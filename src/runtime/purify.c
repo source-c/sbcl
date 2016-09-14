@@ -281,7 +281,10 @@ ptrans_code(lispobj thing)
     lispobj func, result;
 
     code = (struct code *)native_pointer(thing);
-    nwords = CEILING(HeaderValue(code->header) + fixnum_word_value(code->code_size),
+    // FIXME: CEILING is likely redundant.
+    //  - The header word count can't be odd
+    //  - The instruction word count is rounded by the accessor macro
+    nwords = CEILING(HeaderValue(code->header) + code_instruction_words(code->code_size),
                      2);
 
     new = (struct code *)newspace_alloc(nwords,1); /* constant */
@@ -817,18 +820,16 @@ pscav(lispobj *addr, long nwords, boolean constant)
                         = (struct layout *) native_pointer(instance->slots[0]);
                     long nslots = HeaderValue(*addr);
                     int index;
-                    if (layout->bitmap == 0) {
-                      pscav(addr + 1, nslots, constant);
-                    } else if (fixnump(layout->bitmap)) {
-                      unsigned long bitmap = fixnum_value(layout->bitmap);
+                    if (fixnump(layout->bitmap)) {
+                      long bitmap = (sword_t)layout->bitmap >> N_FIXNUM_TAG_BITS;
                       for (index = 0; index < nslots ; index++, bitmap >>= 1)
-                        if (!(bitmap & 1))
+                        if (bitmap & 1)
                           pscav(addr + 1 + index, 1, constant);
                     } else {
                       struct bignum * bitmap;
                       bitmap = (struct bignum*)native_pointer(layout->bitmap);
                       for (index = 0; index < nslots ; index++)
-                        if (!positive_bignum_logbitp(index, bitmap))
+                        if (positive_bignum_logbitp(index, bitmap))
                           pscav(addr + 1 + index, 1, constant);
                     }
                     count = CEILING(1 + nslots, 2);

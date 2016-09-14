@@ -1242,7 +1242,8 @@
         (vop verify-arg-count node block
              arg-count-location
              min
-             max)))))
+             max)
+        min))))
 
 ;;; Do all the stuff that needs to be done on XEP entry:
 ;;; -- Create frame.
@@ -1259,18 +1260,21 @@
       (vop xep-allocate-frame node block start-label)
       ;; Arg verification needs to be done before the stack pointer is adjusted
       ;; so that the extra arguments are still present when the error is signalled
-      (unless (eq (functional-kind fun) :toplevel)
-        (setf arg-count-tn (make-arg-count-location))
-        #!+precise-arg-count-error
-        (xep-verify-arg-count node block fun arg-count-tn))
-      (cond ((and (optional-dispatch-p ef) (optional-dispatch-more-entry ef))
-             ;; COPY-MORE-ARG should handle SP adjustemnt, but it
-             ;; isn't done on all targets.
-             #!-precise-arg-count-error
-             (vop xep-setup-sp node block)
-             (vop copy-more-arg node block (optional-dispatch-max-args ef)))
-            (t
-             (vop xep-setup-sp node block)))
+      (let ((verified (unless (eq (functional-kind fun) :toplevel)
+                        (setf arg-count-tn (make-arg-count-location))
+                        #!+precise-arg-count-error
+                        (xep-verify-arg-count node block fun arg-count-tn))))
+        #!-x86-64
+        (declare (ignore verified))
+       (cond ((and (optional-dispatch-p ef) (optional-dispatch-more-entry ef))
+              ;; COPY-MORE-ARG should handle SP adjustemnt, but it
+              ;; isn't done on all targets.
+              #!-precise-arg-count-error
+              (vop xep-setup-sp node block)
+              (vop copy-more-arg node block (optional-dispatch-max-args ef)
+                   #!+x86-64 verified))
+             (t
+              (vop xep-setup-sp node block))))
       (when (ir2-physenv-closure env)
         (let ((closure (make-normal-tn *backend-t-primitive-type*)))
           (when (policy fun (> store-closure-debug-pointer 1))
@@ -1639,18 +1643,30 @@ not stack-allocated LVAR ~S." source-lvar)))))
 ;;; implementation.
 (defoptimizer (%special-bind ir2-convert) ((var value) node block)
   (let ((name (leaf-source-name (lvar-value var))))
-    #!-(and sb-thread x86-64)
-    (vop bind node block (lvar-tn node block value) (emit-constant name))
-    #!+(and sb-thread x86-64)
-    (progn
-      ;; GC must understand that the symbol is implicitly live even though
-      ;; binding makes no references to the object.
-      (emit-constant name)
-      (vop sb!vm::bind/let node block (lvar-tn node block value) name))))
+    ;; Emit either BIND or DYNBIND, preferring BIND if both exist.
+    ;; If only one exists, it's DYNBIND.
+    ;; Even if the backend supports load-time TLS index assignment,
+    ;; there might be only one vop (as with arm64).
+    (macrolet ((doit (bind dynbind)
+                 (if (gethash 'bind *backend-parsed-vops*) bind dynbind)))
+      (doit
+       (progn
+         ;; Inform later SYMBOL-VALUE calls that they can
+         ;; assume a nonzero tls-index.
+         ;; FIXME: setting INFO is inefficient when not actually
+         ;; changing anything
+         (unless (info :variable :wired-tls name)
+           (setf (info :variable :wired-tls name) :always-has-tls))
+         ;; We force the symbol into the code constants in case BIND
+         ;; does not actually reference it, as with x86.
+         (emit-constant name)
+         (vop bind node block (lvar-tn node block value) name))
+       (vop dynbind node block (lvar-tn node block value)
+            (emit-constant name))))))
 
-(defoptimizer (%special-unbind ir2-convert) ((var) node block)
-  (declare (ignore var))
-  (vop unbind node block))
+(defoptimizer (%special-unbind ir2-convert) ((n) node block)
+  (declare (ignorable n))
+  (vop unbind node block #!+(and sb-thread unbind-n-vop) (lvar-value n)))
 
 ;;; ### It's not clear that this really belongs in this file, or
 ;;; should really be done this way, but this is the least violation of
@@ -1671,7 +1687,7 @@ not stack-allocated LVAR ~S." source-lvar)))))
                               ;; CLHS says "bound and then made to have no value" -- user
                               ;; should not be able to tell the difference between that and this.
                               (about-to-modify-symbol-value var 'progv)
-                              (%primitive bind unbound-marker var))))
+                              (%primitive dynbind unbound-marker var))))
                         (,bind (vars vals)
                           (declare (optimize (speed 2) (debug 0)
                                              (insert-debug-catch 0)))
@@ -1681,7 +1697,7 @@ not stack-allocated LVAR ~S." source-lvar)))))
                                  (let ((val (car vals))
                                        (var (car vars)))
                                    (about-to-modify-symbol-value var 'progv val t)
-                                   (%primitive bind val var))
+                                   (%primitive dynbind val var))
                                  (,bind (cdr vars) (cdr vals))))))
                  (,bind ,vars ,vals))
                nil

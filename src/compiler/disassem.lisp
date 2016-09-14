@@ -83,7 +83,15 @@
                  dchunk=
                  dchunk-count-bits))
 
-(defconstant dchunk-bits sb!vm:n-word-bits)
+;;; For variable-length instruction sets, such as x86, it is better to
+;;; define the dchunk size to be the smallest number of bits necessary
+;;; and sufficient to decode any instruction format, if that quantity
+;;; of bits is small enough to avoid bignum consing.
+;;; Ideally this constant would go in the 'insts' file for the architecture,
+;;; but there's really no easy way to do that at present.
+(defconstant dchunk-bits
+  #!+x86-64 56
+  #!-x86-64 sb!vm:n-word-bits)
 
 (deftype dchunk ()
   `(unsigned-byte ,dchunk-bits))
@@ -91,7 +99,7 @@
   `(integer 0 ,dchunk-bits))
 
 (defconstant dchunk-zero 0)
-(defconstant dchunk-one (1- (expt 2 sb!vm:n-word-bits)))
+(defconstant dchunk-one (ldb (byte dchunk-bits 0) -1))
 
 (defun dchunk-extract (chunk byte-spec)
   (declare (type dchunk chunk))
@@ -133,7 +141,12 @@
   (declare (type sb!sys:system-area-pointer sap)
            (type offset byte-offset)
            (muffle-conditions compiler-note) ; returns possible bignum
+           ;; Not all backends can actually disassemble for either byte order.
+           (ignorable byte-order)
            (optimize (speed 3) (safety 0)))
+  #!+x86-64
+  (logand (sb!sys:sap-ref-word sap byte-offset) dchunk-one)
+  #!-x86-64
   (the dchunk
        (ecase dchunk-bits
          (32 (if (eq byte-order :big-endian)
@@ -520,8 +533,9 @@
 (defun gen-arg-forms (arg rendering funstate)
   (labels ((tempvars (n)
              (if (plusp n)
-                 (cons (intern (format nil ".T~D" (incf *!temp-var-counter*))
-                               (load-time-value (find-package "SB!DISASSEM")))
+                 (cons (package-symbolicate
+                        (load-time-value (find-package "SB!DISASSEM"))
+                        ".T" (write-to-string (incf *!temp-var-counter*)))
                        (tempvars (1- n))))))
     (let* ((arg-cell (assq arg funstate))
            (rendering-temps (cdr (assq rendering (cdr arg-cell))))
@@ -1072,7 +1086,7 @@
   (properties nil :type list)
   ;; for user code to hang stuff off of, cleared each time after a
   ;; non-prefix instruction is processed
-  (inst-properties nil :type list)
+  (inst-properties nil :type (or fixnum list))
   (filtered-values (make-array max-filtered-value-index)
                    :type filtered-value-vector)
   ;; used for prettifying printing
@@ -1126,14 +1140,21 @@
 (defmacro dstate-get-prop (dstate name)
   `(getf (dstate-properties ,dstate) ,name))
 
-;;; Push NAME on the list of instruction properties in DSTATE.
-(defun dstate-put-inst-prop (dstate name)
-  (push name (dstate-inst-properties dstate)))
+;;; Put PROPERTY into the set of instruction properties in DSTATE.
+;;; PROPERTY can be a fixnum or symbol, but any given backend
+;;; must exclusively use one or the other property representation.
+(defun dstate-put-inst-prop (dstate property)
+  (if (fixnump property)
+      (setf (dstate-inst-properties dstate)
+            (logior (or (dstate-inst-properties dstate) 0) property))
+      (push property (dstate-inst-properties dstate))))
 
-;;; Return non-NIL if NAME is on the list of instruction properties in
-;;; DSTATE.
-(defun dstate-get-inst-prop (dstate name)
-  (member name (dstate-inst-properties dstate) :test #'eq))
+;;; Return non-NIL if PROPERTY is in the set of instruction properties in
+;;; DSTATE. As with -PUT-INST-PROP, we can have a bitmask or a plist.
+(defun dstate-get-inst-prop (dstate property)
+  (if (fixnump property)
+      (logtest (or (dstate-inst-properties dstate) 0) property)
+      (memq property (dstate-inst-properties dstate))))
 
 (declaim (ftype function read-suffix))
 (defun read-signed-suffix (length dstate)

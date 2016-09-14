@@ -213,13 +213,12 @@ static struct code *
 trans_code(struct code *code)
 {
     struct code *new_code;
-    lispobj first, l_code, l_new_code;
+    lispobj l_code, l_new_code;
     uword_t nheader_words, ncode_words, nwords;
     uword_t displacement;
     lispobj fheaderl, *prev_pointer;
 
     /* if object has already been transported, just return pointer */
-    first = code->header;
     if (forwarding_pointer_p((lispobj *)code)) {
 #ifdef DEBUG_CODE_GC
         printf("Was already transported\n");
@@ -228,13 +227,13 @@ trans_code(struct code *code)
             ((lispobj *)((pointer_sized_uint_t) code));
     }
 
-    gc_assert(widetag_of(first) == CODE_HEADER_WIDETAG);
+    gc_assert(widetag_of(code->header) == CODE_HEADER_WIDETAG);
 
     /* prepare to transport the code vector */
     l_code = (lispobj) LOW_WORD(code) | OTHER_POINTER_LOWTAG;
 
-    ncode_words = fixnum_word_value(code->code_size);
-    nheader_words = HeaderValue(code->header);
+    ncode_words = code_instruction_words(code->code_size);
+    nheader_words = code_header_words(code->header);
     nwords = ncode_words + nheader_words;
     nwords = CEILING(nwords, 2);
 
@@ -316,8 +315,8 @@ scav_code_header(lispobj *where, lispobj object)
     struct simple_fun *function_ptr; /* untagged pointer to entry point */
 
     code = (struct code *) where;
-    n_code_words = fixnum_word_value(code->code_size);
-    n_header_words = HeaderValue(object);
+    n_code_words = code_instruction_words(code->code_size);
+    n_header_words = code_header_words(object);
     n_words = n_code_words + n_header_words;
     n_words = CEILING(n_words, 2);
 
@@ -361,8 +360,8 @@ size_code_header(lispobj *where)
 
     code = (struct code *) where;
 
-    ncode_words = fixnum_word_value(code->code_size);
-    nheader_words = HeaderValue(code->header);
+    ncode_words = code_instruction_words(code->code_size);
+    nheader_words = code_header_words(code->header);
     nwords = ncode_words + nheader_words;
     nwords = CEILING(nwords, 2);
 
@@ -688,6 +687,12 @@ boolean positive_bignum_logbitp(int index, struct bignum* bignum)
   }
 }
 
+// Helper function for helper function below, since lambda isn't a thing
+static void instance_scan_range(void* instance_ptr, int offset, int nwords)
+{
+    scavenge((lispobj*)instance_ptr + offset, nwords);
+}
+
 // Helper function for stepping through the tagged slots of an instance in
 // scav_instance and verify_space (which, as it happens, is not useful).
 void
@@ -700,28 +705,89 @@ instance_scan_interleaved(void (*proc)(lispobj*, sword_t),
   lispobj layout_bitmap = layout->bitmap;
   sword_t index;
 
-  /* This code would be more efficient if the Lisp stored an additional format
-     of the same metadata - a vector of ranges of slot offsets to scan.
-     Each pair of vector elements would demarcate the start and end of a range
-     of offsets to be passed to the proc().  The vector could be either
-     (unsigned-byte 8) or (unsigned-byte 16) for compactness.
-     On the other hand, this may not be a bottleneck as-is */
+  /* This code might be made more efficient by run-length-encoding the ranges
+     of words to scan, but probably not by much */
 
   ++instance_ptr; // was supplied as the address of the header word
-  if (layout_bitmap == 0) {
-      proc(instance_ptr, n_words);
-  } else if (fixnump(layout_bitmap)) {
-      unsigned long bitmap = fixnum_value(layout_bitmap);
+  if (fixnump(layout_bitmap)) {
+      long bitmap = (sword_t)layout_bitmap >> N_FIXNUM_TAG_BITS; // signed integer!
       for (index = 0; index < n_words ; index++, bitmap >>= 1)
-          if (!(bitmap & 1))
+          if (bitmap & 1)
               proc(instance_ptr + index, 1);
   } else { /* huge bitmap */
       struct bignum * bitmap;
       bitmap = (struct bignum*)native_pointer(layout_bitmap);
-      for (index = 0; index < n_words ; index++)
-          if (!positive_bignum_logbitp(index, bitmap))
-              proc(instance_ptr + index, 1);
+      if (forwarding_pointer_p((lispobj*)bitmap))
+          bitmap = (struct bignum*)
+            native_pointer((lispobj)forwarding_pointer_value((lispobj*)bitmap));
+      bitmap_scan((uword_t*)bitmap->digits, HeaderValue(bitmap->header), 0,
+                  instance_scan_range, instance_ptr);
   }
+}
+
+void bitmap_scan(uword_t* bitmap, int n_bitmap_words, int flags,
+                 void (*proc)(void*, int, int), void* arg)
+{
+    uword_t sense = (flags & BIT_SCAN_INVERT) ? ~0L : 0;
+    int start_word_index = 0;
+    int shift = 0;
+    in_use_marker_t word;
+
+    flags = flags & BIT_SCAN_CLEAR;
+
+    // Rather than bzero'ing we can just clear each nonzero word as it's read,
+    // if so specified.
+#define BITMAP_REF(j) word = bitmap[j]; if(word && flags) bitmap[j] = 0; word ^= sense
+    BITMAP_REF(0);
+    while (1) {
+        int skip_bits, start_bit, start_position, run_length;
+        if (word == 0) {
+            if (++start_word_index >= n_bitmap_words) break;
+            BITMAP_REF(start_word_index);
+            shift = 0;
+            continue;
+        }
+        // On each loop iteration, the lowest 1 bit is a "relative"
+        // bit index, since the word was already shifted. This is 'skip_bits'.
+        // Adding back in the total shift amount gives 'start_bit',
+        // the true absolute index within the current word.
+        // 'start_position' is absolute within the entire bitmap.
+        skip_bits = ffsl(word) - 1;
+        start_bit = skip_bits + shift;
+        start_position = N_WORD_BITS * start_word_index + start_bit;
+        // Compute the number of consecutive 1s in the current word.
+        word >>= skip_bits;
+        run_length = ~word ? ffsl(~word) - 1 : N_WORD_BITS;
+        if (start_bit + run_length < N_WORD_BITS) { // Do not extend to additional words.
+            word >>= run_length;
+            shift += skip_bits + run_length;
+        } else {
+            int end_word_index = ++start_word_index;
+            while (1) {
+                if (end_word_index >= n_bitmap_words) {
+                    word = 0;
+                    run_length += (end_word_index - start_word_index) * N_WORD_BITS;
+                    break;
+                }
+                BITMAP_REF(end_word_index);
+                if (~word == 0)
+                    ++end_word_index;
+                else {
+                    // end_word_index is the exclusive bound on contiguous
+                    // words to include in the range. See if the low bits
+                    // from the next word can extend the range.
+                    shift = ffsl(~word) - 1;
+                    word >>= shift;
+                    run_length += (end_word_index - start_word_index) * N_WORD_BITS
+                                  + shift;
+                    break;
+                }
+            }
+            start_word_index = end_word_index;
+        }
+        proc(arg, start_position, run_length);
+    }
+#undef BITMAP_REF
 }
 
 static sword_t
@@ -739,7 +805,10 @@ scav_instance(lispobj *where, lispobj header)
     if (forwarding_pointer_p(layout))
         layout = native_pointer((lispobj)forwarding_pointer_value(layout));
 
-    instance_scan_interleaved(scavenge, where, ntotal, layout);
+    if (((struct layout*)layout)->bitmap == make_fixnum(-1))
+        scavenge(where+1, ntotal);
+    else
+        instance_scan_interleaved(scavenge, where, ntotal, layout);
 
     return ntotal + 1;
 }
@@ -1844,7 +1913,7 @@ scav_vector (lispobj *where, lispobj object)
     /* Scavenge hash table, which will fix the positions of the other
      * needed objects. */
     scavenge((lispobj *)hash_table,
-             sizeof(struct hash_table) / sizeof(lispobj));
+             CEILING(sizeof(struct hash_table) / sizeof(lispobj), 2));
 
     /* Cross-check the kv_vector. */
     if (where != (lispobj *)native_pointer(hash_table->table)) {

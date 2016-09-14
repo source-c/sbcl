@@ -276,7 +276,7 @@
 ;;; IR1 might potentially transform EQL into %EQL/INTEGER.
 #!+integer-eql-vop
 (defun %eql/integer (obj1 obj2)
-  ;; This is just for constand folding, no need to transform into the %EQL/INTEGER VOP
+  ;; This is just for constant folding, no need to transform into the %EQL/INTEGER VOP
   (eql obj1 obj2))
 
 (declaim (inline %eql))
@@ -312,7 +312,15 @@
               (lambda (x y)
                 (and (eql (numerator x) (numerator y))
                      (eql (denominator x) (denominator y)))))
-             (complex
+             ((complex single-float)
+              (lambda (x y)
+                (and (eql (realpart x) (realpart y))
+                     (eql (imagpart x) (imagpart y)))))
+             ((complex double-float)
+              (lambda (x y)
+                (and (eql (realpart x) (realpart y))
+                     (eql (imagpart x) (imagpart y)))))
+             ((complex rational)
               (lambda (x y)
                 (and (eql (realpart x) (realpart y))
                      (eql (imagpart x) (imagpart y))))))))))
@@ -393,8 +401,7 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
                   `(let ((x-el (%instance-ref x i))
                          (y-el (%instance-ref y i)))
                      (or (eq x-el y-el) (equalp x-el y-el)))))
-       (let ((bitmap (layout-bitmap layout-x)))
-         (if (zerop bitmap)
+         (if (eql (layout-bitmap layout-x) sb!kernel::+layout-all-tagged+)
              (loop for i of-type index from sb!vm:instance-data-start
                    below (layout-length layout-x)
                    always (slot-ref-equalp))
@@ -411,7 +418,7 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
                      always (cond ((eql test 0) (slot-ref-equalp))
                                   ((functionp test)
                                    (funcall test i x y))
-                                  (t))))))))))
+                                  (t)))))))))
 
 ;;; Doesn't work on simple vectors
 (defun array-equal-p (x y)

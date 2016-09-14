@@ -272,11 +272,9 @@
  ("src/code/target-unicode" :not-host)
  ("src/code/misc")
 
- ("src/code/room"   :not-host)
-
+ ("src/code/symbol"        :not-host)
  ("src/code/fd-stream"     :not-host)
  ("src/code/stream"        :not-host)
- ("src/code/symbol"        :not-host) ; uses STRING-OUTPUT-STREAM
  ("src/code/early-format")
  ("src/code/defpackage"    :not-host)
 
@@ -337,6 +335,7 @@
 
  ;; needs "backend"
  ("src/compiler/target/backend-parms")
+ ("src/code/room" :not-host) ; needs GENCGC-CARD-BYTES
 
  ("src/code/force-delayed-defbangconstants")
  ("src/code/defmacro")
@@ -420,7 +419,8 @@
  ;; "code/late-type", and SB!XC:TYPEP, defined in "code/cross-type",
  ;; and SPECIALIZE-ARRAY-TYPE, defined in "compiler/generic/vm-type",
  ;; and SB!XC:PROCLAIM, defined in "src/compiler/proclaim"
- ("src/code/defstruct")
+ ;; FIXME: #+ should be (and sb-xc-host) but it isn't set yet.
+ ("src/code/defstruct" #+cmucl :ignore-failure-p)
  ("src/code/target-defstruct" :not-host)
 
  ;; ALIEN-VALUE has to be defined as a class (done by DEFSTRUCT
@@ -498,7 +498,8 @@
  ("src/compiler/ir1tran")
  ("src/compiler/ir1tran-lambda")
  ("src/compiler/ir1-translators")
- ("src/compiler/ir1util")
+ ;; FIXME: #+ should be (and sb-xc-host) but it isn't set yet.
+ ("src/compiler/ir1util" #+cmucl :ignore-failure-p)
  ("src/compiler/ir1opt")
  ("src/compiler/loop")
 
@@ -604,6 +605,8 @@
  ("src/assembly/target/array"      :assem :not-host)
  ("src/assembly/target/arith"      :assem :not-host)
  ("src/assembly/target/alloc"      :assem :not-host)
+ #!+read-only-tramps
+ ("src/assembly/target/tramps"     :assem :not-host :not-genesis)
 
  ("src/compiler/pseudo-vops")
 

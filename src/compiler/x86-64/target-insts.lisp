@@ -25,7 +25,7 @@
            (type disassem-state dstate))
   (princ (if (and (eq width :byte)
                   (<= 4 value 7)
-                  (not (dstate-get-inst-prop dstate 'rex)))
+                  (not (dstate-get-inst-prop dstate +rex+)))
              (aref *high-byte-reg-names* (- value 4))
              (aref (ecase width
                      (:byte *byte-reg-names*)
@@ -62,7 +62,7 @@
            (type stream stream)
            (type disassem-state dstate))
   (print-reg-with-width value
-                        (if (dstate-get-inst-prop dstate 'rex-w) :qword :dword)
+                        (if (dstate-get-inst-prop dstate +rex-w+) :qword :dword)
                         stream
                         dstate))
 
@@ -237,7 +237,11 @@
                (princ16 offset stream)
                (or (minusp offset)
                    (nth-value 1 (note-code-constant-absolute offset dstate))
-                   (maybe-note-assembler-routine offset nil dstate)))
+                   (maybe-note-assembler-routine offset nil dstate)
+                   ;; Static symbols coming frorm CELL-REF
+                   (maybe-note-static-symbol (+ offset (- other-pointer-lowtag
+                                                          n-word-bytes))
+                                             dstate)))
             (t
              (princ offset stream)))))))
   (write-char #\] stream)
@@ -249,9 +253,7 @@
                (seg-code (dstate-segment dstate)))
       ;; Try to reverse-engineer which thread-local binding this is
       (let* ((code (seg-code (dstate-segment dstate)))
-             (header-n-words
-              (ash (sap-ref-word (int-sap (get-lisp-obj-address code))
-                                 (- other-pointer-lowtag)) -8))
+             (header-n-words (code-header-words code))
              (tls-index (ash disp (- n-fixnum-tag-bits))))
         (loop for word-num from code-constants-offset below header-n-words
               for obj = (code-header-ref code word-num)
@@ -277,26 +279,38 @@
 ;; Figure out whether LEA should print its EA with just the stuff in brackets,
 ;; or additionally show the EA as either a label or a hex literal.
 (defun lea-print-ea (value stream dstate)
-  (let ((width (inst-operand-size dstate)))
+  (let ((width (inst-operand-size dstate))
+        (addr nil)
+        (fmt "= #x~x"))
     (etypecase value
       (list
        ;; Indicate to PRINT-MEM-REF that this is not a memory access.
        (print-mem-ref :compute value width stream dstate)
        (when (eq (first value) 'rip)
-         (let ((addr (+ (dstate-next-addr dstate) (second value))))
-           (note (lambda (s) (format s "= #x~x" addr)) dstate))))
-
-      (string
-       ;; A label for the EA should not print as itself, but as the decomposed
-       ;; addressing mode so that [ADDR] and [RIP+disp] are unmistakable.
-       (print-mem-ref :compute (reg-r/m-inst-r/m-arg dchunk-zero dstate)
-                      width stream dstate)
-       (note (lambda (s) (format s "= ~A" value)) dstate))
+         (setq addr (+ (dstate-next-addr dstate) (second value)))))
 
       ;; We're robust in allowing VALUE to be an integer (a register),
       ;; though LEA Rx,Ry is an illegal instruction.
+      ;; Test this before INTEGER since the types overlap.
       (full-reg
-       (print-reg-with-width value width stream dstate)))))
+       (print-reg-with-width value width stream dstate))
+
+      ((or string integer)
+       ;; A label for the EA should not print as itself, but as the decomposed
+       ;; addressing mode so that [ADDR] and [RIP+disp] are unmistakable.
+       ;; We can see an INTEGER here because LEA-COMPUTE-LABEL is always called
+       ;; on the operand to LEA, and it will compute an absolute address based
+       ;; off RIP when possible. If :use-labels NIL was specified, there is
+       ;; no hashtable of address to string, so we get the address.
+       ;; But ordinarily we get the string. Either way, the r/m arg reveals the
+       ;; EA calculation. DCHUNK-ZERO is a meaningless value - any would do -
+       ;; because the EA was computed in a prefilter.
+       (print-mem-ref :compute (reg-r/m-inst-r/m-arg dchunk-zero dstate)
+                      width stream dstate)
+       (setq addr value)
+       (when (stringp value) (setq fmt "= ~A"))))
+    (when addr
+      (note (lambda (s) (format s fmt addr)) dstate))))
 
 (defun unboxed-constant-ref (dstate segment-offset)
   (let* ((seg (dstate-segment dstate))

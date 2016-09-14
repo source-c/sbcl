@@ -57,14 +57,14 @@
   (%with-array-data-macro array start end :check-bounds t :check-fill-pointer t))
 
 (defun %with-array-data (array start end)
-  (%with-array-data-macro array start end :check-bounds t :check-fill-pointer nil))
+  (%with-array-data-macro array start end :check-bounds t :array-header-p t))
 
 (defun %data-vector-and-index (array index)
   (if (array-header-p array)
       (multiple-value-bind (vector index)
           (%with-array-data array index nil)
         (values vector index))
-      (values array index)))
+      (values (truly-the (simple-array * (*)) array) index)))
 
 ;;;; MAKE-ARRAY
 (defun %integer-vector-widetag-and-n-bits (signed high)
@@ -141,6 +141,7 @@
                                   sb!vm:*specialized-array-element-type-properties*
                                   :key #'sb!vm:saetp-typecode))))))
     (flet ((ill-type ()
+             (declare (optimize allow-non-returning-tail-call))
              (error "Invalid type specifier: ~/sb!impl:print-type-specifier/"
                     type))
            (integer-interval-widetag (low high)
@@ -789,6 +790,7 @@ of specialized arrays is supported."
 
 (declaim (ftype (function (array) nil) invalid-array-error))
 (defun invalid-array-error (array)
+  (declare (optimize allow-non-returning-tail-call))
   (aver (array-header-p array))
   ;; Array invalidation stashes the original dimensions here...
   (let ((dims (%array-displaced-p array))
@@ -803,6 +805,7 @@ of specialized arrays is supported."
 (declaim (ftype (function (array t integer &optional t) nil)
                 invalid-array-index-error))
 (defun invalid-array-index-error (array index bound &optional axis)
+  (declare (optimize allow-non-returning-tail-call))
   (if (invalid-array-p array)
       (invalid-array-error array)
       (error 'invalid-array-index-error
@@ -996,20 +999,26 @@ of specialized arrays is supported."
 (defun array-dimensions (array)
   #!+sb-doc
   "Return a list whose elements are the dimensions of the array"
-  (declare (array array))
-  (if (array-header-p array)
-      (do ((results nil (cons (array-dimension array index) results))
-           (index (1- (array-rank array)) (1- index)))
-          ((minusp index) results))
-      (list (array-dimension array 0))))
+  (declare (explicit-check))
+  (cond ((array-header-p array)
+         (do ((results nil (cons (%array-dimension array index) results))
+              (index (1- (%array-rank array)) (1- index)))
+             ((minusp index) results)))
+        ((typep array 'vector)
+         (list (length array)))
+        (t
+         (sb!c::%type-check-error/c array 'object-not-array-error))))
 
 (defun array-total-size (array)
   #!+sb-doc
   "Return the total number of elements in the Array."
-  (declare (array array))
-  (if (array-header-p array)
-      (%array-available-elements array)
-      (length (the vector array))))
+  (declare (explicit-check))
+  (cond ((array-header-p array)
+         (%array-available-elements array))
+        ((typep array 'vector)
+         (length array))
+        (t
+         (sb!c::%type-check-error/c array 'object-not-array-error))))
 
 (defun array-displacement (array)
   #!+sb-doc
@@ -1042,6 +1051,7 @@ of specialized arrays is supported."
   (and (array-header-p array) (%array-fill-pointer-p array)))
 
 (defun fill-pointer-error (vector &optional arg)
+  (declare (optimize allow-non-returning-tail-call))
   (cond (arg
          (aver (array-has-fill-pointer-p vector))
          (let ((max (%array-available-elements vector)))
@@ -1067,7 +1077,8 @@ of specialized arrays is supported."
       (fill-pointer-error vector)))
 
 (defun %set-fill-pointer (vector new)
-  (declare (explicit-check))
+  (declare (explicit-check)
+           (index new))
   (flet ((oops (x)
            (fill-pointer-error vector x)))
     (cond ((not (array-has-fill-pointer-p vector))
@@ -1725,3 +1736,14 @@ function to be removed without further warning."
                    (setf ,tag (%other-pointer-widetag ,(first args))))
                  (svref ,',table-name ,tag)))
              ,@args))))))
+
+(defun sb!kernel::check-array-shape (array dimensions)
+  (when (let ((dimensions dimensions))
+          (dotimes (i (array-rank array))
+            (unless (eql (array-dimension array i) (pop dimensions))
+              (return t))))
+    (error "malformed :INITIAL-CONTENTS: ~S should have dimensions ~S"
+           (make-array dimensions :displaced-to (%array-data-vector array)
+                                  :element-type (array-element-type array))
+           (array-dimensions array)))
+  array)

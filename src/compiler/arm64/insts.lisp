@@ -415,32 +415,26 @@
 
 ;;;; special magic to support decoding internal-error and related traps
 (defun snarf-error-junk (sap offset &optional length-only)
-  (let ((length (sap-ref-8 sap offset)))
-    (declare (type system-area-pointer sap)
+  (let* ((inst (sap-ref-32 sap (- offset 4)))
+         (error-number (ldb (byte 8 13) inst))
+         (length (sb!kernel::error-length error-number))
+         (index offset))
+    (declare (type sb!sys:system-area-pointer sap)
              (type (unsigned-byte 8) length))
     (cond (length-only
-           (values 0 (1+ length) nil nil))
+           (loop repeat length do (sb!c::sap-read-var-integerf sap index))
+           (values 0 (- index offset) nil nil))
           (t
-           (let* ((inst (sap-ref-32 sap (- offset 4)))
-                  (vector (make-array length :element-type '(unsigned-byte 8)))
-                  (index 0)
-                  (error-number (ldb (byte 8 13) inst)))
-             (declare (type (simple-array (unsigned-byte 8) (*)) vector))
-             (sb!kernel:copy-ub8-from-system-area sap (1+ offset)
-                                                  vector 0 length)
-             (collect ((sc-offsets)
-                       (lengths))
-               (lengths 1) ; the length byte
-               (loop
-                (when (>= index length)
-                  (return))
-                (let ((old-index index))
-                  (sc-offsets (read-var-integer vector index))
-                  (lengths (- index old-index))))
-               (values error-number
-                       (1+ length)
-                       (sc-offsets)
-                       (lengths))))))))
+           (collect ((sc-offsets)
+                     (lengths))
+             (loop repeat length do
+                  (let ((old-index index))
+                    (sc-offsets (sb!c::sap-read-var-integerf sap index))
+                    (lengths (- index old-index))))
+             (values error-number
+                     (- index offset)
+                     (sc-offsets)
+                     (lengths)))))))
 
 (defun brk-control (chunk inst stream dstate)
   (declare (ignore inst chunk))
@@ -2157,22 +2151,23 @@
   (label :fields (list (byte 2 29) (byte 19 5)) :type 'label)
   (rd :field (byte 5 0) :type 'x-reg))
 
-(defun emit-pc-relative-inst (op segment rd label)
+(defun emit-pc-relative-inst (op segment rd label &optional (offset 0))
   (assert (label-p label))
   (assert (register-p rd))
   (emit-back-patch segment 4
                    (lambda (segment posn)
-                     (let ((offset (- (label-position label) posn)))
+                     (let ((offset (+ (- (label-position label) posn)
+                                      offset)))
                        (emit-pc-relative segment
                                          op
                                          (ldb (byte 2 0) offset)
                                          (ldb (byte 19 2) offset)
                                          (tn-offset rd))))))
 
-(define-instruction adr (segment rd label)
+(define-instruction adr (segment rd label &optional (offset 0))
   (:printer pc-relative ((op 0)))
   (:emitter
-   (emit-pc-relative-inst 0 segment rd label)))
+   (emit-pc-relative-inst 0 segment rd label offset)))
 
 (define-instruction adrp (segment rd label)
   (:printer pc-relative ((op 1)))
@@ -2654,7 +2649,7 @@
      #'multi-instruction-maybe-shrink
      #'multi-instruction-emitter)))
 
-(define-instruction compute-code (segment code lip object-label temp)
+(define-instruction compute-code (segment code lip object-label)
   (:vop-var vop)
   (:emitter
    (emit-compute segment vop code lip

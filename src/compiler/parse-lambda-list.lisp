@@ -28,7 +28,9 @@
                                      &key &allow-other-keys &aux))
                                   ((and val (symbolp val)) (list val))
                                   (t val))
-              sum (ash 1 (position symbol lambda-list-parser-states))))
+              for weight = (or (position symbol lambda-list-parser-states)
+                               (error "Not a parser state: ~S" symbol))
+              sum (ash 1 weight)))
       ;; Otherwise the input is required to be a list of symbols.
       (with-unique-names (k)
         `(loop for ,k in ,list
@@ -68,7 +70,7 @@
 ;;; wrong, we use COMPILER-ERROR, aborting compilation to the last
 ;;; recovery point.
 (declaim (ftype (sfunction
-                 (list &key (:context t) (:accept integer) (:silent boolean)
+                 (list &key (:context t) (:accept integer) (:silent t)
                             (:condition-class symbol))
                  (values (unsigned-byte 13) list list list list list list list))
                 parse-lambda-list))
@@ -849,7 +851,7 @@
 (defun ds-bind-error (input min max pattern)
   (multiple-value-bind (name kind lambda-list) (get-ds-bind-context pattern)
     #-sb-xc-host
-    (declare (optimize sb!c::allow-non-returning-tail-call))
+    (declare (optimize allow-non-returning-tail-call))
     (case kind
      (:special-form
       ;; IR1 translators should call COMPILER-ERROR instead of
@@ -908,7 +910,7 @@
              (setq tail (cdr next))))))
     (multiple-value-bind (kind name) (get-ds-bind-context pattern)
       #-sb-xc-host
-      (declare (optimize sb!c::allow-non-returning-tail-call))
+      (declare (optimize allow-non-returning-tail-call))
       ;; KLUDGE: Compiling (COERCE x 'list) transforms to COERCE-TO-LIST,
       ;; but COERCE-TO-LIST is an inline function not yet defined, and
       ;; its subsequent definition would signal an inlining failure warning.

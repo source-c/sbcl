@@ -149,7 +149,7 @@
   (:results (result :scs (descriptor-reg)))
   (:generator 38
     (storew null-tn fdefn fdefn-fun-slot other-pointer-lowtag)
-    (inst li (make-fixup "undefined_tramp" :foreign) temp)
+    (inst li (make-fixup 'undefined-tramp :assembly-routine) temp)
     (storew temp fdefn fdefn-raw-addr-slot other-pointer-lowtag)
     (move fdefn result)))
 
@@ -162,7 +162,7 @@
 ;;;
 ;;; See the "Chapter 9: Specials" of the SBCL Internals Manual.
 
-(define-vop (bind)
+(define-vop (dynbind)
   (:args (val :scs (any-reg descriptor-reg))
          (symbol :scs (descriptor-reg)))
   (:temporary (:scs (descriptor-reg)) temp)

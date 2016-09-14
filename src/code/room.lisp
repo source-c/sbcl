@@ -33,7 +33,7 @@
       (setf (svref *meta-room-info* (symbol-value widetag))
             (make-room-info :name name
                             :kind (if (eq name 'symbol)
-                                      :small-other
+                                      :tiny-other
                                       :other))))))
 
 (dolist (code (list #!+sb-unicode complex-character-string-widetag
@@ -137,7 +137,7 @@
 #!-sb-fluid
 (declaim (inline current-dynamic-space-start))
 #!+gencgc
-(defun current-dynamic-space-start () sb!vm:dynamic-space-start)
+(defun current-dynamic-space-start () dynamic-space-start)
 #!-gencgc
 (defun current-dynamic-space-start ()
   (extern-alien "current_dynamic_space" unsigned-long))
@@ -235,7 +235,7 @@
                    widetag
                    (boxed-size header-value)))
 
-          (:small-other
+          (:tiny-other
            (values (tagged-object other-pointer-lowtag)
                    widetag
                    (boxed-size (logand header-value #xff))))
@@ -306,8 +306,7 @@
               ;; will be a short. On platforms with larger ones, it'll
               ;; be an int.
               (bytes-used (unsigned
-                           #.(if (typep sb!vm:gencgc-card-bytes
-                                        '(unsigned-byte 16))
+                           #.(if (typep gencgc-card-bytes '(unsigned-byte 16))
                                  16
                                  32)))
               (flags (unsigned 8))
@@ -401,8 +400,8 @@
 ;;; allocated in Space.
 (defun type-breakdown (space)
   (declare (muffle-conditions t))
-  (let ((sizes (make-array 256 :initial-element 0 :element-type '(unsigned-byte #.sb!vm:n-word-bits)))
-        (counts (make-array 256 :initial-element 0 :element-type '(unsigned-byte #.sb!vm:n-word-bits))))
+  (let ((sizes (make-array 256 :initial-element 0 :element-type '(unsigned-byte #.n-word-bits)))
+        (counts (make-array 256 :initial-element 0 :element-type '(unsigned-byte #.n-word-bits))))
     (map-allocated-objects
      (lambda (obj type size)
        (declare (word size) (optimize (speed 3)) (ignore obj))
@@ -738,6 +737,9 @@
                    #!+stack-grows-downward-not-upward (sap+ sp n-word-bytes)
                    #!-stack-grows-downward-not-upward (sap+ sp (- n-word-bytes))))))
 
+(declaim (inline code-header-words))
+(defun code-header-words (code) (get-header-data code))
+
 (defun map-referencing-objects (fun space object)
   (declare (type spaces space)
            #!-sb-fluid (inline map-allocated-objects))
@@ -761,7 +763,7 @@
                         (return t))))
             (maybe-call fun obj)))
          (code-component
-          (let ((length (get-header-data obj)))
+          (let ((length (code-header-words obj)))
             (do ((i code-constants-offset (1+ i)))
                 ((= i length))
               (when (eq (code-header-ref obj i) object)

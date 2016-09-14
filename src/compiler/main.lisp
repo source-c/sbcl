@@ -16,15 +16,11 @@
 ;;; FIXME: Doesn't this belong somewhere else, like early-c.lisp?
 (declaim (special *constants* *free-vars* *component-being-compiled*
                   *free-funs* *source-paths*
-                  *continuation-number* *continuation-numbers*
-                  *number-continuations* *tn-id* *tn-ids* *id-tns*
-                  *label-ids* *label-id* *id-labels*
                   *undefined-warnings* *compiler-error-count*
                   *compiler-warning-count* *compiler-style-warning-count*
                   *compiler-note-count*
                   *compiler-error-bailout*
-                  *last-source-context* *last-original-source*
-                  *last-source-form* *last-format-string* *last-format-args*
+                  *last-format-string* *last-format-args*
                   *last-message-count* *last-error-context*
                   *lexenv* *fun-names-in-this-file*
                   *allow-instrumenting*))
@@ -123,9 +119,9 @@
 ;; Used during compilation to keep track of with source paths have been
 ;; instrumented in which blocks.
 (defvar *code-coverage-blocks* nil)
-;; Stores the code coverage instrumentation results. Keys are namestrings,
-;; the value is a list of (CONS PATH STATE), where STATE is NIL for
-;; a path that has not been visited, and T for one that has.
+;; Stores the code coverage instrumentation results. Keys are namestrings, the
+;; value is a list of (CONS PATH STATE), where STATE is +CODE-COVERAGE-UNMARKED+
+;; for a path that has not been visited, and T for one that has.
 (defvar *code-coverage-info* (make-hash-table :test 'equal))
 
 
@@ -218,7 +214,9 @@ Examples:
   (flet ((with-it ()
            (let ((succeeded-p nil)
                  (*source-plist* (append source-plist *source-plist*))
-                 (*source-namestring* (or source-namestring *source-namestring*)))
+                 (*source-namestring*
+                  (possibly-base-stringize
+                   (or source-namestring *source-namestring*))))
              (if (and *in-compilation-unit* (not override))
                  ;; Inside another WITH-COMPILATION-UNIT, a WITH-COMPILATION-UNIT is
                  ;; ordinarily (unless OVERRIDE) basically a no-op.
@@ -570,12 +568,7 @@ necessary, since type inference may take arbitrarily long to converge.")
 (defun %compile-component (component)
   (let ((*code-segment* nil)
         (*elsewhere* nil)
-        #!+inline-constants
-        (*constant-segment* nil)
-        #!+inline-constants
-        (*constant-table* nil)
-        #!+inline-constants
-        (*constant-vector* nil))
+        #!+inline-constants (*unboxed-constants* nil))
     (maybe-mumble "GTN ")
     (gtn-analyze component)
     (maybe-mumble "LTN ")
@@ -1698,9 +1691,6 @@ necessary, since type inference may take arbitrarily long to converge.")
            (declare (ignore error))
            (return-from sub-compile-file (values t t t))))
         (*current-path* nil)
-        (*last-source-context* nil)
-        (*last-original-source* nil)
-        (*last-source-form* nil)
         (*last-format-string* nil)
         (*last-format-args* nil)
         (*last-message-count* 0)

@@ -49,14 +49,13 @@
 (defmacro loadw (value ptr &optional (slot 0) (lowtag 0))
   `(inst mov ,value (make-ea-for-object-slot ,ptr ,slot ,lowtag)))
 
-(defmacro storew (value ptr &optional (slot 0) (lowtag 0))
-  (once-only ((value value))
-    `(cond ((and (integerp ,value)
-                 (not (typep ,value '(signed-byte 32))))
-            (inst mov temp-reg-tn ,value)
-            (inst mov (make-ea-for-object-slot ,ptr ,slot ,lowtag) temp-reg-tn))
-           (t
-            (inst mov (make-ea-for-object-slot ,ptr ,slot ,lowtag) ,value)))))
+(defun storew (value ptr &optional (slot 0) (lowtag 0))
+  (cond ((and (integerp value)
+              (not (typep value '(signed-byte 32))))
+         (inst mov temp-reg-tn value)
+         (inst mov (make-ea-for-object-slot ptr slot lowtag) temp-reg-tn))
+        (t
+         (inst mov (make-ea-for-object-slot ptr slot lowtag) value))))
 
 (defmacro pushw (ptr &optional (slot 0) (lowtag 0))
   `(inst push (make-ea-for-object-slot ,ptr ,slot ,lowtag)))
@@ -287,18 +286,8 @@
     (case kind
       (#.invalid-arg-count-trap) ; there is no "payload" in this trap kind
       (t
-       (with-adjustable-vector (vector)       ; interr arguments
-         (write-var-integer code vector)
-         (dolist (tn values)
-        ;; classic CMU CL comment:
-        ;;   zzzzz jrd here. tn-offset is zero for constant
-        ;;   tns.
-           (write-var-integer (make-sc-offset (sc-number (tn-sc tn))
-                                              (or (tn-offset tn) 0))
-                              vector))
-         (inst byte (length vector))
-         (dotimes (i (length vector))
-           (inst byte (aref vector i))))))))
+       (inst byte code)
+       (encode-internal-error-args values)))))
 
 (defun error-call (vop error-code &rest values)
   #!+sb-doc

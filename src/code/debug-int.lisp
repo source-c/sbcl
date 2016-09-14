@@ -545,7 +545,7 @@
   (let ((component-ptr (component-ptr-from-pc pc)))
     (unless (sap= component-ptr (int-sap #x0))
        (let* ((code (component-from-component-ptr component-ptr))
-              (code-header-len (* (get-header-data code) sb!vm:n-word-bytes))
+              (code-header-len (* (code-header-words code) sb!vm:n-word-bytes))
               (pc-offset (- (sap-int pc)
                             (- (get-lisp-obj-address code)
                                sb!vm:other-pointer-lowtag)
@@ -872,13 +872,8 @@
               ;; KLUDGE: Detect undefined functions by a range-check
               ;; against the trampoline address and the following
               ;; function in the runtime.
-              (if (< (static-foreign-symbol-address "undefined_tramp")
-                     (sap-int (sb!vm:context-pc context))
-                     (static-foreign-symbol-address #!+x86 "closure_tramp"
-                                                  #!+x86-64 "alloc_tramp"))
-                  (return (values :undefined-function 0 context))
-                  (return (values code 0 context))))
-            (let* ((code-header-len (* (get-header-data code)
+              (return (values code 0 context)))
+            (let* ((code-header-len (* (code-header-words code)
                                        sb!vm:n-word-bytes))
                    (pc-offset
                      (- (sap-int (sb!vm:context-pc context))
@@ -913,7 +908,7 @@
             (/noshow0 "got CODE")
             (when (symbolp code)
               (return (values code 0 scp)))
-            (let* ((code-header-len (* (get-header-data code)
+            (let* ((code-header-len (* (code-header-words code)
                                        sb!vm:n-word-bytes))
                    (pc-offset
                      (- (sap-int (sb!vm:context-pc scp))
@@ -1016,8 +1011,13 @@ register."
   (let ((info (%code-debug-info component)))
     (cond
       ((not info)
-       (make-bogus-debug-fun (or (find-assembly-routine component pc)
-                                 "no debug information for frame")))
+       (let ((routine (find-assembly-routine component pc)))
+         (make-bogus-debug-fun (cond ((not routine)
+                                      "no debug information for frame")
+                                     ((memq routine '(sb!vm::undefined-tramp
+                                                      sb!vm::undefined-alien-tramp))
+                                      "undefined function")
+                                     (routine)))))
      ((eq info :bogus-lra)
       (make-bogus-debug-fun "function end breakpoint"))
      (t
@@ -1111,7 +1111,7 @@ register."
                     (- (sap-int ra)
                        (- (get-lisp-obj-address component)
                           sb!vm:other-pointer-lowtag)
-                       (* (get-header-data component) sb!vm:n-word-bytes))))
+                       (* (code-header-words component) sb!vm:n-word-bytes))))
               (push (cons #!-(or x86 x86-64)
                           (stack-ref catch sb!vm:catch-block-tag-slot)
                           #!+(or x86 x86-64)
@@ -1258,8 +1258,8 @@ register."
              sb!kernel::*current-internal-error*
              (array-in-bounds-p sb!c:+backend-internal-errors+
                                 sb!kernel::*current-internal-error*))
-    (cdr (svref sb!c:+backend-internal-errors+
-                sb!kernel::*current-internal-error*))))
+    (cadr (svref sb!c:+backend-internal-errors+
+                 sb!kernel::*current-internal-error*))))
 
 (defun tl-invalid-arg-count-error-p (frame)
   (and (eq (interrupted-frame-error frame)
@@ -1330,7 +1330,7 @@ register."
           ;; -- WHN 20000120
           (debug-fun-from-pc component
                              (* (- (fun-word-offset simple-fun)
-                                   (get-header-data component))
+                                   (code-header-words component))
                                 sb!vm:n-word-bytes))))))
 
 ;;; Return the kind of the function, which is one of :OPTIONAL,
@@ -1648,14 +1648,14 @@ register."
           (loop
            (when (>= i len) (return))
            (let ((block (make-compiled-debug-block)))
-             (dotimes (k (sb!c:read-var-integer blocks i))
+             (dotimes (k (sb!c:read-var-integerf blocks i))
                (let ((kind (svref sb!c::*compiled-code-location-kinds*
                                   (aref+ blocks i)))
                      (pc (+ last-pc
-                            (sb!c:read-var-integer blocks i)))
+                            (sb!c:read-var-integerf blocks i)))
                      (tlf-offset (or tlf-number
-                                     (sb!c:read-var-integer blocks i)))
-                     (form-number (sb!c:read-var-integer blocks i))
+                                     (sb!c:read-var-integerf blocks i)))
+                     (form-number (sb!c:read-var-integerf blocks i))
                      (live-set (sb!c:read-packed-bit-vector
                                 live-set-len blocks i))
                      (step-info (sb!c:read-var-string blocks i)))
@@ -2109,10 +2109,8 @@ register."
          (= val sb!vm:unbound-marker-widetag)
          ;; undefined_tramp doesn't validate properly as a pointer, and
          ;; the actual value can vary by backend (x86oids need not apply)
-         #!-(or x86 x86-64)
+         #!-read-only-tramps
          (= val (maybe-tag-tramp (foreign-symbol-address "undefined_tramp")))
-         #!+(or arm arm64)
-         (= val (maybe-tag-tramp (foreign-symbol-address "undefined_alien_function")))
          ;; pointer
          (not (zerop (valid-lisp-pointer-p (int-sap val)))))
         (values (%make-lisp-obj val) t)

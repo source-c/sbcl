@@ -277,8 +277,8 @@
                    :stack-allocate-p ,stack-allocate-p
                    :lip ,lip)
        (when ,type-code
-         (inst mov ,flag-tn (ash (1- ,size) n-widetag-bits))
-         (inst add ,flag-tn ,flag-tn ,type-code)
+         (load-immediate-word ,flag-tn (+ (ash (1- ,size) n-widetag-bits)
+                                          ,type-code))
          (storew ,flag-tn ,result-tn 0 ,lowtag))
        ,@body)))
 
@@ -291,15 +291,8 @@
     (inst brk (dpb code (byte 8 8) kind))
     ;; NARGS is implicitely assumed for invalid-arg-count
     (unless (= kind invalid-arg-count-trap)
-     (with-adjustable-vector (vector)
-       (dolist (tn values)
-         (write-var-integer (make-sc-offset (sc-number (tn-sc tn))
-                                            (or (tn-offset tn) 0))
-                            vector))
-       (inst byte (length vector))
-       (dotimes (i (length vector))
-         (inst byte (aref vector i)))
-       (emit-alignment 2)))))
+      (encode-internal-error-args values)
+      (emit-alignment 2))))
 
 (defun error-call (vop error-code &rest values)
   #!+sb-doc

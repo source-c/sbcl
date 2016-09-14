@@ -444,14 +444,14 @@
   (define-fp-operate subt #x16 #x0a1)
 
 ;;; IEEE support
-  (def!constant +su+   #x500)           ; software, underflow enabled
-  (def!constant +sui+  #x700)           ; software, inexact & underflow enabled
-  (def!constant +sv+   #x500)           ; software, interger overflow enabled
-  (def!constant +svi+  #x700)
-  (def!constant +rnd+  #x0c0)           ; dynamic rounding mode
-  (def!constant +sud+  #x5c0)
-  (def!constant +svid+ #x7c0)
-  (def!constant +suid+ #x7c0)
+  (defconstant +su+   #x500)           ; software, underflow enabled
+  (defconstant +sui+  #x700)           ; software, inexact & underflow enabled
+  (defconstant +sv+   #x500)           ; software, interger overflow enabled
+  (defconstant +svi+  #x700)
+  (defconstant +rnd+  #x0c0)           ; dynamic rounding mode
+  (defconstant +sud+  #x5c0)
+  (defconstant +svid+ #x7c0)
+  (defconstant +suid+ #x7c0)
 
   (define-fp-operate cvtqs_su #x16 (logior +su+ #x0bc) 2)
   (define-fp-operate cvtqs_sui #x16 (logior +sui+ #x0bc) 2)
@@ -608,10 +608,15 @@
 ;;;;
 
 (define-instruction lword (segment lword)
-  (:declare (type (or (unsigned-byte 32) (signed-byte 32)) lword))
+  (:declare (type (or (unsigned-byte 32) (signed-byte 32) fixup) lword))
   (:cost 0)
   (:emitter
-   (emit-lword segment lword)))
+   (etypecase lword
+     (fixup
+      (note-fixup segment :absolute32 lword)
+      (emit-lword segment 0))
+     (integer
+      (emit-lword segment lword)))))
 
 (define-instruction short (segment word)
   (:declare (type (or (unsigned-byte 16) (signed-byte 16)) word))

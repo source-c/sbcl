@@ -428,15 +428,6 @@
                      :high high
                      :enumerable enumerable))
 
-;; all character-set types are enumerable, but it's not possible
-;; for one to be TYPE= to a MEMBER type because (MEMBER #\x)
-;; is not internally represented as a MEMBER type.
-;; So in case it wasn't clear already ENUMERABLE-P does not mean
-;;  "possibly a MEMBER type in the Lisp-theoretic sense",
-;; but means "could be implemented in SBCL as a MEMBER type".
-(!define-type-class character-set :enumerable nil
-                    :might-contain-other-types nil)
-
 (defun make-character-set-type (pairs)
   ; (aver (equal (mapcar #'car pairs)
   ;              (sort (mapcar #'car pairs) #'<)))
@@ -772,6 +763,7 @@
 (defun values-specifier-type-r (context type-specifier)
   (declare (type cons context))
   (labels ((fail (spec) ; Q: Shouldn't this signal a TYPE-ERROR ?
+             #-sb-xc-host(declare (optimize allow-non-returning-tail-call))
              (error "bad thing to be a type specifier: ~
                       ~/sb!impl:print-type-specifier/"
                     spec))

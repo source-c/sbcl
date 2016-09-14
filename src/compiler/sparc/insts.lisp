@@ -738,7 +738,6 @@ about function addresses and register values.")
                                 op3 (reg-tn-encoding src1) 1
                                 (if extended 1 0) src2))))
 
-;;; have to do this because def!constant is evalutated in the null lex env.
 (defmacro with-ref-format (printer)
   `(let* ((addend
            '(:choose (:plus-integer immed) ("+" rs2)))
@@ -1598,11 +1597,16 @@ about function addresses and register values.")
 ;;;; Instructions for dumping data and header objects.
 
 (define-instruction word (segment word)
-  (:declare (type (or (unsigned-byte 32) (signed-byte 32)) word))
+  (:declare (type (or (unsigned-byte 32) (signed-byte 32) fixup) word))
   :pinned
   (:delay 0)
   (:emitter
-   (emit-word segment word)))
+   (etypecase word
+     (fixup
+      (note-fixup segment :absolute word)
+      (emit-word segment 0))
+     (integer
+      (emit-word segment word)))))
 
 (define-instruction short (segment short)
   (:declare (type (or (unsigned-byte 16) (signed-byte 16)) short))

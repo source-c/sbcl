@@ -125,8 +125,7 @@
 ;;; preexisting class slot value is OK, and if it's not initialized,
 ;;; its class slot value is set to an UNDEFINED-CLASS. -- FIXME: This
 ;;; is no longer true, :UNINITIALIZED used instead.
-(declaim (ftype (function (layout classoid index simple-vector layout-depthoid
-                                  unsigned-byte)
+(declaim (ftype (function (layout classoid index simple-vector layout-depthoid layout-bitmap)
                           layout)
                 %init-or-check-layout))
 (defun %init-or-check-layout (layout classoid length inherits depthoid bitmap)
@@ -192,7 +191,7 @@
                            index
                            simple-vector
                            layout-depthoid
-                           unsigned-byte))
+                           layout-bitmap))
                 redefine-layout-warning))
 (defun redefine-layout-warning (old-context old-layout
                                 context length inherits depthoid bitmap)
@@ -242,8 +241,8 @@ between the ~A definition and the ~A definition"
 
 ;;; Require that LAYOUT data be consistent with CLASSOID, LENGTH,
 ;;; INHERITS, DEPTHOID, and BITMAP.
-(declaim (ftype (function (layout classoid index simple-vector layout-depthoid
-                           unsigned-byte)) check-layout))
+(declaim (ftype (function (layout classoid index simple-vector layout-depthoid layout-bitmap))
+                check-layout))
 (defun check-layout (layout classoid length inherits depthoid bitmap)
   (aver (eq (layout-classoid layout) classoid))
   (when (redefine-layout-warning "current" layout
@@ -271,8 +270,8 @@ between the ~A definition and the ~A definition"
 ;;; Used by the loader to forward-reference layouts for classes whose
 ;;; definitions may not have been loaded yet. This allows type tests
 ;;; to be loaded when the type definition hasn't been loaded yet.
-(declaim (ftype (function (symbol index simple-vector layout-depthoid
-                                  unsigned-byte) layout)
+(declaim (ftype (function (symbol index simple-vector layout-depthoid layout-bitmap)
+                          layout)
                 find-and-init-or-check-layout))
 (defun find-and-init-or-check-layout (name length inherits depthoid bitmap)
   (truly-the ; avoid an "assertion too complex to check" optimizer note
@@ -542,10 +541,10 @@ between the ~A definition and the ~A definition"
                          name (classoid-name old) (classoid-name new))))))
             (:primitive
              (error "Cannot redefine standard type ~
-                     ~/sb-impl:print-type-specifier/." name))
+                     ~/sb!impl:print-type-specifier/." name))
             (:defined
              (warn "redefining DEFTYPE type to be a class: ~
-                    ~/sb-impl::print-symbol-with-prefix/" name)
+                    ~/sb!impl::print-symbol-with-prefix/" name)
              (clear-info :type :expander name)
              (clear-info :type :source-location name)))
 
@@ -582,7 +581,7 @@ between the ~A definition and the ~A definition"
       (:defined)
       (:primitive
        (error "Attempt to remove :PRIMITIVE type: ~
-              ~/sb-impl:print-type-specifier/" name))
+              ~/sb!impl:print-type-specifier/" name))
       ((:forthcoming-defclass-type :instance)
        (when cell
          ;; Note: We cannot remove the classoid cell from the table,
@@ -651,6 +650,15 @@ between the ~A definition and the ~A definition"
   (defun classoid-enumerable-p (x) (eq (classoid-name x) 'character)))
 (!define-type-class classoid :enumerable #'classoid-enumerable-p
                     :might-contain-other-types nil)
+
+(defun classoid-inherits-from (sub super-or-name)
+  (declare (type classoid sub)
+           (type (or symbol classoid) super-or-name))
+  (let ((super (if (symbolp super-or-name)
+                   (find-classoid super-or-name)
+                   super-or-name)))
+    (find (classoid-layout super)
+          (layout-inherits (classoid-layout sub)))))
 
 ;;; We might be passed classoids with invalid layouts; in any pairwise
 ;;; class comparison, we must ensure that both are valid before
@@ -771,6 +779,15 @@ between the ~A definition and the ~A definition"
           ((eq (classoid-state class2) :sealed)
            ;; checking whether a subclass of both can be defined:
            (sealed-class-intersection2 class2 class1))
+          ;; If exactly one of CLASS{1,2} is a CONDITION-CLASSOID,
+          ;; there can be no intersection: sub-/superclass relations
+          ;; between CONDITION-CLASSOIDs and other CLASSOIDs are not
+          ;; possible and a CONDITION-CLASSOIDs cannot be changed into
+          ;; different CLASSOIDs.
+          ((let ((c1 (condition-classoid-p class1))
+                 (c2 (condition-classoid-p class2)))
+             (or (and c1 (not c2)) (and (not c1) c2)))
+           *empty-type*)
           (t
            ;; uncertain, since a subclass of both might be defined
            nil))))
@@ -779,9 +796,15 @@ between the ~A definition and the ~A definition"
 ;;; FUNCALLABLE-INSTANCE types (which used to be CLASSOIDs until CSR
 ;;; discovered that this was incompatible with the MOP class
 ;;; hierarchy).  See NAMED :COMPLEX-SUBTYPEP-ARG2
-(defvar *non-instance-classoid-types*
+(declaim (type cons **non-instance-classoid-types**))
+(defglobal **non-instance-classoid-types**
   '(symbol system-area-pointer weak-pointer code-component
     lra fdefn random-class))
+
+(defun classoid-non-instance-p (classoid)
+  (declare (type classoid classoid))
+  (member classoid **non-instance-classoid-types**
+          :key #'find-classoid))
 
 ;;; KLUDGE: we need this because of the need to represent
 ;;; intersections of two classes, even when empty at a given time, as
@@ -1242,7 +1265,7 @@ between the ~A definition and the ~A definition"
                                           0
                                           inherits-vector
                                           depthoid
-                                          0)
+                                          +layout-all-tagged+)
            :invalidate nil)))))
   (/show0 "done with loop over *!BUILT-IN-CLASSES*"))
 
@@ -1288,7 +1311,8 @@ between the ~A definition and the ~A definition"
                              (classoid-layout (find-classoid x)))
                            inherits-list)))
         #-sb-xc-host (/show0 "INHERITS=..") #-sb-xc-host (/hexstr inherits)
-        (register-layout (find-and-init-or-check-layout name 0 inherits -1 0)
+        (register-layout (find-and-init-or-check-layout name 0 inherits
+                                                        -1 +layout-all-tagged+)
                          :invalidate nil))))
   (/show0 "done defining temporary STANDARD-CLASSes"))
 

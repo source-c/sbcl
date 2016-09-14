@@ -1174,7 +1174,8 @@ core and return a descriptor to it."
                             (error "No target layout for ~S" obj)))
          (result (allocate-struct *dynamic* target-layout))
          (cold-dd-slots (dd-slots-from-core host-type)))
-    (aver (zerop (layout-bitmap (find-layout host-type))))
+    (aver (eql (layout-bitmap (find-layout host-type))
+               sb!kernel::+layout-all-tagged+))
     ;; Dump the slots.
     (do ((len (cold-layout-length target-layout))
          (index 1 (1+ index)))
@@ -1203,7 +1204,8 @@ core and return a descriptor to it."
   (clrhash *cold-layouts*)
   ;; This assertion is due to the fact that MAKE-COLD-LAYOUT does not
   ;; know how to set any raw slots.
-  (aver (= 0 (layout-bitmap *host-layout-of-layout*)))
+  (aver (eql (layout-bitmap *host-layout-of-layout*)
+             sb!kernel::+layout-all-tagged+))
   (setq *layout-layout* (make-fixnum-descriptor 0))
   (flet ((chill-layout (name &rest inherits)
            ;; Check that the number of specified INHERITS matches
@@ -1790,6 +1792,7 @@ core and return a descriptor to it."
 
 (defun cold-fdefinition-object (cold-name &optional leave-fn-raw)
   (declare (type (or symbol descriptor) cold-name))
+  (declare (special core-file-name))
   (/noshow0 "/cold-fdefinition-object")
   (let ((warm-name (warm-fun-name cold-name)))
     (or (gethash warm-name *cold-fdefn-objects*)
@@ -1803,6 +1806,15 @@ core and return a descriptor to it."
             (write-wordindexed fdefn
                                sb!vm:fdefn-raw-addr-slot
                                (make-random-descriptor
+                                #!+read-only-tramps
+                                (or (lookup-assembler-reference
+                                     'sb!vm::undefined-tramp
+                                     (not (null core-file-name)))
+                                    ;; Our preload for the tramps
+                                    ;; doesn't happen during host-1,
+                                    ;; so substitute a usable value.
+                                    0)
+                                #!-read-only-tramps
                                 (cold-foreign-symbol-address "undefined_tramp"))))
           fdefn))))
 
@@ -1846,6 +1858,9 @@ core and return a descriptor to it."
                           (bug "FSET got closure-header-widetag")
                           (/show0 "/static-fset (closure)")
                           (make-random-descriptor
+                           #!+read-only-tramps
+                           (lookup-assembler-reference 'sb!vm::closure-tramp)
+                           #!-read-only-tramps
                            (cold-foreign-symbol-address "closure_tramp")))))
     fdefn))
 
@@ -2022,11 +2037,11 @@ core and return a descriptor to it."
   (push (list routine code-object offset kind)
         *cold-assembler-fixups*))
 
-(defun lookup-assembler-reference (symbol)
+(defun lookup-assembler-reference (symbol &optional (errorp t))
   (let ((value (cdr (assoc symbol *cold-assembler-routines*))))
-    ;; FIXME: Should this be ERROR instead of WARN?
     (unless value
-      (warn "Assembler routine ~S not defined." symbol))
+      (when errorp
+        (error "Assembler routine ~S not defined." symbol)))
     value))
 
 ;;; Unlike in the target, FOP-KNOWN-FUN sometimes has to backpatch.
@@ -2138,7 +2153,9 @@ core and return a descriptor to it."
           (setf (bvref-8 gspace-bytes gspace-byte-offset)
                 (ldb (byte 8 0) value)
                 (bvref-8 gspace-bytes (1+ gspace-byte-offset))
-                (ldb (byte 8 8) value)))))
+                (ldb (byte 8 8) value)))
+         (:absolute32
+          (setf (bvref-32 gspace-bytes gspace-byte-offset) value))))
       (:arm
        (ecase kind
          (:absolute
@@ -2203,6 +2220,8 @@ core and return a descriptor to it."
                           (mask-field (byte 11 21) (bvref-32 gspace-bytes gspace-byte-offset))))))))
       (:mips
        (ecase kind
+         (:absolute
+          (setf (bvref-32 gspace-bytes gspace-byte-offset) value))
          (:jump
           (assert (zerop (ash value -28)))
           (setf (ldb (byte 26 0)
@@ -2223,6 +2242,8 @@ core and return a descriptor to it."
        ;; needs to be corresponding code in ppc-vm.lisp
        (:ppc
         (ecase kind
+          (:absolute
+           (setf (bvref-32 gspace-bytes gspace-byte-offset) value))
           (:ba
            (setf (bvref-32 gspace-bytes gspace-byte-offset)
                  (dpb (ash value -2) (byte 24 2)
@@ -2254,7 +2275,9 @@ core and return a descriptor to it."
           (setf (bvref-32 gspace-bytes gspace-byte-offset)
                 (dpb (ldb (byte 10 0) value)
                      (byte 10 0)
-                     (bvref-32 gspace-bytes gspace-byte-offset))))))
+                     (bvref-32 gspace-bytes gspace-byte-offset))))
+         (:absolute
+          (setf (bvref-32 gspace-bytes gspace-byte-offset) value))))
       ((:x86 :x86-64)
        ;; XXX: Note that un-fixed-up is read via bvref-word, which is
        ;; 64 bits wide on x86-64, but the fixed-up value is written
@@ -2407,6 +2430,7 @@ core and return a descriptor to it."
 ;;; loading functions.
 (defun cold-load (filename)
   "Load the file named by FILENAME into the cold load image being built."
+  (write-line (namestring filename))
   (with-open-file (s filename :element-type '(unsigned-byte 8))
     (load-as-fasl s nil nil)))
 
@@ -2428,15 +2452,15 @@ core and return a descriptor to it."
     ;; Raw slots can not possibly work because dump-struct uses
     ;; %RAW-INSTANCE-REF/WORD which does not exist in the cross-compiler.
     ;; Remove this assertion if that problem is somehow circumvented.
-    (unless (= bitmap 0)
+    (unless (eql bitmap sb!kernel::+layout-all-tagged+)
       (error "Raw slots not working in genesis."))
     (loop for index downfrom (1- size) to sb!vm:instance-data-start
           for val = (pop-stack) then (pop-stack)
           do (write-wordindexed result
                                 (+ index sb!vm:instance-slots-offset)
                                 (if (logbitp index bitmap)
-                                    (descriptor-word-sized-integer val)
-                                    val)))
+                                    val
+                                    (descriptor-word-sized-integer val))))
     result))
 
 (define-cold-fop (fop-layout)
@@ -2492,28 +2516,28 @@ core and return a descriptor to it."
 
 ;;; Load a symbol SIZE characters long from FASL-INPUT, and
 ;;; intern that symbol in PACKAGE.
-(defun cold-load-symbol (size package fasl-input)
-  (let ((string (make-string size)))
+(defun cold-load-symbol (length+flag package fasl-input)
+  (let ((string (make-string (ash length+flag -1))))
     (read-string-as-bytes (%fasl-input-stream fasl-input) string)
     (push-fop-table (intern string package) fasl-input)))
 
 ;; I don't feel like hacking up DEFINE-COLD-FOP any more than necessary,
 ;; so this code is handcrafted to accept two operands.
-(flet ((fop-cold-symbol-in-package-save (fasl-input index pname-len)
-         (cold-load-symbol pname-len (ref-fop-table fasl-input index)
+(flet ((fop-cold-symbol-in-package-save (fasl-input index length+flag)
+         (cold-load-symbol length+flag (ref-fop-table fasl-input index)
                            fasl-input)))
   (dotimes (i 16) ; occupies 16 cells in the dispatch table
     (setf (svref **fop-funs** (+ (get 'fop-symbol-in-package-save 'opcode) i))
           #'fop-cold-symbol-in-package-save)))
 
-(define-cold-fop (fop-lisp-symbol-save (namelen))
-  (cold-load-symbol namelen *cl-package* (fasl-input)))
+(define-cold-fop (fop-lisp-symbol-save (length+flag))
+  (cold-load-symbol length+flag *cl-package* (fasl-input)))
 
-(define-cold-fop (fop-keyword-symbol-save (namelen))
-  (cold-load-symbol namelen *keyword-package* (fasl-input)))
+(define-cold-fop (fop-keyword-symbol-save (length+flag))
+  (cold-load-symbol length+flag *keyword-package* (fasl-input)))
 
-(define-cold-fop (fop-uninterned-symbol-save (namelen))
-  (let ((name (make-string namelen)))
+(define-cold-fop (fop-uninterned-symbol-save (length+flag))
+  (let ((name (make-string (ash length+flag -1))))
     (read-string-as-bytes (fasl-input-stream) name)
     (push-fop-table (get-uninterned-symbol name) (fasl-input))))
 
@@ -3281,14 +3305,16 @@ core and return a descriptor to it."
   ;; Assembly code needs only the constants for UNDEFINED_[ALIEN_]FUN_ERROR
   ;; but to avoid imparting that knowledge here, we'll expose all error
   ;; number constants except for OBJECT-NOT-<x>-ERROR ones.
-  (loop for interr across sb!c:+backend-internal-errors+
+  (loop for (description name) across sb!c:+backend-internal-errors+
         for i from 0
-        when (stringp (car interr))
-        do (format t "#define ~A ~D~%" (c-symbol-name (cdr interr)) i))
+        when (stringp description)
+        do (format t "#define ~A ~D~%" (c-symbol-name name) i))
   ;; C code needs strings for describe_internal_error()
   (format t "#define INTERNAL_ERROR_NAMES ~{\\~%~S~^, ~}~2%"
           (map 'list 'sb!kernel::!c-stringify-internal-error
                sb!c:+backend-internal-errors+))
+  (format t "#define INTERNAL_ERROR_NARGS {~{~S~^, ~}}~2%"
+          (map 'list #'cddr sb!c:+backend-internal-errors+))
 
   ;; I'm not really sure why this is in SB!C, since it seems
   ;; conceptually like something that belongs to SB!VM. In any case,
@@ -3408,11 +3434,11 @@ core and return a descriptor to it."
     ;; "self layout" slots are named '_layout' instead of 'layout' so that
     ;; classoid's expressly declared layout isn't renamed as a special-case.
     (format t "    lispobj _layout;~%")
-    ;; For GC, the relevant notion of length is what the structure
-    ;; actually occupies in memory, so we make sure the C struct
-    ;; incorporates a final padding word if necessary.
-    (let ((names ; round dd-length to odd so that total + header is even
-           (coerce (loop for i from 1 below (logior (dd-length dd) 1)
+    ;; Output exactly the number of Lisp words consumed by the structure,
+    ;; no more, no less. C code can always compute the padded length from
+    ;; the precise length, but the other way doesn't work.
+    (let ((names
+           (coerce (loop for i from 1 below (dd-length dd)
                          collect (list (format nil "word_~D_" (1+ i))))
                    'vector)))
       (dolist (slot (dd-slots dd))
@@ -3441,8 +3467,23 @@ core and return a descriptor to it."
               (+ sb!vm:static-space-start
                  sb!vm:n-word-bytes
                  sb!vm:other-pointer-lowtag
-                   (if symbol (sb!vm:static-symbol-offset symbol) 0))))))
+                 (if symbol (sb!vm:static-symbol-offset symbol) 0))))))
 
+(defun write-sc-offset-coding ()
+  (flet ((write-array (name bytes)
+           (format t "static struct sc_offset_byte ~A[] = {~@
+                      ~{    {~{ ~2D, ~2D ~}}~^,~%~}~@
+                      };~2%"
+                   name
+                   (mapcar (lambda (byte)
+                             (list (byte-size byte) (byte-position byte)))
+                           bytes))))
+    (format t "struct sc_offset_byte {
+    int position;
+    int size;
+};~2%")
+    (write-array "sc_offset_sc_number_bytes" sb!c::+sc-offset-scn-bytes+)
+    (write-array "sc_offset_offset_bytes"    sb!c::+sc-offset-offset-bytes+)))
 
 ;;;; writing map file
 
@@ -3682,6 +3723,7 @@ initially undefined function references:~2%")
 ;;; perhaps eventually in SB-LD or SB-BOOT.
 (defun sb!vm:genesis (&key
                       object-file-names
+                      preload-file
                       symbol-table-file-name
                       core-file-name
                       map-file-name
@@ -3689,6 +3731,7 @@ initially undefined function references:~2%")
                       #+nil (list-objects t))
   #!+sb-dynamic-core
   (declare (ignorable symbol-table-file-name))
+  (declare (special core-file-name))
 
   (format t
           "~&beginning GENESIS, ~A~%"
@@ -3708,7 +3751,7 @@ initially undefined function references:~2%")
           (load-cold-foreign-symbol-table symbol-table-file-name)
           (error "can't output a core file without symbol table file input")))
 
-    #!+sb-dynamic-core
+    #!+(and sb-dynamic-core (not read-only-tramps))
     (progn
       (setf (gethash (extern-alien-name "undefined_tramp")
                      *cold-foreign-symbol-table*)
@@ -3782,6 +3825,14 @@ initially undefined function references:~2%")
            (*deferred-known-fun-refs* nil)
            #!+x86 (*load-time-code-fixups* (make-hash-table)))
 
+      ;; If we're given a preload file, it contains tramps and whatnot
+      ;; that must be loaded before we create any FDEFNs.  It can in
+      ;; theory be loaded any time between binding
+      ;; *COLD-ASSEMBLER-ROUTINES* above and calling
+      ;; INITIALIZE-STATIC-FNS below.
+      (when preload-file
+        (cold-load preload-file))
+
       ;; Prepare for cold load.
       (initialize-non-nil-symbols)
       (initialize-layouts)
@@ -3817,7 +3868,6 @@ initially undefined function references:~2%")
 
       ;; Cold load.
       (dolist (file-name object-file-names)
-        (write-line (namestring file-name))
         (cold-load file-name))
 
       (when *known-structure-classoids*
@@ -3913,6 +3963,7 @@ initially undefined function references:~2%")
            (write-structure-object
             (layout-info (find-layout class)))))
         (out-to "static-symbols" (write-static-symbols))
+        (out-to "sc-offset" (write-sc-offset-coding))
 
         (let ((fn (format nil "~A/Makefile.features" c-header-dir-name)))
           (ensure-directories-exist fn)

@@ -51,8 +51,7 @@
   (slots () :type list)
   ;; a list of (NAME . INDEX) pairs for accessors of included structures
   (inherited-accessor-alist () :type list)
-  ;; number of elements we've allocated (See also RAW-LENGTH, which is not
-  ;; included in LENGTH.)
+  ;; number of elements including the layout itself (minimum=1)
   (length 0 :type index)
   ;; General kind of implementation.
   (type 'structure :type (member structure vector list
@@ -153,7 +152,7 @@
   ;; This slot is known to the C runtime support code.
   (pure nil :type (member t nil 0))
   ;; Map of raw slot indices.
-  (bitmap 0 :type unsigned-byte)
+  (bitmap +layout-all-tagged+ :type layout-bitmap)
   ;; Per-slot comparator for implementing EQUALP.
   (equalp-tests #() :type simple-vector)
   ;; Definition location

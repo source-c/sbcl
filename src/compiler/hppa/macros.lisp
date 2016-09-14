@@ -200,16 +200,8 @@ initializes the object."
     (when vop
       (note-this-location vop :internal-error))
     (inst break kind)
-    (with-adjustable-vector (vector)
-      (write-var-integer code vector)
-      (dolist (tn values)
-        (write-var-integer (make-sc-offset (sc-number
-                                            (tn-sc tn))
-                                           (tn-offset tn))
-                           vector))
-      (inst byte (length vector))
-      (dotimes (i (length vector))
-        (inst byte (aref vector i))))
+    (inst byte code)
+    (encode-internal-error-args values)
     (emit-alignment word-shift)))
 
 (defun error-call (vop error-code &rest values)
@@ -438,4 +430,3 @@ garbage collection.  This is currently implemented by disabling GC"
   (declare (ignore objects))            ;should we eval these for side-effect?
   `(without-gcing
     ,@body))
-

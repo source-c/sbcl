@@ -307,16 +307,9 @@
     (inst debug-trap)
     ;; The rest of this is "just" the encoded error details.
     (inst byte kind)
-    (with-adjustable-vector (vector)
-      (write-var-integer code vector)
-      (dolist (tn values)
-        (write-var-integer (make-sc-offset (sc-number (tn-sc tn))
-                                           (or (tn-offset tn) 0))
-                           vector))
-      (inst byte (length vector))
-      (dotimes (i (length vector))
-        (inst byte (aref vector i)))
-      (emit-alignment word-shift))))
+    (inst byte code)
+    (encode-internal-error-args values)
+    (emit-alignment word-shift)))
 
 (defun error-call (vop error-code &rest values)
   #!+sb-doc

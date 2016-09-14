@@ -148,7 +148,7 @@
       (inst addu lip function
             (- (ash simple-fun-code-offset word-shift)
                fun-pointer-lowtag))
-      (inst li lip (make-fixup "closure_tramp" :foreign))
+      (inst li lip (make-fixup 'closure-tramp :assembly-routine))
       (emit-label normal-fn)
       (storew lip fdefn fdefn-raw-addr-slot other-pointer-lowtag)
       (storew function fdefn fdefn-fun-slot other-pointer-lowtag)
@@ -162,7 +162,7 @@
   (:results (result :scs (descriptor-reg)))
   (:generator 38
     (storew null-tn fdefn fdefn-fun-slot other-pointer-lowtag)
-    (inst li temp (make-fixup "undefined_tramp" :foreign))
+    (inst li temp (make-fixup 'undefined-tramp :assembly-routine))
     (storew temp fdefn fdefn-raw-addr-slot other-pointer-lowtag)
     (move result fdefn)))
 
@@ -175,7 +175,7 @@
 ;;; symbol.
 ;;; See the "Chapter 9: Specials" of the SBCL Internals Manual.
 
-(define-vop (bind)
+(define-vop (dynbind)
   (:args (val :scs (any-reg descriptor-reg))
          (symbol :scs (descriptor-reg)))
   (:temporary (:scs (descriptor-reg)) temp)

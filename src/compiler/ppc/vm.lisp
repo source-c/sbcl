@@ -17,7 +17,7 @@
 ;;; slots are required by architecture, mostly (?) to make C backtrace
 ;;; work. This must be a power of 2 - see BYTES-REQUIRED-FOR-NUMBER-STACK.
 ;;;
-(def!constant number-stack-displacement
+(defconstant number-stack-displacement
   (* #!-darwin 2
      #!+darwin 8
      n-word-bytes))
@@ -30,7 +30,7 @@
 (macrolet ((defreg (name offset)
                (let ((offset-sym (symbolicate name "-OFFSET")))
                  `(eval-when (:compile-toplevel :load-toplevel :execute)
-                   (def!constant ,offset-sym ,offset)
+                   (defconstant ,offset-sym ,offset)
                    (setf (svref *register-names* ,offset-sym) ,(symbol-name name)))))
 
            (defregset (name &rest regs)
@@ -98,27 +98,7 @@
 (define-storage-base constant :non-packed)
 (define-storage-base immediate-constant :non-packed)
 
-;;;
-;;; Handy macro so we don't have to keep changing all the numbers whenever
-;;; we insert a new storage class.
-;;;
-(defmacro define-storage-classes (&rest classes)
-  (do ((forms (list 'progn)
-              (let* ((class (car classes))
-                     (sc-name (car class))
-                     (constant-name (intern (concatenate 'simple-string
-                                                         (string sc-name)
-                                                         "-SC-NUMBER"))))
-                (list* `(define-storage-class ,sc-name ,index
-                          ,@(cdr class))
-                       `(def!constant ,constant-name ,index)
-                       forms)))
-       (index 0 (1+ index))
-       (classes classes (cdr classes)))
-      ((null classes)
-       (nreverse forms))))
-
-(define-storage-classes
+(!define-storage-classes
 
   ;; Non-immediate contstants in the constant pool
   (constant constant)
@@ -300,18 +280,18 @@
 ;;;; function call parameters
 
 ;;; the SC numbers for register and stack arguments/return values
-(def!constant immediate-arg-scn (sc-number-or-lose 'any-reg))
-(def!constant control-stack-arg-scn (sc-number-or-lose 'control-stack))
+(defconstant immediate-arg-scn (sc-number-or-lose 'any-reg))
+(defconstant control-stack-arg-scn (sc-number-or-lose 'control-stack))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 
 ;;; offsets of special stack frame locations
-(def!constant ocfp-save-offset 0)
-(def!constant lra-save-offset 1)
-(def!constant nfp-save-offset 2)
+(defconstant ocfp-save-offset 0)
+(defconstant lra-save-offset 1)
+(defconstant nfp-save-offset 2)
 
 ;;; the number of arguments/return values passed in registers
-(def!constant register-arg-count 4)
+(defconstant register-arg-count 4)
 
 ;;; names to use for the argument registers
 
@@ -336,7 +316,7 @@
 (export 'single-value-return-byte-offset)
 
 ;;; This is used by the debugger.
-(def!constant single-value-return-byte-offset 8)
+(defconstant single-value-return-byte-offset 8)
 
 ;;; This function is called by debug output routines that want a pretty name
 ;;; for a TN's location.  It returns a thing that can be printed with PRINC.

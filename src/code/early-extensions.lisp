@@ -145,14 +145,14 @@
 ;;; if so, perhaps implement a DEFTRANSFORM or something to stop it.
 ;;; (or just find a nicer way of expressing characters portably?) --
 ;;; WHN 19990713
-(def!constant bell-char-code 7)
-(def!constant backspace-char-code 8)
-(def!constant tab-char-code 9)
-(def!constant line-feed-char-code 10)
-(def!constant form-feed-char-code 12)
-(def!constant return-char-code 13)
-(def!constant escape-char-code 27)
-(def!constant rubout-char-code 127)
+(defconstant bell-char-code 7)
+(defconstant backspace-char-code 8)
+(defconstant tab-char-code 9)
+(defconstant line-feed-char-code 10)
+(defconstant form-feed-char-code 12)
+(defconstant return-char-code 13)
+(defconstant escape-char-code 27)
+(defconstant rubout-char-code 127)
 
 ;;;; type-ish predicates
 
@@ -278,9 +278,7 @@
         (push `(,n-value ,default) binds)
         (let ((macro-body
                (if (or (null collector) (eq collector 'collect))
-                   (let ((n-tail
-                          (make-symbol
-                           (concatenate 'string (symbol-name name) "-TAIL"))))
+                   (let ((n-tail (gensymify* name "-TAIL")))
                      (push n-tail ignores)
                      (push `(,n-tail ,(if default `(last ,n-value))) binds)
                      `(collect-list-expander ',n-value ',n-tail args))
@@ -835,6 +833,7 @@
 ;;; PACKAGE-DESIGNATOR is actually a deleted package, and in that case
 ;;; you generally do want to signal an error instead of proceeding.)
 (defun %find-package-or-lose (package-designator)
+  #-sb-xc-host(declare (optimize allow-non-returning-tail-call))
   (or (find-package package-designator)
       (error 'simple-package-error
              :package package-designator
@@ -845,6 +844,7 @@
 ;;; consequences of most operations on deleted packages are
 ;;; unspecified. We try to signal errors in such cases.
 (defun find-undeleted-package-or-lose (package-designator)
+  #-sb-xc-host(declare (optimize allow-non-returning-tail-call))
   (let ((maybe-result (%find-package-or-lose package-designator)))
     (if (package-%name maybe-result)    ; if not deleted
         maybe-result
@@ -864,6 +864,7 @@
 
 ;;; Signal an error unless NAME is a legal function name.
 (defun legal-fun-name-or-type-error (name)
+  #-sb-xc-host(declare (optimize allow-non-returning-tail-call))
   (unless (legal-fun-name-p name)
     (error 'simple-type-error
            :datum name
@@ -1251,6 +1252,7 @@
               (deprecation-info-replacements info)))))
 
 (defun deprecation-error (software version namespace name replacements)
+  #-sb-xc-host(declare (optimize allow-non-returning-tail-call))
   (error 'deprecation-error
          :namespace namespace
          :name name
@@ -1690,6 +1692,13 @@ to :INTERPRET, an interpreter will be used.")
            ,@forms
            (truly-the (simple-array character (*))
                       (get-output-stream-string ,var))))))
+
+(defun possibly-base-stringize (s)
+  (cond #!+(and sb-unicode (host-feature sb-xc))
+        ((and (typep s '(array character (*))) (every #'base-char-p s))
+         (coerce s 'base-string))
+        (t
+         s)))
 
 (defun self-evaluating-p (x)
   (typecase x

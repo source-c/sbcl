@@ -631,7 +631,7 @@ unless :NAMED is also specified.")))
                    (or (dd-class-p dd) named-p))
           (setf (dd-predicate-name dd) (symbolicate name "-P")))
         (unless (option-present-p :conc-name)
-          (setf (dd-conc-name dd) (concatenate 'string (string name) "-")))
+          (setf (dd-conc-name dd) (string (gensymify* name "-"))))
         (unless (option-present-p :copier)
           (setf (dd-copier-name dd) (symbolicate "COPY-" name))))))
   dd)
@@ -1311,17 +1311,21 @@ or they must be declared locally notinline at each call site.~@:>"
   (values))
 
 (defun dd-bitmap (dd)
-  ;; The bitmap stores a 1 for each untagged word,
-  ;; including any internal padding words for alignment.
-  ;; The 0th bit is initialized to 0 because the LAYOUT is a tagged
+  ;; The bitmap stores a 1 for each tagged word, and a 0 for each raw word.
+  ;; The 0th bit is should always be 1 because the LAYOUT is a tagged
   ;; slot that is not present in DD-SLOTS.
-  ;; All other bits start as 1 and are cleared if the word is tagged.
-  ;; A final padding word, if any, is regarded as tagged.
-  (let ((bitmap (ldb (byte (dd-length dd) 0)
-                     (ash -1 sb!vm:instance-data-start))))
-    (dolist (slot (dd-slots dd) bitmap)
-      (when (eql t (dsd-raw-type slot))
-        (setf (ldb (byte 1 (dsd-index slot)) bitmap) 0)))))
+  (let ((slots (dd-slots dd))
+        (length (dd-length dd)))
+    (if (find t slots :key #'dsd-raw-type :test #'neq)
+        ;; A final padding word, if any, is regarded as tagged.
+        ;; If the length is even, then there is padding, because the
+        ;; header is 1 word, and padding make it even again.
+        (let ((bitmap (logior (if (evenp length) (ash 1 length) 0) 1)))
+          (dolist (slot slots bitmap)
+            (when (eql t (dsd-raw-type slot))
+              (setf bitmap (logior bitmap (ash 1 (dsd-index slot)))))))
+        ;; As a special case, -1 implies that all slots are tagged.
+        -1)))
 
 ;;; This is called when we are about to define a structure class. It
 ;;; returns a (possibly new) class object and the layout which should
@@ -1714,7 +1718,7 @@ or they must be declared locally notinline at each call site.~@:>"
                                               metaclass-constructor
                                               slot-names)
   (let* ((dd (make-defstruct-description t class-name))
-         (conc-name (concatenate 'string (symbol-name class-name) "-"))
+         (conc-name (string (gensymify* class-name "-")))
          (dd-slots (let ((reversed-result nil)
                          ;; The index starts at 1 for ordinary named
                          ;; slots because slot 0 is magical, used for
@@ -1936,17 +1940,8 @@ or they must be declared locally notinline at each call site.~@:>"
   (defun %instance-layout (instance)
     (classoid-layout (find-classoid (type-of instance))))
   (defun %instance-length (instance)
-    ;; INSTANCE-LENGTH tells you how many data words the backend is able to
-    ;; physically access in this structure. Since every structure occupies
-    ;; an even number of words, the storage slots comprise an odd number
-    ;; of words after subtracting 1 for the header.
-    ;; And in fact the fasl dumper / loader do write and read potentially
-    ;; one cell beyond the instance's LAYOUT-LENGTH if it was not odd.
-    ;; I'm not sure whether that is a good or bad thing.
-    ;; But be that as it may, in the cross-compiler you must not access
-    ;; more cells than there are in the declared structure because there
-    ;; is no lower level storage that you can peek at.
-    ;; So INSTANCE-LENGTH is exactly the same as LAYOUT-LENGTH on the host.
+    ;; In the target, it is theoretically possible to have %INSTANCE-LENGTH
+    ;; exceeed layout length, but in the cross-compiler they're the same.
     (layout-length (%instance-layout instance)))
   (defun %instance-ref (instance index)
     (let ((layout (%instance-layout instance)))

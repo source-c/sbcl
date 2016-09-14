@@ -76,14 +76,23 @@
 ;;; REX-R            A REX prefix with the "register" bit set was found
 ;;; REX-X            A REX prefix with the "index" bit set was found
 ;;; REX-B            A REX prefix with the "base" bit set was found
+(defconstant +operand-size-8+  #b1000000)
+(defconstant +operand-size-16+ #b0100000)
+(defconstant +rex+             #b0010000)
+;;; The next 4 exactly correspond to the bits in the REX prefix itself,
+;;; to avoid unpacking and stuffing into inst-properties one at a time.
+(defconstant +rex-w+           #b0001000)
+(defconstant +rex-r+           #b0000100)
+(defconstant +rex-x+           #b0000010)
+(defconstant +rex-b+           #b0000001)
 
 ;;; Return the operand size depending on the prefixes and width bit as
 ;;; stored in DSTATE.
 (defun inst-operand-size (dstate)
   (declare (type disassem-state dstate))
-  (cond ((dstate-get-inst-prop dstate 'operand-size-8) :byte)
-        ((dstate-get-inst-prop dstate 'rex-w) :qword)
-        ((dstate-get-inst-prop dstate 'operand-size-16) :word)
+  (cond ((dstate-get-inst-prop dstate +operand-size-8+) :byte)
+        ((dstate-get-inst-prop dstate +rex-w+) :qword)
+        ((dstate-get-inst-prop dstate +operand-size-16+) :word)
         (t +default-operand-size+)))
 
 ;;; The same as INST-OPERAND-SIZE, but for those instructions (e.g.
@@ -91,7 +100,7 @@
 ;;; be overwritten to :word.
 (defun inst-operand-size-default-qword (dstate)
   (declare (type disassem-state dstate))
-  (if (dstate-get-inst-prop dstate 'operand-size-16) :word :qword))
+  (if (dstate-get-inst-prop dstate +operand-size-16+) :word :qword))
 
 ;;; This prefilter is used solely for its side effects, namely to put
 ;;; the bits found in the REX prefix into the DSTATE for use by other
@@ -99,15 +108,7 @@
 (defun prefilter-wrxb (dstate value)
   (declare (type (unsigned-byte 4) value)
            (type disassem-state dstate))
-  (dstate-put-inst-prop dstate 'rex)
-  (when (plusp (logand value #b1000))
-    (dstate-put-inst-prop dstate 'rex-w))
-  (when (plusp (logand value #b0100))
-    (dstate-put-inst-prop dstate 'rex-r))
-  (when (plusp (logand value #b0010))
-    (dstate-put-inst-prop dstate 'rex-x))
-  (when (plusp (logand value #b0001))
-    (dstate-put-inst-prop dstate 'rex-b))
+  (dstate-put-inst-prop dstate (logior +rex+ (logand value #b1111)))
   value)
 
 ;;; The two following prefilters are used instead of prefilter-wrxb when
@@ -115,38 +116,35 @@
 ;;; always used together, so only the first one sets the REX property.
 (defun prefilter-rex-w (dstate value)
   (declare (type bit value) (type disassem-state dstate))
-  (dstate-put-inst-prop dstate 'rex)
-  (when (plusp value)
-    (dstate-put-inst-prop dstate 'rex-w)))
+  (dstate-put-inst-prop dstate (logior +rex+ (if (plusp value) +rex-w+ 0))))
 
 (defun prefilter-rex-b (dstate value)
   (declare (type bit value) (type disassem-state dstate))
-  (when (plusp value)
-    (dstate-put-inst-prop dstate 'rex-b)))
+  (dstate-put-inst-prop dstate (if (plusp value) +rex-b+ 0)))
 
 ;;; This prefilter is used solely for its side effect, namely to put
 ;;; the property OPERAND-SIZE-8 into the DSTATE if VALUE is 0.
 (defun prefilter-width (dstate value)
   (declare (type bit value) (type disassem-state dstate))
   (when (zerop value)
-    (dstate-put-inst-prop dstate 'operand-size-8))
+    (dstate-put-inst-prop dstate +operand-size-8+))
   value)
 
 ;;; This prefilter is used solely for its side effect, namely to put
 ;;; the property OPERAND-SIZE-16 into the DSTATE.
 (defun prefilter-x66 (dstate junk)
   (declare (type disassem-state dstate) (ignore junk))
-  (dstate-put-inst-prop dstate 'operand-size-16))
+  (dstate-put-inst-prop dstate +operand-size-16+))
 
 ;;; A register field that can be extended by REX.R.
 (defun prefilter-reg-r (dstate value)
   (declare (type reg value) (type disassem-state dstate))
-  (if (dstate-get-inst-prop dstate 'rex-r) (+ value 8) value))
+  (if (dstate-get-inst-prop dstate +rex-r+) (+ value 8) value))
 
 ;;; A register field that can be extended by REX.B.
 (defun prefilter-reg-b (dstate value)
   (declare (type reg value) (type disassem-state dstate))
-  (if (dstate-get-inst-prop dstate 'rex-b) (+ value 8) value))
+  (if (dstate-get-inst-prop dstate +rex-b+) (+ value 8) value))
 
 ;;; Returns either an integer, meaning a register, or a list of
 ;;; (BASE-REG OFFSET INDEX-REG INDEX-SCALE), where any component
@@ -161,43 +159,31 @@
   (declare (type disassem-state dstate)
            (type (unsigned-byte 2) mod)
            (type (unsigned-byte 3) r/m))
-  (flet ((extend (bit-name reg)
+  (flet ((displacement ()
+           (case mod
+             (#b01 (read-signed-suffix 8 dstate))
+             (#b10 (read-signed-suffix 32 dstate))))
+         (extend (bit-name reg)
            (logior (if (dstate-get-inst-prop dstate bit-name) 8 0)
                    reg)))
     (declare (inline extend))
-    (let ((full-reg (extend 'rex-b r/m)))
-      (cond ((= mod #b11)
-             ;; registers
-             full-reg)
+    (let ((full-reg (extend +rex-b+ r/m)))
+      (cond ((= mod #b11) full-reg) ; register direct mode
             ((= r/m #b100) ; SIB byte - rex.b is "don't care"
-             (let* ((sib (the (unsigned-byte 8)
-                              (read-suffix 8 dstate)))
-                    (base-reg (ldb (byte 3 0) sib))
-                    (index-reg (extend 'rex-x (ldb (byte 3 3) sib)))
-                    (offset
-                         (case mod
-                               (#b00
-                                (if (= base-reg #b101)
-                                    (read-signed-suffix 32 dstate)
-                                  nil))
-                               (#b01
-                                (read-signed-suffix 8 dstate))
-                               (#b10
-                                (read-signed-suffix 32 dstate)))))
+             (let* ((sib (the (unsigned-byte 8) (read-suffix 8 dstate)))
+                    (index-reg (extend +rex-x+ (ldb (byte 3 3) sib)))
+                    (base-reg (ldb (byte 3 0) sib)))
+               ;; mod=0 and base=RBP means no base reg
                (list (unless (and (= mod #b00) (= base-reg #b101))
-                       (extend 'rex-b base-reg))
-                     offset
+                       (extend +rex-b+ base-reg))
+                     (cond ((/= mod #b00) (displacement))
+                           ((= base-reg #b101) (read-signed-suffix 32 dstate)))
                      (unless (= index-reg #b100) index-reg) ; index can't be RSP
                      (ash 1 (ldb (byte 2 6) sib)))))
+            ((/= mod #b00) (list full-reg (displacement)))
             ;; rex.b is not decoded in determining RIP-relative mode
-            ((and (= mod #b00) (= r/m #b101))
-             (list 'rip (read-signed-suffix 32 dstate)))
-            ((= mod #b00)
-             (list full-reg))
-            ((= mod #b01)
-             (list full-reg (read-signed-suffix 8 dstate)))
-            (t                            ; (= mod #b10)
-             (list full-reg (read-signed-suffix 32 dstate)))))))
+            ((= r/m #b101) (list 'rip (read-signed-suffix 32 dstate)))
+            (t (list full-reg))))))
 
 (defun read-address (dstate)
   (read-suffix (width-bits (inst-operand-size dstate)) dstate))
@@ -1674,7 +1660,8 @@
             ;; the linkage table) and for linkage table references, since
             ;; these should always end up in low memory.
             (aver (or (member (fixup-flavor src)
-                              '(:foreign :foreign-dataref :symbol-tls-index))
+                              '(:foreign :foreign-dataref :symbol-tls-index
+                                :assembly-routine))
                       (eq (ea-size dst) :dword)))
             (maybe-emit-rex-for-ea segment dst nil)
             (emit-byte segment #b11000111)
@@ -2471,8 +2458,8 @@
       (emit-byte segment #b11101000) ; 32 bit relative
       (emit-dword-displacement-backpatch segment where))
      (fixup
-      ;; There is no CALL rel64...
-      (error "Cannot CALL a fixup: ~S" where))
+      (emit-byte segment #b11101000)
+      (emit-relative-fixup segment where))
      (t
       (maybe-emit-rex-for-ea segment where nil :operand-size :do-not-set)
       (emit-byte segment #b11111111)

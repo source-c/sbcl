@@ -175,12 +175,12 @@
 
 ;;;; Constants used by instruction emitters.
 
-(def!constant special-op #b000000)
-(def!constant bcond-op #b000001)
-(def!constant cop0-op #b010000)
-(def!constant cop1-op #b010001)
-(def!constant cop2-op #b010010)
-(def!constant cop3-op #b010011)
+(defconstant special-op #b000000)
+(defconstant bcond-op #b000001)
+(defconstant cop0-op #b010000)
+(defconstant cop1-op #b010001)
+(defconstant cop2-op #b010010)
+(defconstant cop3-op #b010011)
 
 
 
@@ -1072,14 +1072,6 @@
          (nt "Function end breakpoint trap"))
         (#.after-breakpoint-trap
          (nt "After breakpoint trap"))
-        ;; KLUDGE: see comment in compiler/generic/genesis regarding
-        ;; the non-exportation of PSEUDO-ATOMIC-TRAP.
-        (#.sb!vm::pseudo-atomic-trap
-         (nt "Pseudo atomic trap"))
-        (#.object-not-list-trap
-         (nt "Object not list trap"))
-        (#.object-not-instance-trap
-         (nt "Object not instance trap"))
         (#.single-step-around-trap
          (nt "Single step around trap"))
         (#.single-step-before-trap
@@ -1115,12 +1107,16 @@
   (emit-word segment 0))
 
 (define-instruction word (segment word)
-  (:declare (type (or (unsigned-byte 32) (signed-byte 32)) word))
   :pinned
   (:cost 0)
   (:delay 0)
   (:emitter
-   (emit-word segment word)))
+   (etypecase word
+     (fixup
+      (note-fixup segment :absolute word)
+      (emit-word segment 0))
+     (integer
+      (emit-word segment word)))))
 
 (define-instruction short (segment short)
   (:declare (type (or (unsigned-byte 16) (signed-byte 16)) short))
