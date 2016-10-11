@@ -45,11 +45,6 @@
 ;;; and thus not supported by this assembler/disassembler.
 (defconstant +default-address-size+ :qword)
 
-(defun offset-next (value dstate)
-  (declare (type integer value)
-           (type disassem-state dstate))
-  (+ (dstate-next-addr dstate) value))
-
 (defparameter *byte-reg-names*
   #(al cl dl bl spl bpl sil dil r8b r9b r10b r11b r12b r13b r14b r15b))
 (defparameter *high-byte-reg-names*
@@ -102,26 +97,6 @@
   (declare (type disassem-state dstate))
   (if (dstate-get-inst-prop dstate +operand-size-16+) :word :qword))
 
-;;; This prefilter is used solely for its side effects, namely to put
-;;; the bits found in the REX prefix into the DSTATE for use by other
-;;; prefilters and by printers.
-(defun prefilter-wrxb (dstate value)
-  (declare (type (unsigned-byte 4) value)
-           (type disassem-state dstate))
-  (dstate-put-inst-prop dstate (logior +rex+ (logand value #b1111)))
-  value)
-
-;;; The two following prefilters are used instead of prefilter-wrxb when
-;;; the bits of the REX prefix need to be treated individually. They are
-;;; always used together, so only the first one sets the REX property.
-(defun prefilter-rex-w (dstate value)
-  (declare (type bit value) (type disassem-state dstate))
-  (dstate-put-inst-prop dstate (logior +rex+ (if (plusp value) +rex-w+ 0))))
-
-(defun prefilter-rex-b (dstate value)
-  (declare (type bit value) (type disassem-state dstate))
-  (dstate-put-inst-prop dstate (if (plusp value) +rex-b+ 0)))
-
 ;;; This prefilter is used solely for its side effect, namely to put
 ;;; the property OPERAND-SIZE-8 into the DSTATE if VALUE is 0.
 (defun prefilter-width (dstate value)
@@ -129,12 +104,6 @@
   (when (zerop value)
     (dstate-put-inst-prop dstate +operand-size-8+))
   value)
-
-;;; This prefilter is used solely for its side effect, namely to put
-;;; the property OPERAND-SIZE-16 into the DSTATE.
-(defun prefilter-x66 (dstate junk)
-  (declare (type disassem-state dstate) (ignore junk))
-  (dstate-put-inst-prop dstate +operand-size-16+))
 
 ;;; A register field that can be extended by REX.R.
 (defun prefilter-reg-r (dstate value)
@@ -145,48 +114,6 @@
 (defun prefilter-reg-b (dstate value)
   (declare (type reg value) (type disassem-state dstate))
   (if (dstate-get-inst-prop dstate +rex-b+) (+ value 8) value))
-
-;;; Returns either an integer, meaning a register, or a list of
-;;; (BASE-REG OFFSET INDEX-REG INDEX-SCALE), where any component
-;;; may be missing or nil to indicate that it's not used or has the
-;;; obvious default value (e.g., 1 for the index-scale). VALUE is a list
-;;; of the mod and r/m field of the ModRM byte of the instruction.
-;;; Depending on VALUE a SIB byte and/or an offset may be read. The
-;;; REX.B bit from DSTATE is used to extend the sole register or the
-;;; BASE-REG to a full register, the REX.X bit does the same for the
-;;; INDEX-REG.
-(defun prefilter-reg/mem (dstate mod r/m)
-  (declare (type disassem-state dstate)
-           (type (unsigned-byte 2) mod)
-           (type (unsigned-byte 3) r/m))
-  (flet ((displacement ()
-           (case mod
-             (#b01 (read-signed-suffix 8 dstate))
-             (#b10 (read-signed-suffix 32 dstate))))
-         (extend (bit-name reg)
-           (logior (if (dstate-get-inst-prop dstate bit-name) 8 0)
-                   reg)))
-    (declare (inline extend))
-    (let ((full-reg (extend +rex-b+ r/m)))
-      (cond ((= mod #b11) full-reg) ; register direct mode
-            ((= r/m #b100) ; SIB byte - rex.b is "don't care"
-             (let* ((sib (the (unsigned-byte 8) (read-suffix 8 dstate)))
-                    (index-reg (extend +rex-x+ (ldb (byte 3 3) sib)))
-                    (base-reg (ldb (byte 3 0) sib)))
-               ;; mod=0 and base=RBP means no base reg
-               (list (unless (and (= mod #b00) (= base-reg #b101))
-                       (extend +rex-b+ base-reg))
-                     (cond ((/= mod #b00) (displacement))
-                           ((= base-reg #b101) (read-signed-suffix 32 dstate)))
-                     (unless (= index-reg #b100) index-reg) ; index can't be RSP
-                     (ash 1 (ldb (byte 2 6) sib)))))
-            ((/= mod #b00) (list full-reg (displacement)))
-            ;; rex.b is not decoded in determining RIP-relative mode
-            ((= r/m #b101) (list 'rip (read-signed-suffix 32 dstate)))
-            (t (list full-reg))))))
-
-(defun read-address (dstate)
-  (read-suffix (width-bits (inst-operand-size dstate)) dstate))
 
 (defun width-bits (width)
   (ecase width
@@ -199,10 +126,19 @@
 ;;;; disassembler argument types
 
 ;;; Used to capture the lower four bits of the REX prefix all at once ...
-(define-arg-type wrxb :prefilter #'prefilter-wrxb)
+(define-arg-type wrxb
+  :prefilter (lambda (dstate value)
+               (dstate-put-inst-prop dstate (logior +rex+ (logand value #b1111)))
+               value))
 ;;; ... or individually (not needed for REX.R and REX.X).
-(define-arg-type rex-w :prefilter #'prefilter-rex-w)
-(define-arg-type rex-b :prefilter #'prefilter-rex-b)
+;;; They are always used together, so only the first one sets the REX property.
+(define-arg-type rex-w
+  :prefilter  (lambda (dstate value)
+                (dstate-put-inst-prop dstate
+                                      (logior +rex+ (if (plusp value) +rex-w+ 0)))))
+(define-arg-type rex-b
+  :prefilter (lambda (dstate value)
+               (dstate-put-inst-prop dstate (if (plusp value) +rex-b+ 0))))
 
 (define-arg-type width
   :prefilter #'prefilter-width
@@ -212,11 +148,14 @@
                     stream)))
 
 ;;; Used to capture the effect of the #x66 operand size override prefix.
-(define-arg-type x66 :prefilter #'prefilter-x66)
+(define-arg-type x66
+  :prefilter (lambda (dstate junk)
+               (declare (ignore junk))
+               (dstate-put-inst-prop dstate +operand-size-16+)))
 
 (define-arg-type displacement
   :sign-extend t
-  :use-label #'offset-next
+  :use-label (lambda (value dstate) (+ (dstate-next-addr dstate) value))
   :printer (lambda (value stream dstate)
              (maybe-note-assembler-routine value nil dstate)
              (print-label value stream dstate)))
@@ -241,7 +180,8 @@
   :printer #'print-reg-default-qword)
 
 (define-arg-type imm-addr
-  :prefilter #'read-address
+  :prefilter (lambda (dstate)
+               (read-suffix (width-bits (inst-operand-size dstate)) dstate))
   :printer #'print-label)
 
 ;;; Normally, immediate values for an operand size of :qword are of size
@@ -1853,13 +1793,6 @@
               (xchg-reg-with-something operand2 operand1))
              (t
               (error "bogus args to XCHG: ~S ~S" operand1 operand2)))))))
-
-;; If the filtered VALUE (R/M field of LEA) should be treated as a label,
-;; return the virtual address, otherwise the value unchanged.
-(defun lea-compute-label (value dstate)
-  (if (and (listp value) (eq (first value) 'rip))
-      (+ (dstate-next-addr dstate) (second value))
-      value))
 
 (define-instruction lea (segment dst src)
   (:printer

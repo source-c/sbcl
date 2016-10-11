@@ -2280,14 +2280,14 @@ maybe_adjust_large_object(lispobj *where)
  * and since that leaves forwarding pointers in the unprotected
  * areas you cannot scavenge it again until those are gone.
  */
-void
-scavenge_pinned_range(void* page_base, int start, int length)
+static void
+scavenge_pinned_range(void* page_base, int start, int count)
 {
-    // 'start' and 'length' are expressed in units of dwords
-    scavenge((lispobj*)page_base + 2*start, 2*length);
+    // 'start' and 'count' are expressed in units of dwords
+    scavenge((lispobj*)page_base + 2*start, 2*count);
 }
 
-void
+static void
 scavenge_pinned_ranges()
 {
     page_index_t page;
@@ -2300,13 +2300,12 @@ scavenge_pinned_ranges()
     }
 }
 
-void wipe_range(void* page_base, int start, int length)
+static void wipe_range(void* page_base, int start, int count)
 {
-    bzero((lispobj*)page_base + 2*start, length*2*N_WORD_BYTES);
+    bzero((lispobj*)page_base + 2*start, count*2*N_WORD_BYTES);
 }
 
-int verbosefixes = 0;
-void
+static void
 wipe_nonpinned_words()
 {
     page_index_t i;
@@ -2330,8 +2329,8 @@ wipe_nonpinned_words()
 #endif
 }
 
-void
-set_page_consi_bit(page_index_t pageindex, lispobj *mark_which_pointer)
+static void
+pin_words(page_index_t pageindex, lispobj *mark_which_pointer)
 {
     struct page *page = &page_table[pageindex];
 
@@ -2366,7 +2365,7 @@ set_page_consi_bit(page_index_t pageindex, lispobj *mark_which_pointer)
     unsigned int index;
     in_use_marker_t *bitmap = pinned_dwords(pageindex);
     for (index = begin_dword_index; index < end_dword_index; index++)
-        bitmap[index/N_WORD_BITS] |= 1LU << (index % N_WORD_BITS);
+        bitmap[index/N_WORD_BITS] |= (uword_t)1 << (index % N_WORD_BITS);
 }
 
 /* Take a possible pointer to a Lisp object and mark its page in the
@@ -2457,7 +2456,7 @@ preserve_pointer(void *addr)
             possibly_valid_dynamic_space_pointer_s(addr, first_page,
                                                    &begin_ptr);
         }
-        set_page_consi_bit(first_page, begin_ptr);
+        pin_words(first_page, begin_ptr);
     }
 #endif
 
@@ -2750,7 +2749,7 @@ scavenge_newspace_generation(generation_index_t generation)
     size_t previous_new_areas_index;
 
     /* Flush the current regions updating the tables. */
-    gc_alloc_update_all_page_tables();
+    gc_alloc_update_all_page_tables(0);
 
     /* Turn on the recording of new areas by gc_alloc(). */
     new_areas = current_new_areas;
@@ -2774,7 +2773,7 @@ scavenge_newspace_generation(generation_index_t generation)
     scav_weak_hash_tables();
 
     /* Flush the current regions updating the tables. */
-    gc_alloc_update_all_page_tables();
+    gc_alloc_update_all_page_tables(0);
 
     /* Grab new_areas_index. */
     current_new_areas_index = new_areas_index;
@@ -2824,7 +2823,7 @@ scavenge_newspace_generation(generation_index_t generation)
             scav_weak_hash_tables();
 
             /* Flush the current regions updating the tables. */
-            gc_alloc_update_all_page_tables();
+            gc_alloc_update_all_page_tables(0);
 
         } else {
 
@@ -2840,7 +2839,7 @@ scavenge_newspace_generation(generation_index_t generation)
             scav_weak_hash_tables();
 
             /* Flush the current regions updating the tables. */
-            gc_alloc_update_all_page_tables();
+            gc_alloc_update_all_page_tables(0);
         }
 
         current_new_areas_index = new_areas_index;
@@ -3019,6 +3018,9 @@ is_in_stack_space(lispobj ptr)
     return 0;
 }
 
+// NOTE: This function can produces false failure indications,
+// usually related to dynamic space pointing to the stack of a
+// dead thread, but there may be other reasons as well.
 static void
 verify_space(lispobj *start, size_t words)
 {
@@ -3029,7 +3031,7 @@ verify_space(lispobj *start, size_t words)
 
     while (words > 0) {
         size_t count = 1;
-        lispobj thing = *(lispobj*)start;
+        lispobj thing = *start;
 
         if (is_lisp_pointer(thing)) {
             page_index_t page_index = find_page_index((void*)thing);
@@ -3075,9 +3077,6 @@ verify_space(lispobj *start, size_t words)
                 extern char __attribute__((unused)) funcallable_instance_tramp;
                 /* Verify that it points to another valid space. */
                 if (!to_readonly_space && !to_static_space
-#ifndef LISP_FEATURE_READ_ONLY_TRAMPS
-                    && (thing != (lispobj)&funcallable_instance_tramp)
-#endif
                     && !is_in_stack_space(thing)) {
                     lose("Ptr %p @ %p sees junk.\n", thing, start);
                 }
@@ -3265,6 +3264,8 @@ verify_space(lispobj *start, size_t words)
     }
 }
 
+static void verify_dynamic_space();
+
 static void
 verify_gc(void)
 {
@@ -3289,17 +3290,19 @@ verify_gc(void)
     }
     verify_space((lispobj*)READ_ONLY_SPACE_START, read_only_space_size);
     verify_space((lispobj*)STATIC_SPACE_START   , static_space_size);
+    verify_dynamic_space();
 }
 
 static void
 verify_generation(generation_index_t generation)
 {
     page_index_t i;
+    int genmask = generation >= 0 ? 1 << generation : ~0;
 
     for (i = 0; i < last_free_page; i++) {
         if (page_allocated_p(i)
             && (page_table[i].bytes_used != 0)
-            && (page_table[i].gen == generation)) {
+            && ((1 << page_table[i].gen) & genmask)) {
             page_index_t last_page;
 
             /* This should be the start of a contiguous block */
@@ -3313,7 +3316,7 @@ verify_generation(generation_index_t generation)
             for (last_page = i; ;last_page++)
                 /* Check whether this is the last page in this contiguous
                  * block. */
-                if (page_ends_contiguous_block_p(last_page, generation))
+                if (page_ends_contiguous_block_p(last_page, page_table[i].gen))
                     break;
 
             verify_space(page_address(i),
@@ -3365,7 +3368,7 @@ void
 gencgc_verify_zero_fill(void)
 {
     /* Flush the alloc regions updating the tables. */
-    gc_alloc_update_all_page_tables();
+    gc_alloc_update_all_page_tables(1);
     SHOW("verifying zero fill");
     verify_zero_fill();
 }
@@ -3373,11 +3376,7 @@ gencgc_verify_zero_fill(void)
 static void
 verify_dynamic_space(void)
 {
-    generation_index_t i;
-
-    for (i = 0; i <= HIGHEST_NORMAL_GENERATION; i++)
-        verify_generation(i);
-
+    verify_generation(-1);
     if (gencgc_enable_verify_zero_fill)
         verify_zero_fill();
 }
@@ -3782,7 +3781,7 @@ garbage_collect_generation(generation_index_t generation, int raise)
         scavenge_newspace_generation_one_scan(new_space);
 
         /* Flush the current regions, updating the tables. */
-        gc_alloc_update_all_page_tables();
+        gc_alloc_update_all_page_tables(1);
 
         bytes_allocated = bytes_allocated - old_bytes_allocated;
 
@@ -3798,7 +3797,7 @@ garbage_collect_generation(generation_index_t generation, int raise)
     wipe_nonpinned_words();
 
     /* Flush the current regions, updating the tables. */
-    gc_alloc_update_all_page_tables();
+    gc_alloc_update_all_page_tables(0);
 
     /* Free the pages in oldspace, but not those marked dont_move. */
     free_oldspace();
@@ -3827,7 +3826,6 @@ garbage_collect_generation(generation_index_t generation, int raise)
             SHOW("verifying");
         }
         verify_gc();
-        verify_dynamic_space();
     }
 
     /* Set the new gc trigger for the GCed generation. */
@@ -3945,7 +3943,7 @@ collect_garbage(generation_index_t last_gen)
     }
 
     /* Flush the alloc regions updating the tables. */
-    gc_alloc_update_all_page_tables();
+    gc_alloc_update_all_page_tables(1);
 
     /* Verify the new objects created by Lisp code. */
     if (pre_verify_gen_0) {
@@ -4085,7 +4083,7 @@ collect_garbage(generation_index_t last_gen)
  * PURIFY flush the current gc_alloc() region, as the page_tables are
  * re-initialized, and every page is zeroed to be sure. */
 void
-gc_free_heap(void)
+gc_free_heap(void) // FIXME: remove, not used
 {
     page_index_t page, last_page;
 
@@ -4317,7 +4315,7 @@ gencgc_pickup_dynamic(void)
 
     generations[gen].bytes_allocated = bytes_allocated;
 
-    gc_alloc_update_all_page_tables();
+    gc_alloc_update_all_page_tables(1);
     write_protect_generation_pages(gen);
 }
 
@@ -4585,15 +4583,33 @@ void
 unhandled_sigmemoryfault(void *addr)
 {}
 
-void gc_alloc_update_all_page_tables(void)
+static void
+update_thread_page_tables(struct thread *th)
+{
+    gc_alloc_update_page_tables(BOXED_PAGE_FLAG, &th->alloc_region);
+#if defined(LISP_FEATURE_SB_SAFEPOINT_STRICTLY) && !defined(LISP_FEATURE_WIN32)
+    gc_alloc_update_page_tables(BOXED_PAGE_FLAG, &th->sprof_alloc_region);
+#endif
+}
+
+/* GC is single-threaded and all memory allocations during a
+   collection happen in the GC thread, so it is sufficient to update
+   all the the page tables once at the beginning of a collection and
+   update only page tables of the GC thread during the collection. */
+void gc_alloc_update_all_page_tables(int for_all_threads)
 {
     /* Flush the alloc regions updating the tables. */
     struct thread *th;
-    for_each_thread(th) {
-        gc_alloc_update_page_tables(BOXED_PAGE_FLAG, &th->alloc_region);
-#if defined(LISP_FEATURE_SB_SAFEPOINT_STRICTLY) && !defined(LISP_FEATURE_WIN32)
-        gc_alloc_update_page_tables(BOXED_PAGE_FLAG, &th->sprof_alloc_region);
-#endif
+    if (for_all_threads) {
+        for_each_thread(th) {
+            update_thread_page_tables(th);
+        }
+    }
+    else {
+        th = arch_os_get_current_thread();
+        if (th) {
+            update_thread_page_tables(th);
+        }
     }
     gc_alloc_update_page_tables(UNBOXED_PAGE_FLAG, &unboxed_region);
     gc_alloc_update_page_tables(BOXED_PAGE_FLAG, &boxed_region);

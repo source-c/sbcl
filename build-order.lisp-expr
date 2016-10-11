@@ -84,7 +84,6 @@
  ("src/code/cross-byte"  :not-target)
  ("src/code/cross-misc"  :not-target)
  ("src/code/cross-char"  :not-target)
- ("src/code/cross-boole" :not-target)
  ("src/code/cross-float" :not-target)
  ("src/code/cross-io"    :not-target)
  ("src/code/cross-sap"   :not-target)
@@ -605,7 +604,6 @@
  ("src/assembly/target/array"      :assem :not-host)
  ("src/assembly/target/arith"      :assem :not-host)
  ("src/assembly/target/alloc"      :assem :not-host)
- #!+read-only-tramps
  ("src/assembly/target/tramps"     :assem :not-host :not-genesis)
 
  ("src/compiler/pseudo-vops")

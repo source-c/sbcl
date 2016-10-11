@@ -383,7 +383,12 @@ catch_exception_raise(mach_port_t exception_port,
     struct thread *th;
 
     FSHOW((stderr,"/entering catch_exception_raise with exception: %d\n", exception));
-    th = *(struct thread**)exception_port;
+
+    if (mach_port_get_context(mach_task_self(), exception_port, (mach_port_context_t *)&th)
+        != KERN_SUCCESS) {
+        lose("Can't find the thread for an exception %p", exception_port);
+    }
+
     /* Get state and info */
     state_count = x86_THREAD_STATE32_COUNT;
     if ((ret = thread_get_state(thread,
@@ -480,15 +485,12 @@ catch_exception_raise(mach_port_t exception_port,
       call_handler_on_thread(thread, &thread_state, signal, &siginfo, handler);
     }
 
-    if (current_mach_task == MACH_PORT_NULL)
-        current_mach_task = mach_task_self();
-
-    dealloc_ret = mach_port_deallocate (current_mach_task, thread);
+    dealloc_ret = mach_port_deallocate (mach_task_self(), thread);
     if (dealloc_ret) {
       lose("mach_port_deallocate (thread) failed with return_code %d\n", dealloc_ret);
     }
 
-    dealloc_ret = mach_port_deallocate (current_mach_task, task);
+    dealloc_ret = mach_port_deallocate (mach_task_self(), task);
     if (dealloc_ret) {
       lose("mach_port_deallocate (task) failed with return_code %d\n", dealloc_ret);
     }

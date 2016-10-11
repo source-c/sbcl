@@ -37,14 +37,17 @@
             (when (zerop pid)
               (target-compile-stem stem flags)
               ;; FIXME: convey exit code based on COMPILE result.
-              (sb-sys:os-exit 0))
+              #.(if (eq :external
+                        (nth-value 1 (find-symbol "OS-EXIT" :sb-sys)))
+                    `(,(find-symbol "OS-EXIT" :sb-sys) 0)
+                    `(sb-unix:unix-exit 0)))
             (push pid subprocess-list))
           (incf subprocess-count)
           ;; Cause the compile-time effects from this file
           ;; to appear in subsequently forked children.
           (let ((*compile-for-effect-only* t))
             (target-compile-stem stem flags))
-          (unless (find :not-target flags)
+          (unless (find :not-genesis flags)
             (push (stem-object-path stem flags :target-compile)
                   reversed-target-object-file-names))))
       (loop (if (plusp subprocess-count) (wait) (return)))

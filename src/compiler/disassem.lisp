@@ -78,7 +78,6 @@
 #!-sb-fluid
 (declaim (inline dchunk-or dchunk-and dchunk-clear dchunk-not
                  dchunk-make-mask dchunk-make-field
-                 sap-ref-dchunk
                  dchunk-extract
                  dchunk=
                  dchunk-count-bits))
@@ -135,46 +134,6 @@
 
 (defmacro make-dchunk (value)
   `(the dchunk ,value))
-
-#-sb-xc-host ;; FIXME: function belongs in 'target-disassem'
-(defun sap-ref-dchunk (sap byte-offset byte-order)
-  (declare (type sb!sys:system-area-pointer sap)
-           (type offset byte-offset)
-           (muffle-conditions compiler-note) ; returns possible bignum
-           ;; Not all backends can actually disassemble for either byte order.
-           (ignorable byte-order)
-           (optimize (speed 3) (safety 0)))
-  #!+x86-64
-  (logand (sb!sys:sap-ref-word sap byte-offset) dchunk-one)
-  #!-x86-64
-  (the dchunk
-       (ecase dchunk-bits
-         (32 (if (eq byte-order :big-endian)
-                 (+ (ash (sb!sys:sap-ref-8 sap byte-offset) 24)
-                    (ash (sb!sys:sap-ref-8 sap (+ 1 byte-offset)) 16)
-                    (ash (sb!sys:sap-ref-8 sap (+ 2 byte-offset)) 8)
-                    (sb!sys:sap-ref-8 sap (+ 3 byte-offset)))
-                 (+ (sb!sys:sap-ref-8 sap byte-offset)
-                    (ash (sb!sys:sap-ref-8 sap (+ 1 byte-offset)) 8)
-                    (ash (sb!sys:sap-ref-8 sap (+ 2 byte-offset)) 16)
-                    (ash (sb!sys:sap-ref-8 sap (+ 3 byte-offset)) 24))))
-         (64 (if (eq byte-order :big-endian)
-                 (+ (ash (sb!sys:sap-ref-8 sap byte-offset) 56)
-                    (ash (sb!sys:sap-ref-8 sap (+ 1 byte-offset)) 48)
-                    (ash (sb!sys:sap-ref-8 sap (+ 2 byte-offset)) 40)
-                    (ash (sb!sys:sap-ref-8 sap (+ 3 byte-offset)) 32)
-                    (ash (sb!sys:sap-ref-8 sap (+ 4 byte-offset)) 24)
-                    (ash (sb!sys:sap-ref-8 sap (+ 5 byte-offset)) 16)
-                    (ash (sb!sys:sap-ref-8 sap (+ 6 byte-offset)) 8)
-                    (sb!sys:sap-ref-8 sap (+ 7 byte-offset)))
-                 (+ (sb!sys:sap-ref-8 sap byte-offset)
-                    (ash (sb!sys:sap-ref-8 sap (+ 1 byte-offset)) 8)
-                    (ash (sb!sys:sap-ref-8 sap (+ 2 byte-offset)) 16)
-                    (ash (sb!sys:sap-ref-8 sap (+ 3 byte-offset)) 24)
-                    (ash (sb!sys:sap-ref-8 sap (+ 4 byte-offset)) 32)
-                    (ash (sb!sys:sap-ref-8 sap (+ 5 byte-offset)) 40)
-                    (ash (sb!sys:sap-ref-8 sap (+ 6 byte-offset)) 48)
-                    (ash (sb!sys:sap-ref-8 sap (+ 7 byte-offset)) 56)))))))
 
 (defun dchunk-corrected-extract (from pos unit-bits byte-order)
   (declare (type dchunk from))
@@ -1054,13 +1013,13 @@
                     (:constructor %make-segment)
                     (:copier nil))
   (sap-maker (missing-arg)
-             :type (function () sb!sys:system-area-pointer))
+             :type (function () system-area-pointer))
   ;; Length in bytes of the range of memory covered by this segment.
   (length 0 :type disassem-length)
   (virtual-location 0 :type address)
   (storage-info nil :type (or null storage-info))
   ;; KLUDGE: CODE-COMPONENT is not a type the host understands
-  #-sb-xc-host (code nil :type (or null sb!kernel:code-component))
+  #-sb-xc-host (code nil :type (or null code-component))
   (unboxed-data-range nil :type (or null (cons fixnum fixnum)))
   (hooks nil :type list))
 
@@ -1075,9 +1034,12 @@
   ;; offset of next position
   (next-offs 0 :type offset)
   ;; a sap pointing to our segment
-  (segment-sap nil :type (or null sb!sys:system-area-pointer))
+  (segment-sap nil :type (or null system-area-pointer))
   ;; the current segment
   (segment nil :type (or null segment))
+  ;; to avoid buffer overrun at segment end, we might need to copy bytes
+  ;; here first because sap-ref-dchunk reads a fixed length.
+  (scratch-buf (make-array 8 :element-type '(unsigned-byte 8)))
   ;; what to align to in most cases
   (alignment sb!vm:n-word-bytes :type alignment)
   (byte-order :little-endian
@@ -1089,6 +1051,11 @@
   (inst-properties nil :type (or fixnum list))
   (filtered-values (make-array max-filtered-value-index)
                    :type filtered-value-vector)
+  ;; to avoid consing decoded values, a prefilter can keep a chain
+  ;; of objects in these slots. The objects returned here
+  ;; are reusable for the next instruction.
+  (filtered-arg-pool-in-use)
+  (filtered-arg-pool-free)
   ;; used for prettifying printing
   (addr-print-len nil :type (or null (integer 0 20)))
   (argument-column 0 :type column)

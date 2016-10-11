@@ -25,6 +25,8 @@
  *   <ftp://ftp.cs.utexas.edu/pub/garbage/bigsurv.ps>.
  */
 
+#define _GNU_SOURCE /* for ffsl(3) from string.h */
+
 #include <stdio.h>
 #include <signal.h>
 #include <string.h>
@@ -694,7 +696,7 @@ static void instance_scan_range(void* instance_ptr, int offset, int nwords)
 }
 
 // Helper function for stepping through the tagged slots of an instance in
-// scav_instance and verify_space (which, as it happens, is not useful).
+// scav_instance and verify_space.
 void
 instance_scan_interleaved(void (*proc)(lispobj*, sword_t),
                           lispobj *instance_ptr,
@@ -710,7 +712,7 @@ instance_scan_interleaved(void (*proc)(lispobj*, sword_t),
 
   ++instance_ptr; // was supplied as the address of the header word
   if (fixnump(layout_bitmap)) {
-      long bitmap = (sword_t)layout_bitmap >> N_FIXNUM_TAG_BITS; // signed integer!
+      sword_t bitmap = (sword_t)layout_bitmap >> N_FIXNUM_TAG_BITS; // signed integer!
       for (index = 0; index < n_words ; index++, bitmap >>= 1)
           if (bitmap & 1)
               proc(instance_ptr + index, 1);

@@ -373,6 +373,7 @@
          (symbol :scs (descriptor-reg)))
   (:temporary (:sc unsigned-reg :offset rax-offset) tls-index)
   (:temporary (:sc unsigned-reg) bsp tmp)
+  (:vop-var vop)
   (:generator 10
     (load-binding-stack-pointer bsp)
     (inst mov (reg-in-size tls-index :dword) (tls-index-of symbol))
@@ -381,8 +382,7 @@
     (inst test (reg-in-size tls-index :dword) (reg-in-size tls-index :dword))
     (inst jmp :ne TLS-INDEX-VALID)
     (inst mov tls-index symbol)
-    (inst mov tmp (make-fixup 'alloc-tls-index :assembly-routine))
-    (inst call tmp)
+    (invoke-asm-routine 'call 'alloc-tls-index vop tmp)
     TLS-INDEX-VALID
     (inst mov tmp (make-ea :qword :base thread-base-tn :index tls-index))
     (storew tmp bsp (- binding-value-slot binding-size))
@@ -645,6 +645,7 @@
               (:generator 4
                 (inst ,inst/c (make-ea-for-raw-slot object index) value))))))
     (def word unsigned-reg unsigned-num mov)
+    (def signed-word signed-reg signed-num mov)
     (def single single-reg single-float movss)
     (def double double-reg double-float movsd)
     (def complex-single complex-single-reg complex-single-float movq)

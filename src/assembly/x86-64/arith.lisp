@@ -30,6 +30,9 @@
         fixnum-tag-mask))
 )
 
+#+sb-xc-host
+(defmacro static-fun-addr (name)
+  `(make-ea :qword :disp (+ nil-value (static-fun-offset ,name))))
 
 ;;;; addition, subtraction, and multiplication
 
@@ -62,11 +65,7 @@
                 (inst push (make-ea :qword :base rbp-tn
                             :disp (frame-byte-offset return-pc-save-offset)))
                 (inst mov rcx (fixnumize 2)) ; arg count
-                (inst jmp
-                      (make-ea :qword
-                               :disp (+ nil-value
-                                        (static-fun-offset
-                                         ',(symbolicate "TWO-ARG-" fun))))))))
+                (inst jmp (static-fun-addr ',(symbolicate "TWO-ARG-" fun))))))
 
   #.`
   (define-generic-arith-routine (+ 10)
@@ -153,8 +152,7 @@
   (inst push (make-ea :qword :base rbp-tn
                       :disp (frame-byte-offset return-pc-save-offset)))
   (inst mov rcx (fixnumize 1))    ; arg count
-  (inst jmp (make-ea :qword
-                     :disp (+ nil-value (static-fun-offset '%negate))))
+  (inst jmp (static-fun-addr '%negate))
 
   FIXNUM
   (move res x)
@@ -205,9 +203,7 @@
                                              -3
                                              ocfp-save-offset))))
                 (inst mov rcx (fixnumize 2))
-                (inst call (make-ea :qword
-                                    :disp (+ nil-value
-                                             (static-fun-offset ',static-fn))))
+                (inst call (static-fun-addr ',static-fn))
                 ;; HACK: We depend on NIL having the lowest address of all
                 ;; static symbols (including T)
                 ,@(ecase test
@@ -253,8 +249,7 @@
                                       -3
                                       ocfp-save-offset))))
   (inst mov rcx (fixnumize 2))
-  (inst call (make-ea :qword
-                      :disp (+ nil-value (static-fun-offset 'eql))))
+  (inst call (static-fun-addr 'eql))
   (inst cmp x (+ nil-value (static-symbol-offset t)))
   (inst pop rbp-tn))
 
@@ -293,8 +288,7 @@
                                       ocfp-save-offset))))
 
   (inst mov rcx (fixnumize 2))
-  (inst call (make-ea :qword
-                      :disp (+ nil-value (static-fun-offset 'two-arg-=))))
+  (inst call (static-fun-addr 'two-arg-=))
   (inst cmp x (+ nil-value (static-symbol-offset t)))
   (inst pop rbp-tn))
 
@@ -386,6 +380,7 @@
          ;; as this vop clobbers RCX in the call. If changed to "CALL [ADDR]"
          ;; be sure to update the subroutine to push and pop RCX.
          (:temporary (:sc unsigned-reg :offset rcx-offset) rcx)
+         (:vop-var vop)
          (:generator ,cost
            (progn
              ;; POPCNT = ECX bit 23 = bit 7 of byte index 2
@@ -407,8 +402,7 @@
              (inst jmp done))
          slow
            (move rdx arg)
-           (inst mov rcx (make-fixup 'logcount :assembly-routine))
-           (inst call rcx)
+           (invoke-asm-routine 'call 'logcount vop rcx)
            (move result rdx)
          done))))
   (def-it unsigned-byte-64-count 14 unsigned-reg unsigned-num)

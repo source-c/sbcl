@@ -5949,3 +5949,66 @@
                         (bar #'y)
                         (if x
                             (return-from test))))))))
+
+(with-test (:name :mv-call-no-let-conversion)
+  (assert (equal
+           (funcall
+            (checked-compile
+             '(lambda ()
+               (locally (declare (optimize (sb-c::let-conversion 0)))
+                 (multiple-value-call #'lisp-implementation-version (values))))))
+           (lisp-implementation-version)))
+  (assert (equal
+           (funcall
+            (checked-compile
+             '(lambda ()
+               (locally (declare (optimize (sb-c::let-conversion 0)))
+                 (multiple-value-call #'lisp-implementation-type (values))))))
+           (lisp-implementation-type)))
+  (assert (equal
+           (funcall
+            (checked-compile
+             '(lambda ()
+               (locally (declare (optimize (sb-c::let-conversion 0)))
+                 (multiple-value-call #'princ-to-string 1)))))
+           "1")))
+
+(with-test (:name :mv-call-argument-mismatch)
+  (assert
+   (nth-value 2
+              (checked-compile
+               '(lambda () (multiple-value-call #'cons 1 2 3))
+               :allow-warnings t))))
+
+(with-test (:name :valid-callable-argument-cast)
+  (assert (equal (funcall (checked-compile '(lambda (x)
+                                             (find-if (the function #'oddp)
+                                              x)))
+                          '(2 4 3))
+                 3)))
+
+(with-test (:name :usigned-word-float-conversion)
+  (assert (= (rational (funcall (checked-compile `(lambda (x)
+                                                    (float (the sb-ext:word x) 1d0)))
+                                sb-ext:most-positive-word))
+             #+32-bit 4294967295
+             #+64-bit 18446744073709551616)))
+
+(with-test (:name :callable-argument-mismatch-on-xep)
+  (assert (= (funcall (checked-compile
+                       `(lambda (s x)
+                          (locally (declare (notinline reduce))
+                            (reduce (lambda (a b)
+                                      (+ a b x))
+                                    s))))
+                      '(1 2) 3)
+             6))
+  (assert (= (funcall (checked-compile
+                       `(lambda (s x)
+                          (locally (declare (notinline reduce))
+                            (reduce (lambda (&optional a b z)
+                                      (declare (ignore z))
+                                      (+ a b x))
+                                    s))))
+                      '(1 2) 3)
+             6)))

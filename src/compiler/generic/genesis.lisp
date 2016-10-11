@@ -240,7 +240,7 @@
 
 (cl:defmethod print-object ((gspace gspace) stream)
   (print-unreadable-object (gspace stream :type t)
-    (format stream "~S" (gspace-name gspace))))
+    (format stream "@#x~X ~S" (gspace-byte-address gspace) (gspace-name gspace))))
 
 (defun make-gspace (name identifier byte-address)
   (unless (zerop (rem byte-address target-space-alignment))
@@ -742,15 +742,6 @@ core and return a descriptor to it."
                                   sb!vm:complex-widetag))
     (float (float-to-core number))
     (t (error "~S isn't a cold-loadable number at all!" number))))
-
-(declaim (ftype (function (sb!vm:word) descriptor) sap-int-to-core))
-(defun sap-int-to-core (sap-int)
-  (let ((des (allocate-header+object *dynamic* (1- sb!vm:sap-size)
-                                      sb!vm:sap-widetag)))
-    (write-wordindexed des
-                       sb!vm:sap-pointer-slot
-                       (make-random-descriptor sap-int))
-    des))
 
 ;;; Allocate a cons cell in GSPACE and fill it in with CAR and CDR.
 (defun cold-cons (car cdr &optional (gspace *dynamic*))
@@ -1714,7 +1705,7 @@ core and return a descriptor to it."
 
   (cold-set '*!initial-debug-sources* *current-debug-sources*)
 
-  #!+(or x86 x86-64)
+  #!+x86
   (progn
     (cold-set 'sb!vm::*fp-constant-0d0* (number-to-core 0d0))
     (cold-set 'sb!vm::*fp-constant-1d0* (number-to-core 1d0))
@@ -1806,16 +1797,12 @@ core and return a descriptor to it."
             (write-wordindexed fdefn
                                sb!vm:fdefn-raw-addr-slot
                                (make-random-descriptor
-                                #!+read-only-tramps
                                 (or (lookup-assembler-reference
-                                     'sb!vm::undefined-tramp
-                                     (not (null core-file-name)))
+                                     'sb!vm::undefined-tramp core-file-name)
                                     ;; Our preload for the tramps
                                     ;; doesn't happen during host-1,
                                     ;; so substitute a usable value.
-                                    0)
-                                #!-read-only-tramps
-                                (cold-foreign-symbol-address "undefined_tramp"))))
+                                    0))))
           fdefn))))
 
 (defun cold-functionp (descriptor)
@@ -1833,35 +1820,23 @@ core and return a descriptor to it."
                      (if (symbolp name)
                          (values (cold-intern name) name)
                          (values name (warm-fun-name name))))
-                    (fdefn (cold-fdefinition-object cold-name t))
-                    (type (logand (descriptor-bits (read-memory defn))
-                                  sb!vm:widetag-mask)))
+                    (fdefn (cold-fdefinition-object cold-name t)))
     (when (cold-functionp (cold-fdefn-fun fdefn))
       (error "Duplicate DEFUN for ~S" warm-name))
+    ;; There can't be any closures or funcallable instances.
+    (aver (= (logand (descriptor-bits (read-memory defn)) sb!vm:widetag-mask)
+             sb!vm:simple-fun-header-widetag))
     (push (cold-cons cold-name inline-expansion) *!cold-defuns*)
     (write-wordindexed fdefn sb!vm:fdefn-fun-slot defn)
     (write-wordindexed fdefn
                        sb!vm:fdefn-raw-addr-slot
-                       (ecase type
-                         (#.sb!vm:simple-fun-header-widetag
-                          (/noshow0 "static-fset (simple-fun)")
-                          #!+(or sparc arm)
-                          defn
-                          #!-(or sparc arm)
+                       #!+(or sparc arm) defn
+                       #!-(or sparc arm)
                           (make-random-descriptor
                            (+ (logandc2 (descriptor-bits defn)
                                         sb!vm:lowtag-mask)
                               (ash sb!vm:simple-fun-code-offset
                                    sb!vm:word-shift))))
-                         (#.sb!vm:closure-header-widetag
-                          ;; There's no way to create a closure.
-                          (bug "FSET got closure-header-widetag")
-                          (/show0 "/static-fset (closure)")
-                          (make-random-descriptor
-                           #!+read-only-tramps
-                           (lookup-assembler-reference 'sb!vm::closure-tramp)
-                           #!-read-only-tramps
-                           (cold-foreign-symbol-address "closure_tramp")))))
     fdefn))
 
 (defun initialize-static-fns ()
@@ -2829,17 +2804,20 @@ core and return a descriptor to it."
              ;; Note: we round the number of constants up to ensure
              ;; that the code vector will be properly aligned.
              (round-up raw-header-n-words 2))
+            (toplevel-p (pop-stack))
+            (debug-info (pop-stack))
             (des (allocate-cold-descriptor *dynamic*
                                            (+ (ash header-n-words
                                                    sb!vm:word-shift)
                                               code-size)
                                            sb!vm:other-pointer-lowtag)))
+       (declare (ignore toplevel-p))
        (write-header-word des header-n-words sb!vm:code-header-widetag)
        (write-wordindexed des
                           sb!vm:code-code-size-slot
                           (make-fixnum-descriptor code-size))
        (write-wordindexed des sb!vm:code-entry-points-slot *nil-descriptor*)
-       (write-wordindexed des sb!vm:code-debug-info-slot (pop-stack))
+       (write-wordindexed des sb!vm:code-debug-info-slot debug-info)
        (when (oddp raw-header-n-words)
          (write-wordindexed des raw-header-n-words (make-descriptor 0)))
        (do ((index (1- raw-header-n-words) (1- index)))
@@ -3498,22 +3476,21 @@ core and return a descriptor to it."
     (dolist (routine (sort (copy-list *cold-assembler-routines*) #'<
                            :key #'cdr))
       (format t "~8,'0X: ~S~%" (cdr routine) (car routine)))
-    (let ((funs nil)
+    (let ((fdefns nil)
+          (funs nil)
           (undefs nil))
-      (maphash (lambda (name fdefn)
-                 (let ((fun (cold-fdefn-fun fdefn)))
-                   (if (cold-null fun)
-                       (push name undefs)
-                       (let ((addr (read-wordindexed
-                                    fdefn sb!vm:fdefn-raw-addr-slot)))
-                         (push (cons name (descriptor-bits addr))
-                               funs)))))
+      (maphash (lambda (name fdefn &aux (fun (cold-fdefn-fun fdefn)))
+                 (push (list (- (descriptor-bits fdefn) (descriptor-lowtag fdefn))
+                             name) fdefns)
+                 (if (cold-null fun)
+                     (push name undefs)
+                     (push (list (- (descriptor-bits fun) (descriptor-lowtag fun))
+                                 name) funs)))
                *cold-fdefn-objects*)
-      (format t "~%~|~%initially defined functions:~2%")
-      (setf funs (sort funs #'< :key #'cdr))
-      (dolist (info funs)
-        (format t "~8,'0X: ~S   #X~8,'0X~%" (cdr info) (car info)
-                (- (cdr info) #x17)))
+      (format t "~%~|~%fdefns (native pointer):
+~:{~%~8,'0X: ~S~}~%" (sort fdefns #'< :key #'car))
+      (format t "~%~|~%initially defined functions (native pointer):
+~:{~%~8,'0X: ~S~}~%" (sort funs #'< :key #'car))
       (format t
 "~%~|
 (a note about initially undefined function references: These functions
@@ -3672,11 +3649,12 @@ initially undefined function references:~2%")
 
       ;; Write the New Directory entry header.
       (write-word new-directory-core-entry-type-code)
-      (write-word 17) ; length = (5 words/space) * 3 spaces + 2 for header.
-
-      (output-gspace *read-only*)
-      (output-gspace *static*)
-      (output-gspace *dynamic*)
+      (let ((spaces (list *read-only*
+                          *static*
+                          *dynamic*)))
+        ;; length = (5 words/space) * N spaces + 2 for header.
+        (write-word (+ (* (length spaces) 5) 2))
+        (mapc #'output-gspace spaces))
 
       ;; Write the initial function.
       (write-word initial-fun-core-entry-type-code)
@@ -3750,13 +3728,6 @@ initially undefined function references:~2%")
       (if symbol-table-file-name
           (load-cold-foreign-symbol-table symbol-table-file-name)
           (error "can't output a core file without symbol table file input")))
-
-    #!+(and sb-dynamic-core (not read-only-tramps))
-    (progn
-      (setf (gethash (extern-alien-name "undefined_tramp")
-                     *cold-foreign-symbol-table*)
-            (dyncore-note-symbol "undefined_tramp" nil))
-      (dyncore-note-symbol "undefined_alien_function" nil))
 
     ;; Now that we've successfully read our only input file (by
     ;; loading the symbol table, if any), it's a good time to ensure
