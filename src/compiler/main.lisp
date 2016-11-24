@@ -565,6 +565,23 @@ necessary, since type inference may take arbitrarily long to converge.")
   (ir1-finalize component)
   (values))
 
+#!+immobile-code
+(progn
+  (declaim (type (member :immobile :dynamic) *compile-to-memory-space*))
+  ;; COMPILE-FILE puts all nontoplevel code in immobile space, but COMPILE
+  ;; offers a choice. Because the collector does not run often enough (yet),
+  ;; COMPILE usually places code in the dynamic space managed by our copying GC.
+  ;; Change this variable if your application always demands immobile code.
+  ;; The real default is set to :DYNAMIC in make-target-2-load.lisp
+  (defvar *compile-to-memory-space* :immobile) ; BUILD-TIME default
+  (defun code-immobile-p (node-or-component)
+    (if (fasl-output-p *compile-object*)
+        (neq (component-kind (if (node-p node-or-component)
+                                 (node-component node-or-component)
+                                 node-or-component))
+             :toplevel)
+        (eq *compile-to-memory-space* :immobile))))
+
 (defun %compile-component (component)
   (let ((*code-segment* nil)
         (*elsewhere* nil)
@@ -634,7 +651,9 @@ necessary, since type inference may take arbitrarily long to converge.")
           (maybe-mumble "code ")
 
           (multiple-value-bind (code-length fixup-notes)
-              (generate-code component)
+              (let (#!+immobile-code
+                    (*code-is-immobile* (code-immobile-p component)))
+                (generate-code component))
 
             #-sb-xc-host
             (when *compiler-trace-output*

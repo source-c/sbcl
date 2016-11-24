@@ -56,6 +56,13 @@
   (:generator 3
     (inst neg res x)))
 
+(define-vop (fast-negate/signed-unsigned signed-unop)
+  (:results (res :scs (unsigned-reg)))
+  (:result-types unsigned-num)
+  (:translate %negate)
+  (:generator 3
+    (inst neg res x)))
+
 (define-vop (fast-lognot/fixnum fixnum-unop)
   (:args (x :scs (any-reg)))
   (:arg-types tagged-num)
@@ -386,13 +393,14 @@
   (:temporary (:sc non-descriptor-reg) temp)
   (:variant-vars variant)
   (:generator 5
-    (move temp amount)
-    (inst cmp temp 0)
+    (inst subs temp amount zr-tn)
     (inst b :ge LEFT)
     (inst neg temp temp)
     (inst cmp temp n-word-bits)
-    (inst b :lt DO)
-    (inst mov temp (1- n-word-bits))
+    ;; Only the first 6 bits count for shifts.
+    ;; This sets all bits to 1 if AMOUNT is larger than 63,
+    ;; cutting the amount to 63.
+    (inst csinv temp temp zr-tn :lt)
     DO
     (ecase variant
       (:signed (inst asr result number temp))
@@ -400,9 +408,7 @@
     (inst b END)
     LEFT
     (inst cmp temp n-word-bits)
-    (inst b :lt DO2)
-    (inst mov temp (1- n-word-bits))
-    DO2
+    (inst csinv temp temp zr-tn :lt)
     (inst lsl result number temp)
     END))
 
@@ -552,10 +558,23 @@
   (:result-types positive-fixnum)
   (:temporary (:scs (non-descriptor-reg) :from (:argument 0)) temp)
   (:generator 30
-    (move temp arg)
-    (inst cmp temp 0)
-    (inst csinv temp temp temp :ge)
+    (inst cmp arg 0)
+    (inst csinv temp arg arg :ge)
     (inst clz temp temp)
+    (inst mov res (fixnumize 64))
+    (inst sub res res (lsl temp n-fixnum-tag-bits))))
+
+(define-vop (unsigned-byte-64-len)
+  (:translate integer-length)
+  (:note "inline (unsigned-byte 64) integer-length")
+  (:policy :fast-safe)
+  (:args (arg :scs (unsigned-reg) :target temp))
+  (:arg-types unsigned-num)
+  (:results (res :scs (any-reg)))
+  (:result-types positive-fixnum)
+  (:temporary (:scs (non-descriptor-reg) :from (:argument 0)) temp)
+  (:generator 29
+    (inst clz temp arg)
     (inst mov res (fixnumize 64))
     (inst sub res res (lsl temp n-fixnum-tag-bits))))
 
@@ -570,11 +589,15 @@
   (:temporary (:scs (non-descriptor-reg) :from (:argument 0) :to (:result 0)
                     :target res) num)
   (:temporary (:scs (non-descriptor-reg)) mask temp)
+  (:variant-vars signed)
   (:generator 30
-    (move num arg)
+    (when signed
+      (inst cmp arg 0)
+      (inst csinv num arg arg :ge)
+      (setf arg num))
     (load-immediate-word mask #x5555555555555555)
-    (inst and temp mask (lsr num 1))
-    (inst and num num mask)
+    (inst and temp mask (lsr arg 1))
+    (inst and num arg mask)
     (inst add num num temp)
     (load-immediate-word mask #x3333333333333333)
     (inst and temp mask (lsr num 2))
@@ -588,6 +611,13 @@
     (inst add num num (lsr num 16))
     (inst add num num (lsr num 32))
     (inst and res num #xff)))
+
+(define-vop (signed-byte-64-count unsigned-byte-64-count)
+  (:note "inline (signed-byte 64) logcount")
+  (:args (arg :scs (signed-reg) :target num))
+  (:arg-types signed-num)
+  (:variant t)
+  (:variant-cost 29))
 
 (defknown %%ldb (integer unsigned-byte unsigned-byte) unsigned-byte
   (movable foldable flushable always-translatable))

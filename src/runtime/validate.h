@@ -31,6 +31,7 @@
 #endif
 #define READ_ONLY_SPACE_SIZE (READ_ONLY_SPACE_END - READ_ONLY_SPACE_START)
 #define STATIC_SPACE_SIZE (STATIC_SPACE_END - STATIC_SPACE_START)
+#define IMMOBILE_SPACE_SIZE (IMMOBILE_SPACE_END - IMMOBILE_SPACE_START)
 #ifdef LISP_FEATURE_LINKAGE_TABLE
 #define LINKAGE_TABLE_SPACE_SIZE \
     (LINKAGE_TABLE_SPACE_END - LINKAGE_TABLE_SPACE_START)
@@ -89,7 +90,7 @@
 #define BINDING_STACK_RETURN_GUARD_PAGE(th) \
     (BINDING_STACK_GUARD_PAGE(th) - os_vm_page_size)
 
-extern void validate(void);
+extern void allocate_spaces(void);
 
 extern void
 protect_control_stack_hard_guard_page(int protect_p, struct thread *thread);

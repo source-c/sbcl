@@ -80,24 +80,6 @@
   (:generator 6
     (load-type result function (- fun-pointer-lowtag))))
 
-(define-vop (set-fun-subtype)
-  (:translate (setf fun-subtype))
-  (:policy :fast-safe)
-  (:args (type :scs (unsigned-reg) :target eax)
-         (function :scs (descriptor-reg)))
-  (:arg-types positive-fixnum *)
-  (:temporary (:sc unsigned-reg :offset rax-offset :from (:argument 0)
-                   :to (:result 0) :target result)
-              eax)
-  (:results (result :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 6
-    (move eax type)
-    (inst mov
-          (make-ea :byte :base function :disp (- fun-pointer-lowtag))
-          al-tn)
-    (move result eax)))
-
 (define-vop (get-header-data)
   (:translate get-header-data)
   (:policy :fast-safe)
@@ -116,7 +98,9 @@
   (:result-types positive-fixnum)
   (:generator 6
     (loadw res x 0 fun-pointer-lowtag)
-    (inst shr res n-widetag-bits)))
+    (inst shr res n-widetag-bits)
+    ;; In case there are closures in immobile space.
+    #!+immobile-space (inst and res short-header-max-words)))
 
 (define-vop (set-header-data)
   (:translate set-header-data)
@@ -195,8 +179,9 @@
   (:results (sap :scs (sap-reg) :from (:argument 0)))
   (:result-types system-area-pointer)
   (:generator 10
-    (loadw sap code 0 other-pointer-lowtag)
-    (inst shr sap n-widetag-bits)
+    (zeroize sap)
+    (inst mov (reg-in-size sap :word)
+              (make-ea :word :base code :disp (- 1 other-pointer-lowtag)))
     (inst lea sap (make-ea :byte :base code :index sap
                            :scale n-word-bytes
                            :disp (- other-pointer-lowtag)))))
@@ -207,8 +192,9 @@
   (:arg-types * positive-fixnum)
   (:results (func :scs (descriptor-reg) :from (:argument 0)))
   (:generator 10
-    (loadw func code 0 other-pointer-lowtag)
-    (inst shr func n-widetag-bits)
+    (zeroize func)
+    (inst mov (reg-in-size func :word)
+              (make-ea :word :base code :disp (- 1 other-pointer-lowtag)))
     (inst lea func
           (make-ea :byte :base offset :index func
                    :scale n-word-bytes

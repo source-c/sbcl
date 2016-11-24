@@ -16,13 +16,17 @@
 
 (in-package "SB!C")
 
-(declaim (ftype (sfunction (fixnum fixnum) code-component) allocate-code-object))
-(defun allocate-code-object (boxed unboxed)
+(declaim (ftype (sfunction (#!+immobile-code boolean fixnum fixnum)
+                           code-component) allocate-code-object))
+(defun allocate-code-object (#!+immobile-code immobile-p boxed unboxed)
   #!+gencgc
   (without-gcing
-    (%make-lisp-obj
-     (alien-funcall (extern-alien "alloc_code_object" (function unsigned unsigned unsigned))
-                    boxed unboxed)))
+   (if (or #!+immobile-code immobile-p)
+       #!+immobile-code (sb!vm::allocate-immobile-code boxed unboxed)
+       #!-immobile-code nil
+       (%make-lisp-obj
+        (alien-funcall (extern-alien "alloc_code_object" (function unsigned unsigned unsigned))
+                       boxed unboxed))))
   #!-gencgc
   (%primitive allocate-code-object boxed unboxed))
 
@@ -58,7 +62,9 @@
       (let* ((2comp (component-info component))
              (constants (ir2-component-constants 2comp))
              (box-num (- (length constants) sb!vm:code-constants-offset))
-             (code-obj (allocate-code-object box-num length))
+             (code-obj (allocate-code-object
+                        #!+immobile-code (eq *compile-to-memory-space* :immobile)
+                        box-num length))
              (fill-ptr (code-instructions code-obj)))
         (declare (type index box-num length))
 

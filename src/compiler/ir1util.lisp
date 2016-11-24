@@ -1302,7 +1302,9 @@
 (defun delete-optional-dispatch (leaf)
   (declare (type optional-dispatch leaf))
   (let ((entry (functional-entry-fun leaf)))
-    (unless (and entry (leaf-refs entry))
+    (unless (and entry
+                 (or (leaf-refs entry)
+                     (eq (functional-kind entry) :external)))
       (aver (or (not entry) (eq (functional-kind entry) :deleted)))
       (setf (functional-kind leaf) :deleted)
 
@@ -2048,6 +2050,11 @@ is :ANY, the function name is not checked."
               (return (and (null (cdr arg)) (null (leaf-refs (car arg))))))
              (t
               (return nil)))))))
+
+(defun call-all-args-fixed-p (call)
+  (loop for arg in (basic-combination-args call)
+        always (numberp (nth-value 1 (values-types
+                                      (lvar-derived-type arg))))))
 
 ;;; Return true if function is an external entry point. This is true
 ;;; of normal XEPs (:EXTERNAL kind) and also of top level lambdas

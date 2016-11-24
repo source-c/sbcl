@@ -253,35 +253,34 @@
 (defun real-get-method (generic-function qualifiers specializers
                         &optional (errorp t)
                         always-check-specializers)
-  (let ((lspec (length specializers))
+  (let ((specializer-count (length specializers))
         (methods (generic-function-methods generic-function)))
     (when (or methods always-check-specializers)
-      (let ((nreq (length (arg-info-metatypes (gf-arg-info
-                                               generic-function)))))
+      (let ((required-parameter-count
+             (length (arg-info-metatypes (gf-arg-info generic-function)))))
         ;; Since we internally bypass FIND-METHOD by using GET-METHOD
-        ;; instead we need to to this here or users may get hit by a
+        ;; instead we need to do this here or users may get hit by a
         ;; failed AVER instead of a sensible error message.
-        (when (/= lspec nreq)
+        (unless (= specializer-count required-parameter-count)
           (error
            'find-method-length-mismatch
-           :format-control
-           "~@<The generic function ~S takes ~D required argument~:P; ~
-            was asked to find a method with specializers ~S~@:>"
-           :format-arguments (list generic-function nreq specializers)))))
-    (let ((hit
-           (dolist (method methods)
-             (let ((mspecializers (method-specializers method)))
-               (aver (= lspec (length mspecializers)))
-               (when (and (equal qualifiers (safe-method-qualifiers method))
-                          (every #'same-specializer-p specializers
-                                 (method-specializers method)))
-                 (return method))))))
-      (cond (hit hit)
+           :format-control   "~@<The generic function ~S takes ~D ~
+                              required argument~:P; was asked to ~
+                              find a method with specializers ~S~@:>"
+           :format-arguments (list generic-function required-parameter-count
+                                   specializers)))))
+    (flet ((congruentp (other-method)
+             (let ((other-specializers (method-specializers other-method)))
+               (aver (= specializer-count (length other-specializers)))
+               (and (equal qualifiers (safe-method-qualifiers other-method))
+                    (every #'same-specializer-p specializers other-specializers)))))
+      (declare (dynamic-extent #'congruentp))
+      (cond ((find-if #'congruentp methods))
             ((null errorp) nil)
             (t
-             (error "~@<There is no method on ~S with ~
-                    ~:[no qualifiers~;~:*qualifiers ~S~] ~
-                    and specializers ~S.~@:>"
+             (error "~@<There is no method on ~S with ~:[no ~
+                     qualifiers~;~:*qualifiers ~S~] and specializers ~
+                     ~S.~@:>"
                     generic-function qualifiers specializers))))))
 
 (defmethod find-method ((generic-function standard-generic-function)
@@ -516,10 +515,10 @@
                        (analyze-lambda-list (method-lambda-list old-method)))
                       ((b-llks b-nreq b-nopt)
                        (analyze-lambda-list new-lambda-list)))
-               (and (= a-nreq b-nreq)
-                    (= a-nopt b-nopt)
-                    (eq (ll-keyp-or-restp a-llks)
-                        (ll-keyp-or-restp b-llks))))))
+             (and (= a-nreq b-nreq)
+                  (= a-nopt b-nopt)
+                  (eq (ll-keyp-or-restp a-llks)
+                      (ll-keyp-or-restp b-llks))))))
     (multiple-value-bind (lock qualifiers specializers new-lambda-list
                           method-gf name)
         (values-for-add-method generic-function method)
@@ -582,25 +581,25 @@
               ;; invocation time; I dunno what the rationale was, and it
               ;; sucks.  Nevertheless, it's probably a programmer error, so
               ;; let's warn anyway. -- CSR, 2003-08-20
-              (let ((mc (generic-function-method-combination generic-functioN)))
-                (cond
-                  ((eq mc *standard-method-combination*)
-                   (when (and qualifiers
-                              (or (cdr qualifiers)
-                                  (not (memq (car qualifiers)
-                                             '(:around :before :after)))))
-                     (warn "~@<Invalid qualifiers for standard method ~
-                            combination in method ~S:~2I~_~S.~@:>"
-                           method qualifiers)))
-                  ((short-method-combination-p mc)
-                   (let ((mc-name (method-combination-type-name mc)))
-                     (when (or (null qualifiers)
-                               (cdr qualifiers)
-                               (and (neq (car qualifiers) :around)
-                                    (neq (car qualifiers) mc-name)))
-                       (warn "~@<Invalid qualifiers for ~S method combination ~
-                              in method ~S:~2I~_~S.~@:>"
-                             mc-name method qualifiers))))))
+              (let* ((mc (generic-function-method-combination generic-function))
+                     (type-name (method-combination-type-name mc)))
+                (flet ((invalid ()
+                         (warn "~@<Invalid qualifiers for ~S method ~
+                                combination in method ~S:~2I~_~S.~@:>"
+                               type-name method qualifiers)))
+                  (cond
+                    ((and (eq mc *standard-method-combination*)
+                          qualifiers
+                          (or (cdr qualifiers)
+                              (not (standard-method-combination-qualifier-p
+                                    (car qualifiers)))))
+                     (invalid))
+                    ((and (short-method-combination-p mc)
+                          (or (null qualifiers)
+                              (cdr qualifiers)
+                              (not (short-method-combination-qualifier-p
+                                    type-name (car qualifiers)))))
+                     (invalid)))))
               (unless skip-dfun-update-p
                 (update-ctors 'add-method
                               :generic-function generic-function

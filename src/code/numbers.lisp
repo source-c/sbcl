@@ -160,21 +160,19 @@
               (tag (gensym)))
           (error-tags tag)
           (errors tag)
-          (errors `(return-from
-                    ,block
-                    (error 'simple-type-error :datum ,var
-                           :expected-type ',type
-                           :format-control
-                           "~@<Argument ~A is not a ~S: ~2I~_~S~:>"
-                           :format-arguments
-                           (list ',var ',type ,var))))))
+          (errors
+           (let ((interr-symbol
+                   (sb!c::%interr-symbol-for-type-spec type)))
+             (if interr-symbol
+                 `(sb!c::%type-check-error/c ,var ',interr-symbol)
+                 `(sb!c::%type-check-error ,var ',type))))))
 
       `(block ,block
          (tagbody
-           (return-from ,block
-                        ,@(generate-number-dispatch vars (error-tags)
-                                                    (cdr res)))
-           ,@(errors))))))
+            (return-from ,block
+              ,@(generate-number-dispatch vars (error-tags)
+                                          (cdr res)))
+            ,@(errors))))))
 
 ;;;; binary operation dispatching utilities
 
@@ -334,9 +332,13 @@
   (declare (explicit-check))
   (if (zerop number)
       number
-      (if (rationalp number)
-          (if (plusp number) 1 -1)
-          (/ number (abs number)))))
+      (number-dispatch ((number number))
+        (((foreach fixnum rational single-float double-float))
+         (if (plusp number)
+             (coerce 1 '(dispatch-type number))
+             (coerce -1 '(dispatch-type number))))
+        ((complex)
+         (/ number (abs number))))))
 
 ;;;; ratios
 
@@ -442,9 +444,9 @@
                (g1 (gcd dx dy)))
           (if (eql g1 1)
               (%make-ratio (,op (* nx dy) (* dx ny)) (* dx dy))
-              (let* ((t1 (,op (* nx (truncate dy g1)) (* (truncate dx g1) ny)))
-                     (g2 (gcd t1 g1))
-                     (t2 (truncate dx g1)))
+              (let* ((t2 (truncate dx g1))
+                     (t1 (,op (* nx (truncate dy g1)) (* t2 ny)))
+                     (g2 (gcd t1 g1)))
                 (cond ((eql t1 0) 0)
                       ((eql g2 1)
                        (%make-ratio t1 (* t2 dy)))

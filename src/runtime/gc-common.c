@@ -86,6 +86,14 @@ forwarding_pointer_value(lispobj *pointer) {
 }
 static inline lispobj
 set_forwarding_pointer(lispobj * pointer, lispobj newspace_copy) {
+  // The object at 'pointer' might already have been forwarded,
+  // but that's ok. Such occurs primarily when dealing with
+  // code components, because code can be forwarded by scavenging any
+  // pointer to a function that resides within the code.
+  // Testing whether the object had been forwarded would just slow
+  // things down, so we blindly stomp on whatever was there.
+  // Unfortunately this also implies we can't assert
+  // that we're operating on a not-yet-forwarded object here.
 #ifdef LISP_FEATURE_GENCGC
     pointer[0]=0x01;
     pointer[1]=newspace_copy;
@@ -136,7 +144,7 @@ scavenge(lispobj *start, sword_t n_words)
         lispobj object = *object_ptr;
 #ifdef LISP_FEATURE_GENCGC
         if (forwarding_pointer_p(object_ptr))
-            lose("unexpect forwarding pointer in scavenge: %p, start=%p, n=%ld\n",
+            lose("unexpected forwarding pointer in scavenge: %p, start=%p, n=%ld\n",
                  object_ptr, start, n_words);
 #endif
         if (is_lisp_pointer(object)) {
@@ -153,6 +161,13 @@ scavenge(lispobj *start, sword_t n_words)
                     object_ptr +=
                         (scavtab[widetag_of(object)])(object_ptr, object);
                 }
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+            } else if (immobile_space_p(object)) {
+                lispobj *ptr = native_pointer(object);
+                if (immobile_obj_gen_bits(ptr) == from_space)
+                    promote_immobile_obj(ptr, 1);
+                object_ptr++;
+#endif
             } else {
                 /* It points somewhere other than oldspace. Leave it
                  * alone. */
@@ -389,7 +404,6 @@ trans_return_pc_header(lispobj object)
     struct code *code, *ncode;
 
     return_pc = (struct simple_fun *) native_pointer(object);
-    /* FIXME: was times 4, should it really be N_WORD_BYTES? */
     offset = HeaderValue(return_pc->header) * N_WORD_BYTES;
 
     /* Transport the whole code object */
@@ -444,7 +458,6 @@ trans_fun_header(lispobj object)
     struct code *code, *ncode;
 
     fheader = (struct simple_fun *) native_pointer(object);
-    /* FIXME: was times 4, should it really be N_WORD_BYTES? */
     offset = HeaderValue(fheader->header) * N_WORD_BYTES;
 
     /* Transport the whole code object */
@@ -516,18 +529,11 @@ static lispobj trans_list(lispobj object);
 static sword_t
 scav_list_pointer(lispobj *where, lispobj object)
 {
-    lispobj first, *first_pointer;
-
+    lispobj first;
     gc_assert(is_lisp_pointer(object));
-
-    /* Object is a pointer into from space - not FP. */
-    first_pointer = (lispobj *) native_pointer(object);
 
     first = trans_list(object);
     gc_assert(first != object);
-
-    /* Set forwarding pointer */
-    set_forwarding_pointer(first_pointer, first);
 
     gc_assert(is_lisp_pointer(first));
     gc_assert(!from_space_p(first));
@@ -608,6 +614,9 @@ scav_other_pointer(lispobj *where, lispobj object)
     first_pointer = (lispobj *) native_pointer(object);
     first = (transother[widetag_of(*first_pointer)])(object);
 
+    // If the object was large, then instead of transporting it,
+    // gencgc might simply promote the pages and return the same pointer.
+    // That decision is made in general_copy_large_object().
     if (first != object) {
         set_forwarding_pointer(first_pointer, first);
 #ifdef LISP_FEATURE_GENCGC
@@ -804,8 +813,13 @@ scav_instance(lispobj *where, lispobj header)
     if (!layout)
         return 1;
     layout = native_pointer((lispobj)layout);
+#ifdef LISP_FEATURE_COMPACT_INSTANCE_HEADER
+    if (__immobile_obj_gen_bits(layout) == from_space)
+        promote_immobile_obj(layout, 1);
+#else
     if (forwarding_pointer_p(layout))
         layout = native_pointer((lispobj)forwarding_pointer_value(layout));
+#endif
 
     if (((struct layout*)layout)->bitmap == make_fixnum(-1))
         scavenge(where+1, ntotal);
@@ -884,20 +898,16 @@ scav_fdefn(lispobj *where, lispobj object)
     /* FSHOW((stderr, "scav_fdefn, function = %p, raw_addr = %p\n",
        fdefn->fun, fdefn->raw_addr)); */
 
-    if ((char *)(fdefn->fun + FUN_RAW_ADDR_OFFSET) == fdefn->raw_addr) {
-        scavenge(where + 1, sizeof(struct fdefn)/sizeof(lispobj) - 1);
-
+    scavenge(where + 1, 2); // 'name' and 'fun'
+    lispobj raw_fun = (lispobj)fdefn->raw_addr;
+    if (raw_fun > READ_ONLY_SPACE_END) {
+        lispobj simple_fun = raw_fun - FUN_RAW_ADDR_OFFSET;
+        scavenge(&simple_fun, 1);
         /* Don't write unnecessarily. */
-        if (fdefn->raw_addr != (char *)(fdefn->fun + FUN_RAW_ADDR_OFFSET))
-            fdefn->raw_addr = (char *)(fdefn->fun + FUN_RAW_ADDR_OFFSET);
-        /* gc.c has more casts here, which may be relevant or alternatively
-           may be compiler warning defeaters.  try
-        fdefn->raw_addr = ((char *) LOW_WORD(fdefn->fun)) + FUN_RAW_ADDR_OFFSET;
-        */
-        return sizeof(struct fdefn) / sizeof(lispobj);
-    } else {
-        return 1;
+        if (simple_fun != raw_fun - FUN_RAW_ADDR_OFFSET)
+            fdefn->raw_addr = (char *)simple_fun + FUN_RAW_ADDR_OFFSET;
     }
+    return 4;
 }
 #endif
 
@@ -1698,7 +1708,7 @@ void scan_weak_pointers(void)
         if (next_wp == wp) /* gencgc uses a ref to self for end of list */
             next_wp = NULL;
 
-        if (!(is_lisp_pointer(value) && from_space_p(value)))
+        if (!is_lisp_pointer(value))
             continue;
 
         /* Now, we need to check whether the object has been forwarded. If
@@ -1706,16 +1716,25 @@ void scan_weak_pointers(void)
          * updated. Otherwise, the weak pointer needs to be nil'ed
          * out. */
 
-        first_pointer = (lispobj *)native_pointer(value);
+        if (from_space_p(value)) {
+            first_pointer = (lispobj *)native_pointer(value);
 
-        if (forwarding_pointer_p(first_pointer)) {
-            wp->value=
+            if (forwarding_pointer_p(first_pointer)) {
+              wp->value=
                 (lispobj)LOW_WORD(forwarding_pointer_value(first_pointer));
-        } else {
+            } else {
             /* Break it. */
-            wp->value = NIL;
-            wp->broken = T;
+                wp->value = NIL;
+                wp->broken = T;
+            }
         }
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+          else if (immobile_space_p(value) &&
+                   immobile_obj_gen_bits(native_pointer(value)) == from_space) {
+                wp->value = NIL;
+                wp->broken = T;
+        }
+#endif
     }
 }
 
@@ -1745,8 +1764,20 @@ struct hash_table *weak_hash_tables = NULL;
 static inline int
 survived_gc_yet (lispobj obj)
 {
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    /* If an immobile object's generation# is that of 'from_space', but has been
+       visited (i.e. is live), then it is conceptually not in 'from_space'.
+       This can happen when and only when _not_ raising the generation number.
+       Since the gen_bits() accessor returns the visited bit, the byte value
+       is numerically unequal to 'from_space', which is what we want */
+    return !is_lisp_pointer(obj)
+      || (immobile_space_p(obj)
+          ? immobile_obj_gen_bits(native_pointer(obj)) != from_space
+          : (!from_space_p(obj) || forwarding_pointer_p(native_pointer(obj))));
+#else
     return (!is_lisp_pointer(obj) || !from_space_p(obj) ||
             forwarding_pointer_p(native_pointer(obj)));
+#endif
 }
 
 static inline int
@@ -1875,7 +1906,7 @@ scav_vector (lispobj *where, lispobj object)
     /* SB-VM:VECTOR-VALID-HASHING-SUBTYPE is set for EQ-based and weak
      * hash tables in the Lisp HASH-TABLE code to indicate need for
      * special GC support. */
-    if (HeaderValue(object) == subtype_VectorNormal)
+    if ((HeaderValue(object) & 0xFF) == subtype_VectorNormal)
         return 1;
 
     kv_length = fixnum_value(where[1]);
@@ -2369,7 +2400,7 @@ gc_init_tables(void)
     transother[NO_TLS_VALUE_MARKER_WIDETAG] = trans_immediate;
     transother[WEAK_POINTER_WIDETAG] = trans_weak_pointer;
     transother[INSTANCE_HEADER_WIDETAG] = trans_instance;
-    transother[FDEFN_WIDETAG] = trans_boxed;
+    transother[FDEFN_WIDETAG] = trans_tiny_boxed;
 
     /* size table, initialized the same way as scavtab */
     for (i = 0; i < ((sizeof sizetab)/(sizeof sizetab[0])); i++)
@@ -2515,7 +2546,7 @@ gc_init_tables(void)
     sizetab[NO_TLS_VALUE_MARKER_WIDETAG] = size_immediate;
     sizetab[WEAK_POINTER_WIDETAG] = size_weak_pointer;
     sizetab[INSTANCE_HEADER_WIDETAG] = size_instance;
-    sizetab[FDEFN_WIDETAG] = size_boxed;
+    sizetab[FDEFN_WIDETAG] = size_tiny_boxed;
 }
 
 
@@ -2530,6 +2561,10 @@ component_ptr_from_pc(lispobj *pc)
         ;
     else if ( (object = search_static_space(pc)) )
         ;
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    else if ( (object = search_immobile_space(pc)) )
+        ;
+#endif
     else
         object = search_dynamic_space(pc);
 
@@ -2807,6 +2842,9 @@ valid_lisp_pointer_p(lispobj *pointer)
 {
     lispobj *start;
     if (((start=search_dynamic_space(pointer))!=NULL) ||
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+        ((start=search_immobile_space(pointer))!=NULL) ||
+#endif
         ((start=search_static_space(pointer))!=NULL) ||
         ((start=search_read_only_space(pointer))!=NULL))
         return looks_like_valid_lisp_pointer_p((lispobj)pointer, start);

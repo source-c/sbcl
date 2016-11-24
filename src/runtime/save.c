@@ -183,7 +183,8 @@ output_space(FILE *file, int id, lispobj *addr, lispobj *end,
              int core_compression_level)
 {
     size_t words, bytes, data, compressed_flag;
-    static char *names[] = {NULL, "dynamic", "static", "read-only"};
+    static char *names[] = {NULL, "dynamic", "static", "read-only",
+                            "immobile", "immobile"};
 
     compressed_flag
             = ((core_compression_level != COMPRESSION_LEVEL_NONE)
@@ -216,7 +217,16 @@ open_core_for_saving(char *filename)
     return fopen(filename, "wb");
 }
 
-#define N_SPACES_TO_SAVE 3
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+extern void prepare_immobile_space_for_save();
+#  define N_SPACES_TO_SAVE 5
+#  ifdef LISP_FEATURE_IMMOBILE_CODE
+lispobj code_component_order;
+extern void defrag_immobile_space(lispobj);
+#  endif
+#else
+#  define N_SPACES_TO_SAVE 3
+#endif
 boolean
 save_to_filehandle(FILE *file, char *filename, lispobj init_function,
                    boolean make_executable,
@@ -242,6 +252,20 @@ save_to_filehandle(FILE *file, char *filename, lispobj init_function,
     }
     printf("done]\n");
     fflush(stdout);
+#ifdef LISP_FEATURE_IMMOBILE_CODE
+    // It's better to wait to defrag until after the binding stack is undone,
+    // because we explicitly don't fixup code refs from stacks.
+    // i.e. if there *were* something on the binding stack that cared that code
+    // moved, it would be wrong. This way we can be sure we don't care.
+    if (code_component_order) {
+        // Assert that defrag will not move the init_function
+        gc_assert(!immobile_space_p(init_function));
+        printf("[defragmenting immobile space... ");
+        fflush(stdout);
+        defrag_immobile_space(code_component_order);
+        printf("done]\n");
+    }
+#endif
 
     /* (Now we can actually start copying ourselves into the output file.) */
 
@@ -283,6 +307,21 @@ save_to_filehandle(FILE *file, char *filename, lispobj init_function,
     /* Flush the current_region, updating the tables. */
     gc_alloc_update_all_page_tables(1);
     update_dynamic_space_free_pointer();
+#endif
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    prepare_immobile_space_for_save();
+    output_space(file,
+                 IMMOBILE_FIXEDOBJ_CORE_SPACE_ID,
+                 (lispobj *)IMMOBILE_SPACE_START,
+                 (lispobj *)SymbolValue(IMMOBILE_FIXEDOBJ_FREE_POINTER,0),
+                 core_start_pos,
+                 core_compression_level);
+    output_space(file,
+                 IMMOBILE_VARYOBJ_CORE_SPACE_ID,
+                 (lispobj *)IMMOBILE_VARYOBJ_SUBSPACE_START,
+                 (lispobj *)SymbolValue(IMMOBILE_SPACE_FREE_POINTER,0),
+                 core_start_pos,
+                 core_compression_level);
 #endif
 #ifdef reg_ALLOC
 #ifdef LISP_FEATURE_GENCGC

@@ -111,21 +111,33 @@
         (cis (imagpart number))))))
 
 ;;; INTEXP -- Handle the rational base, integer power case.
-
-(declaim (type (or integer null) *intexp-maximum-exponent*))
-(defparameter *intexp-maximum-exponent* nil)
-
 ;;; This function precisely calculates base raised to an integral
 ;;; power. It separates the cases by the sign of power, for efficiency
 ;;; reasons, as powers can be calculated more efficiently if power is
 ;;; a positive integer. Values of power are calculated as positive
 ;;; integers, and inverted if negative.
 (defun intexp (base power)
-  (when (and *intexp-maximum-exponent*
-             (> (abs power) *intexp-maximum-exponent*))
-    (error "The absolute value of ~S exceeds ~S."
-            power '*intexp-maximum-exponent*))
-  (cond ((minusp power)
+  (cond ((eql base 1)
+         base)
+        ((eql base -1)
+         (if (evenp power)
+             1
+             base))
+        ((ratiop base)
+         (let ((den (denominator base))
+               (num (numerator base)))
+           (if (minusp power)
+               (let ((negated (- power)))
+                 (cond ((eql num 1)
+                        (intexp den negated))
+                       ((eql num -1)
+                        (intexp (- den) negated))
+                       (t
+                        (build-ratio (intexp den negated)
+                                     (intexp num negated)))))
+               (build-ratio (intexp num power)
+                            (intexp den power)))))
+        ((minusp power)
          (/ (intexp base (- power))))
         ((eql base 2)
          (ash 1 power))
@@ -402,15 +414,18 @@
   (number-dispatch ((number number))
     (((foreach fixnum bignum ratio))
      (if (minusp number)
-         (complex-sqrt number)
+         (complex 0f0
+                  (coerce (%sqrt (- (coerce number 'double-float))) 'single-float))
          (coerce (%sqrt (coerce number 'double-float)) 'single-float)))
     (((foreach single-float double-float))
      (if (minusp number)
-         (complex-sqrt (complex number))
+         (complex (coerce 0.0 '(dispatch-type number))
+                  (coerce (%sqrt (- (coerce number 'double-float)))
+                          '(dispatch-type number)))
          (coerce (%sqrt (coerce number 'double-float))
                  '(dispatch-type number))))
-     ((complex)
-      (complex-sqrt number))))
+    ((complex)
+     (complex-sqrt number))))
 
 ;;;; trigonometic and related functions
 
@@ -696,7 +711,7 @@
 ;;;;   logb
 ;;;;
 ;;;; internal functions:
-;;;;    square coerce-to-complex-type cssqs complex-log-scaled
+;;;;    square coerce-to-complex-type cssqs
 ;;;;
 ;;;; references:
 ;;;;   Kahan, W. "Branch Cuts for Complex Elementary Functions, or Much
@@ -887,13 +902,12 @@
           (setf nu (float-sign y rho))))
       (coerce-to-complex-type eta nu z))))
 
-;;; Compute log(2^j*z).
+;;; log of Z = log |Z| + i * arg Z
 ;;;
-;;; This is for use with J /= 0 only when |z| is huge.
-(defun complex-log-scaled (z j)
+;;; Z may be any number, but the result is always a complex.
+(defun complex-log (z)
   (declare (muffle-conditions t))
-  (declare (type (or rational complex) z)
-           (fixnum j))
+  (declare (type (or rational complex) z))
   ;; The constants t0, t1, t2 should be evaluated to machine
   ;; precision.  In addition, Kahan says the accuracy of log1p
   ;; influences the choices of these constants but doesn't say how to
@@ -923,24 +937,17 @@
       (let ((beta (max (abs x) (abs y)))
             (theta (min (abs x) (abs y))))
         (coerce-to-complex-type (if (and (zerop k)
-                 (< t0 beta)
-                 (or (<= beta t1)
-                     (< rho t2)))
-                                  (/ (%log1p (+ (* (- beta 1.0d0)
-                                       (+ beta 1.0d0))
-                                    (* theta theta)))
-                                     2d0)
-                                  (+ (/ (log rho) 2d0)
-                                     (* (+ k j) ln2)))
+                                         (< t0 beta)
+                                         (or (<= beta t1)
+                                             (< rho t2)))
+                                    (/ (%log1p (+ (* (- beta 1.0d0)
+                                                     (+ beta 1.0d0))
+                                                  (* theta theta)))
+                                       2d0)
+                                    (+ (/ (log rho) 2d0)
+                                       (* k ln2)))
                                 (atan y x)
                                 z)))))
-
-;;; log of Z = log |Z| + i * arg Z
-;;;
-;;; Z may be any number, but the result is always a complex.
-(defun complex-log (z)
-  (declare (type (or rational complex) z))
-  (complex-log-scaled z 0))
 
 ;;; KLUDGE: Let us note the following "strange" behavior. atanh 1.0d0
 ;;; is +infinity, but the following code returns approx 176 + i*pi/4.

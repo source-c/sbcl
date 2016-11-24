@@ -166,6 +166,36 @@
  ;;
  ; :cycle-counter
 
+ ;; Build with support for an additional dynamic heap
+ ;; differing from the main dynamic heap in two ways:
+ ;;  1. it is guaranteed to reside below 4GB so that all pointers
+ ;;      into it fit in 32 bits. (Only an issue for >32 bit address space)
+ ;;  2. all objects therein are immovable, and space is reclaimed
+ ;;     by a mark-and-sweep collector.
+ ;; That combination of aspects potentially allows various efficiencies
+ ;; in code generation, especially for the x86-64 backend.
+ ;; The extra space has a fixed size which can only be changed by a rebuild,
+ ;; and out-of-space conditions are not easily preventable, so the space
+ ;; is sized rather generously to sidestep the issue.
+ ;; Additionally, it is assumed that for all objects in the immobile heap,
+ ;; speed of allocation of those objects is relatively unimportant.
+ ;; If unexpected performance regressions are observed,
+ ;; consider disabling this feature and reporting a bug.
+ ; :immobile-space
+
+ ;; Allocate most functions in the immobile space.
+ ;; Enabled by default if supported.
+ ;; The down-side of this feature is that the allocator is significantly
+ ;; slower than the allocator for movable code. If a particular application
+ ;; is performance-constrained by speed of creation of compiled functions
+ ;; (not including closures), the feature can be disabled.
+ ; :immobile-code
+
+ ;; Combine the layout pointer, instance-length, and widetag of INSTANCE
+ ;; into a single machine word. This represents a space savings of anywhere
+ ;; from 4% to 8% in typical applications. (Your mileage may vary).
+ ; :compact-instance-header
+
  ;; Enabled automatically for platforms which implement complex arithmetic
  ;; VOPs. Such platforms should implement real-complex, complex-real and
  ;; complex-complex addition and subtractions (for complex-single-float

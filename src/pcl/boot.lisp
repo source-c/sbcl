@@ -145,12 +145,39 @@ bootstrapping.
       ()
       real-make-method-lambda))
 
+    (make-method-lambda-using-specializers
+     standard
+     ((proto-generic-function proto-method qualifiers specializers
+                              lambda-expression environment)
+      (standard-generic-function standard-method t t t t)
+      ()
+      real-make-method-lambda-using-specializers))
+
     (make-method-specializers-form
      standard
      ((proto-generic-function proto-method specializer-names environment)
       (standard-generic-function standard-method t t)
       ()
       real-make-method-specializers-form))
+
+    (make-specializer-form-using-class
+     or
+     ((proto-generic-function proto-method specializer-name environment)
+      (standard-generic-function standard-method t t)
+      (or)
+      real-make-specializer-form-using-class/t)
+     ((proto-generic-function proto-method specializer-name environment)
+      (standard-generic-function standard-method specializer t)
+      (or)
+      real-make-specializer-form-using-class/specializer)
+     ((proto-generic-function proto-method specializer-name environment)
+      (standard-generic-function standard-method symbol t)
+      (or)
+      real-make-specializer-form-using-class/symbol)
+     ((proto-generic-function proto-method specializer-name environment)
+      (standard-generic-function standard-method cons t)
+      (or)
+      real-make-specializer-form-using-class/cons))
 
     (parse-specializer-using-class
      standard
@@ -451,60 +478,54 @@ generic function lambda list ~S~:>"
 (defvar *method-name* nil)
 (defvar *method-lambda-list* nil)
 
-(defun expand-defmethod (name
-                         proto-gf
-                         proto-method
-                         qualifiers
-                         lambda-list
-                         body
-                         env
-                         ;; ENV could be of type SB!INTERPRETER:BASIC-ENV
-                         ;; but I don't care to figure out what parts of PCL
-                         ;; would have to change to accept that, so coerce.
-                         &aux (env (sb-kernel:coerce-to-lexenv env)))
-  (multiple-value-bind (parameters unspecialized-lambda-list specializers)
-      (parse-specialized-lambda-list lambda-list)
-    (declare (ignore parameters))
+(defun expand-defmethod (name proto-gf proto-method qualifiers lambda-list
+                         body env)
+  (binding* (;; ENV could be of type SB!INTERPRETER:BASIC-ENV but I
+             ;; don't care to figure out what parts of PCL would have
+             ;; to change to accept that, so coerce.
+             (env (sb-kernel:coerce-to-lexenv env))
+             ((nil unspecialized-lambda-list specializers)
+              (parse-specialized-lambda-list lambda-list))
+             (*method-name* `(,name ,@qualifiers ,specializers))
+             (method-lambda `(lambda ,unspecialized-lambda-list ,@body))
+             ((method-function-lambda initargs new-lambda-list)
+              (make-method-lambda-using-specializers
+               proto-gf proto-method qualifiers specializers method-lambda env))
+             (initargs-form
+              (make-method-initargs-form
+               proto-gf proto-method method-function-lambda initargs env))
+             (specializers-form
+              (make-method-specializers-form
+               proto-gf proto-method specializers env)))
     (mapc (lambda (specializer)
             (when (typep specializer 'type-specifier)
               (check-deprecated-type specializer)))
           specializers)
-    (let ((method-lambda `(lambda ,unspecialized-lambda-list ,@body))
-          (*method-name* `(,name ,@qualifiers ,specializers))
-          (*method-lambda-list* lambda-list))
-      (multiple-value-bind (method-function-lambda initargs)
-          (make-method-lambda proto-gf proto-method method-lambda env)
-        (let ((initargs-form (make-method-initargs-form
-                              proto-gf proto-method method-function-lambda
-                              initargs env))
-              (specializers-form (make-method-specializers-form
-                                  proto-gf proto-method specializers env)))
-          `(progn
-             ;; Note: We could DECLAIM the ftype of the generic function
-             ;; here, since ANSI specifies that we create it if it does
-             ;; not exist. However, I chose not to, because I think it's
-             ;; more useful to support a style of programming where every
-             ;; generic function has an explicit DEFGENERIC and any typos
-             ;; in DEFMETHODs are warned about. Otherwise
-             ;;
-             ;;   (DEFGENERIC FOO-BAR-BLETCH (X))
-             ;;   (DEFMETHOD FOO-BAR-BLETCH ((X HASH-TABLE)) ..)
-             ;;   (DEFMETHOD FOO-BRA-BLETCH ((X SIMPLE-VECTOR)) ..)
-             ;;   (DEFMETHOD FOO-BAR-BLETCH ((X VECTOR)) ..)
-             ;;   (DEFMETHOD FOO-BAR-BLETCH ((X ARRAY)) ..)
-             ;;   (DEFMETHOD FOO-BAR-BLETCH ((X LIST)) ..)
-             ;;
-             ;; compiles without raising an error and runs without
-             ;; raising an error (since SIMPLE-VECTOR cases fall through
-             ;; to VECTOR) but still doesn't do what was intended. I hate
-             ;; that kind of bug (code which silently gives the wrong
-             ;; answer), so we don't do a DECLAIM here. -- WHN 20000229
-             ,(make-defmethod-form name qualifiers specializers-form
-                                   unspecialized-lambda-list
-                                   (if proto-method
-                                       (class-name (class-of proto-method))
-                                       'standard-method)
-                                   initargs-form)))))))
+    ;; Note: We could DECLAIM the ftype of the generic function here,
+    ;; since ANSI specifies that we create it if it does not
+    ;; exist. However, I chose not to, because I think it's more
+    ;; useful to support a style of programming where every generic
+    ;; function has an explicit DEFGENERIC and any typos in DEFMETHODs
+    ;; are warned about. Otherwise
+    ;;
+    ;;   (DEFGENERIC FOO-BAR-BLETCH (X))
+    ;;   (DEFMETHOD FOO-BAR-BLETCH ((X HASH-TABLE)) ..)
+    ;;   (DEFMETHOD FOO-BRA-BLETCH ((X SIMPLE-VECTOR)) ..)
+    ;;   (DEFMETHOD FOO-BAR-BLETCH ((X VECTOR)) ..)
+    ;;   (DEFMETHOD FOO-BAR-BLETCH ((X ARRAY)) ..)
+    ;;   (DEFMETHOD FOO-BAR-BLETCH ((X LIST)) ..)
+    ;;
+    ;; compiles without raising an error and runs without raising an
+    ;; error (since SIMPLE-VECTOR cases fall through to VECTOR) but
+    ;; still doesn't do what was intended. I hate that kind of bug
+    ;; (code which silently gives the wrong answer), so we don't do a
+    ;; DECLAIM here. -- WHN 20000229
+    (make-defmethod-form name qualifiers specializers-form
+                         (or new-lambda-list unspecialized-lambda-list)
+                         (if proto-method
+                             (class-name (class-of proto-method))
+                             'standard-method)
+                         initargs-form)))
 
 (defun interned-symbol-p (x)
   (and (symbolp x) (symbol-package x)))
@@ -606,6 +627,22 @@ generic function lambda list ~S~:>"
 (unless (fboundp 'make-method-initargs-form)
   (setf (gdefinition 'make-method-initargs-form)
         (symbol-function 'real-make-method-initargs-form)))
+
+(defun real-make-method-lambda-using-specializers
+    (proto-gf proto-method qualifiers specializers method-lambda env)
+  (declare (ignore qualifiers))
+  (check-method-lambda method-lambda 'make-method-lambda) ; TODO remove check in make-method-lambda
+  ;; Default behavior: delegate to MAKE-METHOD-LAMBDA.
+  (let* ((lambda-list (second method-lambda))
+         (*method-lambda-list*
+          (append
+           (mapcar #'list (subseq lambda-list 0 (length specializers)) specializers)
+           (subseq lambda-list (length specializers)))))
+    (make-method-lambda proto-gf proto-method method-lambda env)))
+
+(unless (fboundp 'make-method-lambda-using-specializers)
+  (setf (gdefinition 'make-method-lambda-using-specializers)
+        (symbol-function 'real-make-method-lambda-using-specializers)))
 
 ;;; When bootstrapping PCL MAKE-METHOD-LAMBDA starts out as a regular
 ;;; function: REAL-MAKE-METHOD-LAMBDA set to the fdefinition of
@@ -782,30 +819,70 @@ generic function lambda list ~S~:>"
                           ,@(when documentation `(:documentation ,documentation)))))))))))
 
 (defun real-make-method-specializers-form
-    (proto-gf proto-method specializer-names env)
-  (declare (ignore env proto-gf proto-method))
-  (flet ((parse (name)
-           (cond
-             ((and (eq **boot-state** 'complete)
-                   (specializerp name))
-              name)
-             ((symbolp name) `(find-class ',name))
-             ((consp name) (ecase (car name)
-                             ((eql) `(intern-eql-specializer ,(cadr name)))
-                             ((class-eq) `(class-eq-specializer (find-class ',(cadr name))))))
-             (t
-              ;; FIXME: Document CLASS-EQ specializers.
-              (error 'simple-reference-error
-                     :format-control
-                     "~@<~S is not a valid parameter specializer name.~@:>"
-                     :format-arguments (list name)
-                     :references (list '(:ansi-cl :macro defmethod)
-                                       '(:ansi-cl :glossary "parameter specializer name")))))))
-    `(list ,@(mapcar #'parse specializer-names))))
+    (proto-generic-function proto-method specializer-names environment)
+  (flet ((make-parse-form (name)
+           (make-specializer-form-using-class
+            proto-generic-function proto-method name environment)))
+    `(list ,@(mapcar #'make-parse-form specializer-names))))
 
 (unless (fboundp 'make-method-specializers-form)
   (setf (gdefinition 'make-method-specializers-form)
         (symbol-function 'real-make-method-specializers-form)))
+
+(defun real-make-specializer-form-using-class/t
+    (proto-generic-function proto-method specializer-name environment)
+  (declare (ignore proto-generic-function proto-method environment))
+  (error 'simple-reference-error
+         :format-control
+         "~@<~S is not a valid parameter specializer name.~@:>"
+         :format-arguments (list specializer-name)
+         :references (list '(:ansi-cl :macro defmethod)
+                           '(:ansi-cl :glossary "parameter specializer name"))))
+
+(defun real-make-specializer-form-using-class/specializer
+    (proto-generic-function proto-method specializer-name environment)
+  (declare (ignore proto-generic-function proto-method environment))
+  (when (eq **boot-state** 'complete)
+    specializer-name))
+
+(defun real-make-specializer-form-using-class/symbol
+    (proto-generic-function proto-method specializer-name environment)
+  (declare (ignore proto-generic-function proto-method environment))
+  `(find-class ',specializer-name))
+
+(defun real-make-specializer-form-using-class/cons
+    (proto-generic-function proto-method specializer-name environment)
+  (declare (ignore proto-generic-function proto-method environment))
+  ;; In case of unknown specializer or known specializer with syntax
+  ;; error, TYPECASE may fall through to default method with error
+  ;; signaling.
+  (typecase specializer-name
+    ((cons (eql eql) (cons t null))
+     `(intern-eql-specializer ,(second specializer-name)))
+    ((cons (eql class-eq) (cons t null))
+     `(class-eq-specializer (find-class ',(second specializer-name))))))
+
+(defun real-make-specializer-form-using-class
+    (proto-generic-function proto-method specializer-name environment)
+  (macrolet
+      ((delegations ()
+         `(typecase specializer-name
+            ,@(mapcar
+               (lambda (type)
+                 (let ((function-name
+                         (symbolicate
+                          'real-make-specializer-form-using-class '#:/ type)))
+                   `(,type
+                     (,function-name
+                      proto-generic-function proto-method specializer-name environment))))
+               '(; specializer
+                 ; ^ apparently not needed during bootstrapping
+                 symbol cons t)))))
+    (delegations)))
+
+(unless (fboundp 'make-specializer-form-using-class)
+  (setf (gdefinition 'make-specializer-form-using-class)
+        (symbol-function 'real-make-specializer-form-using-class)))
 
 (defun real-parse-specializer-using-class (generic-function specializer)
   (let ((result (specializer-from-type specializer)))

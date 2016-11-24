@@ -44,13 +44,25 @@ endif
 
 CFLAGS += -fno-omit-frame-pointer
 
-GC_SRC = gencgc.c
+ifdef LISP_FEATURE_IMMOBILE_SPACE
+  GC_SRC = gencgc.c marknsweepgc.c
+else
+  GC_SRC = gencgc.c
+endif
 
 # Hardened GCC enables PIE by default
 ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e nopie),)
 CFLAGS += -fno-pie
 LINKFLAGS += -nopie
 LDFLAGS += -nopie
+endif
+
+# The following works for Ubuntu 16.10. There must be a better way to
+# do this across various flavors of linux.
+ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e no-pie),)
+CFLAGS += -fno-pie
+LINKFLAGS += -no-pie
+LDFLAGS += -no-pie
 endif
 
 # Nothing to do for after-grovel-headers.

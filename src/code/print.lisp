@@ -946,7 +946,11 @@ variable: an unreadable object representing the error is printed instead.")
                   (write-char #\" stream)
                   (when coerce-p
                     (write-char #\Space stream)
-                    (write `'(vector ,(array-element-type vector)) :stream stream)
+                    (write (cond #!+sb-unicode
+                                 ((base-string-p vector)
+                                  ''base-string)
+                                 (t
+                                  `'(vector ,(array-element-type vector)))) :stream stream)
                     (write-char #\) stream)))
                  (t
                   (write-string vector stream)))))
@@ -1681,9 +1685,15 @@ variable: an unreadable object representing the error is printed instead.")
              (do ((n 0 (1+ n))
                   (f (%code-entry-points component) (%simple-fun-next f)))
                  ((null f) (format stream " [~D]" n)))
-             (when (typep dinfo 'sb!c::debug-info)
-               (write-char #\space stream)
-               (output-object (sb!c::debug-info-name dinfo) stream)))))))
+             (let ((fun-name (awhen (%code-entry-points component)
+                               (%simple-fun-name it))))
+               (when fun-name
+                 (write-char #\Space stream)
+                 (write fun-name :stream stream))
+               (cond ((not (typep dinfo 'sb!c::debug-info)))
+                     ((neq (sb!c::debug-info-name dinfo) fun-name)
+                      (write-string ", " stream)
+                      (output-object (sb!c::debug-info-name dinfo) stream)))))))))
 
 (defun output-lra (lra stream)
   (print-unreadable-object (lra stream :identity t)

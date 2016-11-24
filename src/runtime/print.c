@@ -740,6 +740,7 @@ static void print_otherptr(lispobj obj)
             // FIXME: This case looks unreachable. print_struct() does it
             case INSTANCE_HEADER_WIDETAG:
                 NEWLINE_OR_RETURN;
+                count &= SHORT_HEADER_MAX_WORDS;
                 printf("length = %ld", (long) count);
                 index = 0;
                 while (count-- > 0) {
@@ -749,6 +750,7 @@ static void print_otherptr(lispobj obj)
                 break;
 
             case CODE_HEADER_WIDETAG:
+                count &= SHORT_HEADER_MAX_WORDS;
                 print_slots(code_slots, count-1, ptr);
                 break;
 
@@ -794,7 +796,7 @@ static void print_otherptr(lispobj obj)
                 break;
 
             case FDEFN_WIDETAG:
-                print_slots(fdefn_slots, count, ptr);
+                print_slots(fdefn_slots, count & SHORT_HEADER_MAX_WORDS, ptr);
                 break;
 
             default:

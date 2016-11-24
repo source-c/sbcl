@@ -93,22 +93,23 @@
 ;;;     (defmethod print-object ((x c) stream)
 ;;;       (if *print-escape* (call-next-method) (report-name x stream)))
 ;;; The current code doesn't seem to quite match that.
-(def*method print-object ((x condition) stream)
-  (if *print-escape*
-      (if (and (typep x 'simple-condition) (slot-value x 'format-control))
-          (print-unreadable-object (x stream :type t :identity t)
-            (write (simple-condition-format-control x)
-                   :stream stream
-                   :lines 1))
-          (print-unreadable-object (x stream :type t :identity t)))
-      ;; KLUDGE: A comment from CMU CL here said
-      ;;   7/13/98 BUG? CPL is not sorted and results here depend on order of
-      ;;   superclasses in define-condition call!
-      (dolist (class (condition-classoid-cpl (classoid-of x))
-                     (error "no REPORT? shouldn't happen!"))
-        (let ((report (condition-classoid-report class)))
-          (when report
-            (return (funcall report x stream)))))))
+(def*method print-object ((object condition) stream)
+  (cond
+    ((not *print-escape*)
+     ;; KLUDGE: A comment from CMU CL here said
+     ;;   7/13/98 BUG? CPL is not sorted and results here depend on order of
+     ;;   superclasses in define-condition call!
+     (funcall (or (some #'condition-classoid-report
+                        (condition-classoid-cpl (classoid-of object)))
+                  (error "no REPORT? shouldn't happen!"))
+              object stream))
+    ((and (typep object 'simple-condition)
+          (slot-value object 'format-control))
+     (print-unreadable-object (object stream :type t :identity t)
+       (write (simple-condition-format-control object)
+              :stream stream :lines 1)))
+    (t
+     (print-unreadable-object (object stream :type t :identity t)))))
 
 ;;; It is essential that there be a method that works in warm load
 ;;; because any conditions signaled are not printable otherwise,
@@ -298,56 +299,56 @@
 (defun %define-condition (name parent-types layout slots
                           direct-default-initargs all-readers all-writers
                           source-location &optional documentation)
-  (with-single-package-locked-error
-      (:symbol name "defining ~A as a condition")
-    (%compiler-define-condition name parent-types layout all-readers all-writers)
-    (when source-location
-      (setf (layout-source-location layout) source-location))
-    (let ((class (find-classoid name))) ; FIXME: rename to 'classoid'
-      (setf (condition-classoid-slots class) slots
-            (condition-classoid-direct-default-initargs class) direct-default-initargs
-            (fdocumentation name 'type) documentation)
+  (call-with-defining-class
+   'condition name
+   (lambda ()
+     (%%compiler-define-condition name parent-types layout all-readers all-writers)
+     (when source-location
+       (setf (layout-source-location layout) source-location))
+     (let ((classoid (find-classoid name)))
+       (setf (condition-classoid-slots classoid) slots
+             (condition-classoid-direct-default-initargs classoid) direct-default-initargs
+             (fdocumentation name 'type) documentation)
 
-      (dolist (slot slots)
+       (dolist (slot slots)
+         ;; Set up reader and writer functions.
+         (let ((slot-name (condition-slot-name slot)))
+           (dolist (reader (condition-slot-readers slot))
+             (install-condition-slot-reader reader name slot-name))
+           (dolist (writer (condition-slot-writers slot))
+             (install-condition-slot-writer writer name slot-name))))
 
-        ;; Set up reader and writer functions.
-        (let ((slot-name (condition-slot-name slot)))
-          (dolist (reader (condition-slot-readers slot))
-            (install-condition-slot-reader reader name slot-name))
-          (dolist (writer (condition-slot-writers slot))
-            (install-condition-slot-writer writer name slot-name))))
-
-      ;; Compute effective slots and set up the class and hairy slots
-      ;; (subsets of the effective slots.)
-      (setf (condition-classoid-class-slots class) '()
-            (condition-classoid-hairy-slots class) '())
-      (let ((eslots (compute-effective-slots class))
-            (e-def-initargs
-             (reduce #'append
-                     (mapcar #'condition-classoid-direct-default-initargs
-                             (condition-classoid-cpl class)))))
-        (dolist (slot eslots)
-          (ecase (condition-slot-allocation slot)
-            (:class
-             (unless (condition-slot-cell slot)
-               (setf (condition-slot-cell slot)
-                     (list (if (condition-slot-initform-p slot)
-                               (let ((initfun (condition-slot-initfunction slot)))
-                                 (aver (functionp initfun))
-                                 (funcall initfun))
-                               *empty-condition-slot*))))
-             (push slot (condition-classoid-class-slots class)))
-            ((:instance nil)
-             (setf (condition-slot-allocation slot) :instance)
-             ;; FIXME: isn't this "always hairy"?
-             (when (or (functionp (condition-slot-initfunction slot))
-                       (dolist (initarg (condition-slot-initargs slot) nil)
-                         (when (functionp (third (assoc initarg e-def-initargs)))
-                           (return t))))
-               (push slot (condition-classoid-hairy-slots class)))))))
-      (dolist (fun *define-condition-hooks*)
-        (funcall fun class)))
-    name))
+       ;; Compute effective slots and set up the class and hairy slots
+       ;; (subsets of the effective slots.)
+       (setf (condition-classoid-class-slots classoid) '()
+             (condition-classoid-hairy-slots classoid) '())
+       (let ((eslots (compute-effective-slots classoid))
+             (e-def-initargs
+              (reduce #'append
+                      (mapcar #'condition-classoid-direct-default-initargs
+                              (condition-classoid-cpl classoid)))))
+         (dolist (slot eslots)
+           (ecase (condition-slot-allocation slot)
+             (:class
+              (unless (condition-slot-cell slot)
+                (setf (condition-slot-cell slot)
+                      (list (if (condition-slot-initform-p slot)
+                                (let ((initfun (condition-slot-initfunction slot)))
+                                  (aver (functionp initfun))
+                                  (funcall initfun))
+                                *empty-condition-slot*))))
+              (push slot (condition-classoid-class-slots classoid)))
+             ((:instance nil)
+              (setf (condition-slot-allocation slot) :instance)
+              ;; FIXME: isn't this "always hairy"?
+              (when (or (functionp (condition-slot-initfunction slot))
+                        (dolist (initarg (condition-slot-initargs slot) nil)
+                          (when (functionp (third (assoc initarg e-def-initargs)))
+                            (return t))))
+                (push slot (condition-classoid-hairy-slots classoid)))))))
+       (dolist (fun *define-condition-hooks*)
+         (funcall fun classoid)))))
+  name)
 
 (defmacro define-condition (name (&rest parent-types) (&rest slot-specs)
                                  &body options)
@@ -516,9 +517,9 @@
    (expected-type :reader type-error-expected-type :initarg :expected-type))
   (:report
    (lambda (condition stream)
-     (format stream  "~@<The value~
-                      ~@:_~2@T~S~@:_~
-                      is not of type~
+     (format stream  "~@<The value ~
+                      ~@:_~2@T~S ~
+                      ~@:_is not of type ~
                       ~@:_~2@T~/sb!impl:print-type-specifier/~:@>"
              (type-error-datum condition)
              (type-error-expected-type condition)))))

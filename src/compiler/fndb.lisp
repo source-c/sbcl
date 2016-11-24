@@ -179,7 +179,11 @@
 (defknown get-properties (list list) (values t t list) (foldable flushable))
 (defknown symbol-name (symbol) simple-string (movable foldable flushable))
 (defknown make-symbol (string) symbol (flushable))
-(defknown %make-symbol (simple-string) symbol (flushable))
+;; %make-symbol is the internal API, but the primitive object allocator
+;; is %%make-symbol, because when immobile space feature is present,
+;; we dispatch to either the C allocator or the Lisp allocator.
+(defknown %make-symbol (simple-string boolean) symbol (flushable))
+(defknown sb!vm::%%make-symbol (simple-string) symbol (flushable))
 (defknown copy-symbol (symbol &optional t) symbol (flushable))
 (defknown gensym (&optional (or string unsigned-byte)) symbol ())
 (defknown symbol-package (symbol) (or package null) (flushable))
@@ -1284,10 +1288,19 @@
 (defknown format ((or (member nil t) stream string)
                   (or string function) &rest t)
   (or string null)
-  ())
+    ())
+(defknown sb!format::format-error* (string list &rest t &key &allow-other-keys)
+    nil)
+(defknown sb!format::format-error (string &rest t) nil)
+(defknown sb!format::format-error-at* ((or null string) (or null index) string list
+                                       &rest t &key &allow-other-keys)
+    nil)
+(defknown sb!format::format-error-at ((or null string) (or null index) string
+                                      &rest t)
+    nil)
 (defknown sb!format::args-exhausted (string integer) nil)
 
-(defknown (y-or-n-p yes-or-no-p) (&optional string &rest t) boolean
+(defknown (y-or-n-p yes-or-no-p) (&optional (or string null function) &rest t) boolean
   ())
 
 ;;;; from the "File System Interface" chapter:

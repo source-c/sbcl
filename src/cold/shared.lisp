@@ -215,6 +215,12 @@
           ;; It sorta kinda works to have both, but there should be no need,
           ;; and it's not really supported.
           "At most one interpreter can be selected")
+         ("(and immobile-space (not x86-64))"
+          ":IMMOBILE-SPACE is supported only on x86-64")
+        ("(and compact-instance-header (not immobile-space))"
+          ":COMPACT-INSTANCE-HEADER requires :IMMOBILE-SPACE feature")
+        ("(and immobile-code (not immobile-space))"
+          ":IMMOBILE-CODE requires :IMMOBILE-SPACE feature")
          ;; There is still hope to make multithreading on DragonFly x86-64
          ("(and sb-thread x86 dragonfly)"
           ":SB-THREAD not supported on selected architecture")))
@@ -439,10 +445,14 @@
       (tagbody
        retry-compile-file
          (multiple-value-bind (output-truename warnings-p failure-p)
-            (if trace-file
-                (funcall compile-file src :output-file tmp-obj
-                         :trace-file t :allow-other-keys t)
-                (funcall compile-file src :output-file tmp-obj))
+             (restart-case
+                 (if trace-file
+                     (funcall compile-file src :output-file tmp-obj
+                                               :trace-file t :allow-other-keys t)
+                     (funcall compile-file src :output-file tmp-obj))
+               (recompile ()
+                 :report report-recompile-restart
+                 (go retry-compile-file)))
            (declare (ignore warnings-p))
            (cond ((not output-truename)
                   (error "couldn't compile ~S" src))
@@ -482,12 +492,7 @@
 ;;; cross-compiler's source code in the cross-compilation host.
 (defun in-host-compilation-mode (fn)
   (declare (type function fn))
-  (let ((*features* (cons :sb-xc-host *features*))
-        ;; the CROSS-FLOAT-INFINITY-KLUDGE, as documented in
-        ;; base-target-features.lisp-expr:
-        (*shebang-features* (set-difference *shebang-features*
-                                            '(:sb-propagate-float-type
-                                              :sb-propagate-fun-type))))
+  (let ((*features* (cons :sb-xc-host *features*)))
     (with-additional-nickname ("SB-XC" "SB!XC")
       (funcall fn))))
 (compile 'in-host-compilation-mode)

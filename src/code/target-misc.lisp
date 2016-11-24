@@ -243,6 +243,7 @@
   #!+win32 (sb!win32::get-computer-name)
   #!-win32 (truly-the simple-string (sb!unix:unix-gethostname)))
 
+(declaim (type (or null string) *machine-version*))
 (defvar *machine-version*)
 
 (defun machine-version ()
@@ -259,11 +260,13 @@ are running on, or NIL if we can't find any useful information."
 ;;; from ANSI 11.1.2.1.1 "Constraints on the COMMON-LISP Package
 ;;; for Conforming Implementations" it is kosher to add a SETF function for
 ;;; a symbol in COMMON-LISP..
+(declaim (type (or null string) *short-site-name* *long-site-name*))
 (defvar *short-site-name* nil
   #!+sb-doc
   "The value of SHORT-SITE-NAME.")
 (defvar *long-site-name* nil
-  #!+sb-doc "the value of LONG-SITE-NAME")
+  #!+sb-doc
+  "The value of LONG-SITE-NAME.")
 (defun short-site-name ()
   #!+sb-doc
   "Return a string with the abbreviated site name, or NIL if not known."
@@ -274,7 +277,8 @@ are running on, or NIL if we can't find any useful information."
   *long-site-name*)
 
 ;;;; ED
-(defvar *ed-functions* nil
+(declaim (type list *ed-functions*))
+(defvar *ed-functions* '()
   #!+sb-doc
   "See function documentation for ED.")
 
@@ -307,7 +311,7 @@ the file system."
 ;;; and the values of *DRIBBLE-STREAM*, *STANDARD-INPUT*, and
 ;;; *STANDARD-OUTPUT* are popped from *PREVIOUS-DRIBBLE-STREAMS*.
 
-(defvar *previous-dribble-streams* nil)
+(defvar *previous-dribble-streams* '())
 (defvar *dribble-stream* nil)
 
 (defun dribble (&optional pathname &key (if-exists :append))
@@ -315,34 +319,29 @@ the file system."
   "With a file name as an argument, dribble opens the file and sends a
   record of further I/O to that file. Without an argument, it closes
   the dribble file, and quits logging."
-  (cond (pathname
-         (let* ((new-dribble-stream
-                 (open pathname
-                       :direction :output
-                       :if-exists if-exists
-                       :if-does-not-exist :create))
-                (new-standard-output
-                 (make-broadcast-stream *standard-output* new-dribble-stream))
-                (new-error-output
-                 (make-broadcast-stream *error-output* new-dribble-stream))
-                (new-standard-input
-                 (make-echo-stream *standard-input* new-dribble-stream)))
+  (flet ((install-streams (dribble input output error)
+           (setf *dribble-stream* dribble
+                 *standard-input* input
+                 *standard-output* output
+                 *error-output* error)))
+    (cond (pathname
            (push (list *dribble-stream* *standard-input* *standard-output*
                        *error-output*)
                  *previous-dribble-streams*)
-           (setf *dribble-stream* new-dribble-stream)
-           (setf *standard-input* new-standard-input)
-           (setf *standard-output* new-standard-output)
-           (setf *error-output* new-error-output)))
-        ((null *dribble-stream*)
-         (error "not currently dribbling"))
-        (t
-         (let ((old-streams (pop *previous-dribble-streams*)))
+           (let ((new-dribble (open pathname
+                                    :direction :output
+                                    :if-exists if-exists
+                                    :if-does-not-exist :create)))
+             (install-streams
+              new-dribble
+              (make-echo-stream *standard-input* new-dribble)
+              (make-broadcast-stream *standard-output* new-dribble)
+              (make-broadcast-stream *error-output* new-dribble))))
+          ((null *dribble-stream*)
+           (error "not currently dribbling"))
+          (t
            (close *dribble-stream*)
-           (setf *dribble-stream* (first old-streams))
-           (setf *standard-input* (second old-streams))
-           (setf *standard-output* (third old-streams))
-           (setf *error-output* (fourth old-streams)))))
+           (apply #'install-streams (pop *previous-dribble-streams*)))))
   (values))
 
 (defun %byte-blt (src src-start dst dst-start dst-end)

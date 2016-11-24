@@ -10,8 +10,12 @@
 (in-package "SB!VM")
 
 (defun invoke-asm-routine (inst routine vop temp-reg)
-  (declare (ignore vop))
-  (inst mov temp-reg (make-fixup routine :assembly-routine))
+  (declare (ignorable vop))
+  (cond #!+immobile-code
+        ((sb!c::code-immobile-p (sb!c::vop-node vop))
+         (setq temp-reg (make-fixup routine :assembly-routine)))
+        (t
+         (inst mov temp-reg (make-fixup routine :assembly-routine))))
   (ecase inst
    (jmp  (inst jmp temp-reg))
    (call (inst call temp-reg))))

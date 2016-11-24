@@ -6012,3 +6012,47 @@
                                     s))))
                       '(1 2) 3)
              6)))
+
+(with-test (:name :mv-call-type-derivation
+                   :fails-on :sbcl)
+  (assert (equal (funcall (checked-compile
+                           `(lambda (list)
+                              (multiple-value-call
+                                  (lambda (&optional a &rest r)
+                                    (declare (cons r)
+                                             (ignore r))
+                                    (list a))
+                                (values-list list)))
+                           :allow-warnings t)
+                          '(1 2))
+                 '(1))))
+
+(with-test (:name :delete-optional-dispatch-xep)
+  (let ((name (gensym)))
+    (assert (= (funcall (checked-compile `(sb-int:named-lambda ,name
+                                              (&optional x)
+                                            (if (= x 0)
+                                                10
+                                                (multiple-value-call #',name (1- x)))))
+                        3)
+               10))))
+
+(with-test (:name :yes-or-no-p-type)
+  (checked-compile `(lambda ()
+                      (yes-or-no-p nil)))
+  (checked-compile `(lambda ()
+                      (y-or-n-p nil)))
+  (checked-compile `(lambda ()
+                      (yes-or-no-p #'list)))
+  (checked-compile `(lambda ()
+                      (y-or-n-p #'list))))
+
+(with-test (:name :callable-delayed-mismatch)
+  (multiple-value-bind (fun failure-p warnings)
+      (checked-compile '(lambda () (let ((f 'cons)) (find-if f '(10))))
+                       :allow-warnings 'simple-warning)
+    (declare (ignore fun))
+    (assert failure-p)
+    (assert (= (length warnings) 1))
+    (search "The function CONS is called by"
+            (princ-to-string (first warnings)))))

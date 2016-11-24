@@ -200,7 +200,7 @@ of SBCL which maintained the CMU-CL-style split into two packages.)"
                "BIGNUM-LOGCOUNT" "BIGNUM-LOGICAL-AND"
                "BIGNUM-LOGICAL-IOR" "BIGNUM-LOGICAL-NOT"
                "BIGNUM-LOGICAL-XOR" "BIGNUM-PLUS-P"
-               "BIGNUM-TO-FLOAT" "BIGNUM-TRUNCATE" "BIGNUM-TYPE"
+               "BIGNUM-TO-FLOAT" "BIGNUM-TRUNCATE"
                "MAKE-SMALL-BIGNUM"
                "MULTIPLY-BIGNUM-AND-FIXNUM" "MULTIPLY-BIGNUMS"
                "MULTIPLY-FIXNUMS" "NEGATE-BIGNUM"
@@ -585,6 +585,8 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "FASL-OUTPUT" "FASL-OUTPUT-P"
                "FASL-OUTPUT-ENTRY-TABLE" "FASL-OUTPUT-STREAM"
                "FASL-VALIDATE-STRUCTURE"
+               "IMMOBILE-FIXEDOBJ-CORE-SPACE-ID"
+               "IMMOBILE-VARYOBJ-CORE-SPACE-ID"
                "INITIAL-FUN-CORE-ENTRY-TYPE-CODE"
                "*!LOAD-TIME-VALUES*"
                "MAX-CORE-SPACE-ID"
@@ -833,10 +835,6 @@ like *STACK-TOP-HINT* and unsupported stuff like *TRACED-FUN-LIST*."
                "DOUBLE-FLOAT-POSITIVE-INFINITY"
                "LONG-FLOAT-NEGATIVE-INFINITY"
                "LONG-FLOAT-POSITIVE-INFINITY"
-
-               ;; hacks to work around system limitations
-               "*INTEXP-MAXIMUM-EXPONENT*" ; since we crash hard when
-                                        ; memory is exhausted
 
                ;; saving Lisp images
                "SAVE-LISP-AND-DIE"
@@ -2452,9 +2450,14 @@ package is deprecated in favour of SB-MOP."
       :use ("CL" "SB!MOP" "SB!INT" "SB!EXT" "SB!WALKER" "SB!KERNEL")
       ;; experimental SBCL-only (for now) symbols
       :export ("SYSTEM-CLASS"
+
+               "MAKE-METHOD-LAMBDA-USING-SPECIALIZERS"
                "MAKE-METHOD-SPECIALIZERS-FORM"
+
                "PARSE-SPECIALIZER-USING-CLASS"
                "UNPARSE-SPECIALIZER-USING-CLASS"
+               "MAKE-SPECIALIZER-FORM-USING-CLASS"
+
                "+SLOT-UNBOUND+"
 
                "ENSURE-CLASS-FINALIZED"
@@ -3074,6 +3077,7 @@ structure representations"
                "SANCTIFY-FOR-EXECUTION"
                "SAP-POINTER-SLOT" "SAP-REG-SC-NUMBER" "SAP-SIZE"
                "SAP-STACK-SC-NUMBER" "SAP-WIDETAG"
+               "SHORT-HEADER-MAX-WORDS"
                "SIGFPE-HANDLER" "SIGNED-REG-SC-NUMBER" "SIGNED-STACK-SC-NUMBER"
                "SIGNED-WORD"
                "SIMPLE-ARRAY-COMPLEX-DOUBLE-FLOAT-WIDETAG"
@@ -3133,6 +3137,12 @@ structure representations"
                          "DYNAMIC-0-SPACE-END"
                          "DYNAMIC-1-SPACE-START"
                          "DYNAMIC-1-SPACE-END")
+               #!+immobile-space("IMMOBILE-CARD-BYTES"
+                                 "IMMOBILE-SPACE-START"
+                                 "IMMOBILE-SPACE-END"
+                                 "IMMOBILE-FIXEDOBJ-SUBSPACE-SIZE"
+                                 "*IMMOBILE-FIXEDOBJ-FREE-POINTER*"
+                                 "*IMMOBILE-SPACE-FREE-POINTER*")
                "READ-ONLY-SPACE-START" "READ-ONLY-SPACE-END"
                "STATIC-SPACE-START" "STATIC-SPACE-END"
                #!+linkage-table("LINKAGE-TABLE-SPACE-START"
