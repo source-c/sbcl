@@ -89,7 +89,8 @@
 (defun %target-defstruct (dd)
   (declare (type defstruct-description dd))
 
-  (/show0 "entering %TARGET-DEFSTRUCT")
+  #!+(and sb-show (host-feature sb-xc) (not win32))
+  (progn (write `(%target-defstruct ,(dd-name dd))) (terpri))
 
   (when (dd-doc dd)
     (setf (fdocumentation (dd-name dd) 'structure)
@@ -132,7 +133,6 @@
     (dolist (fun *defstruct-hooks*)
       (funcall fun classoid)))
 
-  (/show0 "leaving %TARGET-DEFSTRUCT")
   (values))
 
 ;;; Copy any old kind of structure.
@@ -199,8 +199,7 @@
         (pprint-newline :linear stream)
         (loop (pprint-pop)
               (let ((slot (pop remaining-slots)))
-                (write-char #\: stream)
-                (output-symbol-name (symbol-name (dsd-name slot)) stream)
+                (output-symbol* (dsd-name slot) *keyword-package* stream)
                 (write-char #\space stream)
                 (pprint-newline :miser stream)
                 (output-object (funcall (access-fn slot) structure (dsd-index slot))
@@ -221,9 +220,9 @@
         ((or (null remaining-slots) (>= index limit))
          (write-string (if remaining-slots " ...)" ")") stream))
       (declare (type index index))
-      (write-string " :" stream)
+      (write-char #\space stream)
       (let ((slot (first remaining-slots)))
-        (output-symbol-name (symbol-name (dsd-name slot)) stream)
+        (output-symbol* (dsd-name slot) *keyword-package* stream)
         (write-char #\space stream)
         (output-object (funcall (access-fn slot) structure (dsd-index slot))
                        stream)))))

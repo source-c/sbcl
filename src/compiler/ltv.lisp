@@ -90,40 +90,45 @@ guaranteed to never be modified, so it can be put in read-only storage."
       (setf read-only-p t))
     (if (producing-fasl-file)
         (multiple-value-bind (handle type)
-            ;; Value cells are allocated for non-READ-ONLY-P stop the
-            ;; compiler from complaining about constant modification
-            ;; -- it seems that we should be able to elide them all
-            ;; the time if we had a way of telling the compiler that
-            ;; "this object isn't really a constant the way you
-            ;; think". --NS 2009-06-28
             (compile-load-time-value
-             (if read-only-p form `(make-value-cell ,form)))
+             ;; KLUDGE: purify on cheneygc moves everything in code
+             ;; constants into read-only space, value-cell breaks the
+             ;; chain.
+             (cond #!-gencgc
+                   ((not read-only-p)
+                    `(make-value-cell ,form))
+                   (t
+                    form)))
           (unless (csubtypep type source-type)
             (setf type source-type))
           (let ((value-form
-                  (if read-only-p
-                      `(%load-time-value ',handle)
-                      `(value-cell-ref (%load-time-value ',handle)))))
+                  (cond #!-gencgc
+                        ((not read-only-p)
+                         `(value-cell-ref (%load-time-value ',handle)))
+                        (t
+                         `(%load-time-value ',handle)))))
             (the-in-policy type value-form **zero-typecheck-policy**
                            start next result)))
         (let ((value
-               (flet ((eval-it (operator thing)
-                        (handler-case (funcall operator thing)
-                          (error (condition)
-                            (compiler-error "(during EVAL of LOAD-TIME-VALUE)~%~A"
-                                            condition)))))
-                 (if (eq sb!ext:*evaluator-mode* :compile)
-                     ;; This call to EVAL actually means compile+eval.
-                     (eval-it 'eval form)
-                     (let ((f (compile nil `(lambda () ,form))))
-                       (if f
-                           (eval-it 'funcall f)
-                           (compiler-error "Failed to compile LOAD-TIME-VALUE form")))))))
+                (flet ((eval-it (operator thing)
+                         (handler-case (funcall operator thing)
+                           (error (condition)
+                             (compiler-error "(during EVAL of LOAD-TIME-VALUE)~%~A"
+                                             condition)))))
+                  (if (eq sb!ext:*evaluator-mode* :compile)
+                      ;; This call to EVAL actually means compile+eval.
+                      (eval-it 'eval form)
+                      (eval-it 'funcall (compile nil `(lambda () ,form)))))))
           (if read-only-p
               (ir1-convert start next result `',value)
-              (the-in-policy (ctype-of value) `(value-cell-ref ,(make-value-cell value))
+              #!-gencgc
+              (the-in-policy (ctype-of value)
+                             `(value-cell-ref ,(make-value-cell value))
                              **zero-typecheck-policy**
-                             start next result))))))
+                             start next result)
+              #!+gencgc
+              ;; Avoid complaints about constant modification
+              (ir1-convert start next result `(ltv-wrapper ',value)))))))
 
 (defoptimizer (%load-time-value ir2-convert) ((handle) node block)
   (aver (constant-lvar-p handle))

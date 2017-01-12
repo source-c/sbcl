@@ -562,8 +562,13 @@ REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES."
 ;;; making this a generic function then packages with custom package classes
 ;;; could hook into this to provide their own resolution.
 (defun find-package-using-package (package-designator base)
-  (flet ((find-package-from-string (string)
-           (declare (type string string))
+  (typecase package-designator
+    (package package-designator)
+    ;; Rather than use STRINGIFY-STRING-DESIGNATOR, we check type by hand
+    ;; to avoid consing a new simple-base-string if the designator is one
+    ;; that would undergo coercion entailing allocation.
+    ((or symbol string character)
+         (let ((string (string package-designator)))
            (let* ((nicknames (when base
                                (package-%local-nicknames base)))
                   (nicknamed (when nicknames
@@ -581,14 +586,11 @@ REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES."
                          (find-package
                           (substitute #\- #\! string :count 1)))))
                  packageoid))))
-    (typecase package-designator
-      (package package-designator)
-      (symbol (find-package-from-string (symbol-name package-designator)))
-      (string (find-package-from-string package-designator))
-      (character (find-package-from-string (string package-designator)))
-      (t (error 'type-error
+    ;; Is there a fundamental reason we don't declare the FTYPE
+    ;; of FIND-PACKAGE-USING-PACKAGE letting the compiler do the checking?
+    (t (error 'type-error
                 :datum package-designator
-                :expected-type '(or character package string symbol))))))
+                :expected-type '(or character package string symbol)))))
 
 ;;; Return a list of packages given a package designator or list of
 ;;; package designators, or die trying.
@@ -755,9 +757,8 @@ REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES."
 (defun %enter-new-nicknames (package nicknames)
   (declare (type list nicknames))
   (dolist (n nicknames)
-    (let* ((n (stringify-package-designator n))
-           (found (with-package-names (names)
-                    (or (gethash n names)
+    (let ((found (with-package-names (names)
+                    (or (gethash (the simple-string n) names)
                         (progn
                           (setf (gethash n names) package)
                           (push n (package-%nicknames package))
@@ -788,7 +789,9 @@ list. :INTERNAL-SYMBOLS and :EXTERNAL-SYMBOLS are estimates for the number of
 internal and external symbols which will ultimately be present in the package.
 The default value of USE is implementation-dependent, and in this
 implementation it is ~S." *default-package-use-list*)
-  (prog (clobber)
+  (prog ((name (stringify-string-designator name))
+         (nicks (stringify-string-designators nicknames))
+         clobber)
    :restart
      (when (find-package name)
        ;; ANSI specifies that this error is correctable.
@@ -801,8 +804,7 @@ implementation it is ~S." *default-package-use-list*)
        ;; Check for race, signal the error outside the lock.
        (when (and (not clobber) (find-package name))
          (go :restart))
-       (let* ((name (stringify-package-designator name))
-              (package
+       (let ((package
                (%make-package
                 name
                 (make-package-hashtable internal-symbols)
@@ -819,7 +821,7 @@ implementation it is ~S." *default-package-use-list*)
          ;; Perhaps this can be solved by just moving ENTER-NEW-NICKNAMES before
          ;; USE-PACKAGE, but I need to check what kinds of errors can be caused by
          ;; USE-PACKAGE, too.
-         (%enter-new-nicknames package nicknames)
+         (%enter-new-nicknames package nicks)
          (return (setf (gethash name *package-names*) package))))
      (bug "never")))
 
@@ -835,11 +837,13 @@ implementation it is ~S." *default-package-use-list*)
 (defun rename-package (package-designator name &optional (nicknames ()))
   #!+sb-doc
   "Changes the name and nicknames for a package."
-  (prog () :restart
+  (prog ((nicks (stringify-string-designators nicknames)))
+   :restart
      (let ((package (find-undeleted-package-or-lose package-designator))
+           ;; This is the "weirdness" alluded to. Do it in the loop in case
+           ;; the stringified value changes on restart when NAME is a package.
            (name (stringify-package-designator name))
-           (found (find-package name))
-           (nicks (mapcar #'string nicknames)))
+           (found (find-package name)))
        (unless (or (not found) (eq found package))
          (signal-package-error name
                                "A package named ~S already exists." name))
@@ -861,7 +865,7 @@ implementation it is ~S." *default-package-use-list*)
            (setf (package-%name package) name
                  (gethash name names) package
                  (package-%nicknames package) ()))
-         (%enter-new-nicknames package nicknames))
+         (%enter-new-nicknames package nicks))
        (return package))))
 
 (defun delete-package (package-designator)
@@ -1617,9 +1621,8 @@ PACKAGE."
               (package-%locally-nicknamed-by pkg) nil
               (package-source-location pkg) nil
               (gethash (package-%name pkg) names) pkg)
-        (let ((nicks (package-%nicknames pkg)))
-          (setf (package-%nicknames pkg) nil) ; each is pushed in again
-          (%enter-new-nicknames pkg nicks))
+        (dolist (nick (package-%nicknames pkg))
+          (setf (gethash nick names) pkg))
         #!+sb-package-locks
         (setf (package-lock pkg) nil
               (package-%implementation-packages pkg) nil))))
@@ -1631,14 +1634,7 @@ PACKAGE."
             (map 'vector #'package-external-symbols (package-%use-list pkg)))))
 
   (/show0 "about to MAKUNBOUND *!INITIAL-SYMBOLS*")
-  (%makunbound '*!initial-symbols*)       ; (so that it gets GCed)
-
-  ;; For the kernel core image wizards, set the package to *CL-PACKAGE*.
-  ;;
-  ;; FIXME: We should just set this to (FIND-PACKAGE
-  ;; "COMMON-LISP-USER") once and for all here, instead of setting it
-  ;; once here and resetting it later.
-  (setq *package* *cl-package*))
+  (%makunbound '*!initial-symbols*))      ; (so that it gets GCed)
 
 ;;; support for WITH-PACKAGE-ITERATOR
 

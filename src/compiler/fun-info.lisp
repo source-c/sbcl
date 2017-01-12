@@ -122,6 +122,10 @@
   ;; can't be handled using the template mechanism. The COMBINATION
   ;; node and the IR2-BLOCK are passed as arguments.
   (ir2-convert nil :type (or function null))
+  ;; Called before IR2 conversion, just like IR2-CONVERT above
+  ;; Currently used for issuing warnings so that it doesn't intefere
+  ;; with things like CALL-FULL-LIKE-P due to IR2-CONVERT.
+  (ir2-hook nil :type (or function null))
   ;; If true, the function can stack-allocate the result. The
   ;; COMBINATION node is passed as an argument.
   (stack-allocate-result nil :type (or function null))
@@ -162,7 +166,8 @@
   ;; passed to CALLABLE arguments have the right argument counts.
   (callable-check nil :type (or function null))
   ;; Customizing behavior of ASSERT-CALL-TYPE
-  (call-type-deriver nil :type (or function null)))
+  (call-type-deriver nil :type (or function null))
+  (functional-args nil :type (or function null)))
 
 (defprinter (fun-info)
   (attributes :test (not (zerop attributes))

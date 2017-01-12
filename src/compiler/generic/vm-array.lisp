@@ -227,6 +227,11 @@
                       :code :vector-nil :weak-pointer)))
 (!set-load-form-method room-info (:xc))
 
+;;; Return the shift amount needed to turn length into bits
+(defun saetp-n-bits-shift (saetp)
+  (max (1- (integer-length (saetp-n-bits saetp)))
+       0)) ;; because of NIL
+
 (in-package "SB!C")
 
 (defun find-saetp (element-type)

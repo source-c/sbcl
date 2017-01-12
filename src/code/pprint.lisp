@@ -602,7 +602,7 @@
   (declare (type (member :linear :miser :fill :mandatory) kind)
            (type stream-designator stream)
            (values null))
-  (let ((stream (out-synonym-of stream)))
+  (let ((stream (out-stream-from-designator stream)))
     (when (print-pretty-on-stream-p stream)
       (enqueue-newline stream kind)))
   nil)
@@ -626,7 +626,7 @@ line break."
            (type real n)
            (type stream-designator stream)
            (values null))
-  (let ((stream (out-synonym-of stream)))
+  (let ((stream (out-stream-from-designator stream)))
     (when (print-pretty-on-stream-p stream)
       (enqueue-indent stream relative-to (truncate n))))
   nil)
@@ -648,7 +648,7 @@ line break."
            (type unsigned-byte colnum colinc)
            (type stream-designator stream)
            (values null))
-  (let ((stream (out-synonym-of stream)))
+  (let ((stream (out-stream-from-designator stream)))
     (when (print-pretty-on-stream-p stream)
       (enqueue-tab stream kind colnum colinc)))
   nil)
@@ -846,8 +846,8 @@ line break."
            (type real priority)
            (type pprint-dispatch-table table))
   (declare (explicit-check))
-  (/show0 "entering SET-PPRINT-DISPATCH, TYPE=...")
-  (/hexstr type)
+  #!+(and sb-show (host-feature sb-xc) (not win32))
+  (format t "* SET-PPRINT-DISPATCH ~S~%" type)
   (assert-not-standard-pprint-dispatch-table table 'set-pprint-dispatch)
   (let* ((ctype (or (handler-bind
                         ((parse-unknown-type
@@ -885,7 +885,6 @@ line break."
                     ;; (COMPLEMENT #'entry<) is unstable wrt insertion order.
                     (merge 'list list (list entry) (lambda (a b) (entry< b a)))
                     list)))))
-  (/show0 "about to return NIL from SET-PPRINT-DISPATCH")
   nil)
 
 ;;;; standard pretty-printing routines
@@ -1376,7 +1375,7 @@ line break."
   ;; a non-list object which bypasses START-LOGICAL-BLOCK.
   ;; Also, START-LOGICAL-BLOCK could become an FLET inside here.
   (declare (function proc))
-  (with-pretty-stream (stream (out-synonym-of stream))
+  (with-pretty-stream (stream (out-stream-from-designator stream))
     (if (or (not (listp object)) ; implies obj-supplied-p
             (and (eq (car object) 'quasiquote)
                  ;; We can only bail out from printing this logical block

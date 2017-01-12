@@ -16,7 +16,8 @@
 #ifndef _GC_INTERNAL_H_
 #define _GC_INTERNAL_H_
 
-#include <genesis/simple-fun.h>
+#include "genesis/code.h"
+#include "genesis/simple-fun.h"
 #include "thread.h"
 #include "interr.h"
 
@@ -78,6 +79,42 @@ NWORDS(uword_t x, uword_t n_bits)
 #else
 #define FUN_RAW_ADDR_OFFSET (offsetof(struct simple_fun, code) - FUN_POINTER_LOWTAG)
 #endif
+
+static inline unsigned short
+#ifdef LISP_FEATURE_64_BIT
+code_n_funs(struct code* code) { return ((code)->header >> 32) & 0x7FFF; }
+#define FIRST_SIMPLE_FUN_OFFSET(code) ((code)->header >> 48)
+#else
+code_n_funs(struct code* code) { return fixnum_value((code)->n_entries) & 0x3FFF; }
+#define FIRST_SIMPLE_FUN_OFFSET(code) ((code)->n_entries >> 16)
+#endif
+
+// Iterate over the native pointers to each function in 'code_var'
+// offsets are stored as the number of bytes into the instructions
+// portion of the code object at which the simple-fun object resides.
+// We use bytes, not words, because that's what the COMPUTE-FUN vop expects.
+// But the offsets could be compressed further if we chose to use words,
+// which might allow storing them as (unsigned-byte 16),
+// as long as provision is made for ultra huge simple-funs. (~ .5MB)
+//
+// Note that the second assignment to _offset_ is OK: while it technically
+// oversteps the bounds of the indices of the fun offsets, it can not
+// run off the end of the code.
+#define for_each_simple_fun(index_var,fun_var,code_var,assertp,guts)        \
+  { int _nfuns_ = code_n_funs(code_var);                                    \
+    if (_nfuns_ > 0) {                                                      \
+      char *_insts_ = (char*)(code_var) +                                   \
+        (code_header_words((code_var)->header)<<WORD_SHIFT);                \
+      int index_var = 0;                                                    \
+      int _offset_ = FIRST_SIMPLE_FUN_OFFSET(code_var);                     \
+      do {                                                                  \
+       struct simple_fun* fun_var = (struct simple_fun*)(_insts_+_offset_); \
+       if (assertp)                                                         \
+         gc_assert(widetag_of(fun_var->header)==SIMPLE_FUN_HEADER_WIDETAG); \
+       guts ;                                                               \
+       _offset_ = ((unsigned int*)_insts_)[index_var];                      \
+      } while (++index_var < _nfuns_);                                      \
+  }}
 
 #define SIMPLE_FUN_SCAV_START(fun_ptr) &fun_ptr->name
 #define SIMPLE_FUN_SCAV_NWORDS(fun_ptr) ((lispobj*)fun_ptr->code - &fun_ptr->name)
@@ -153,6 +190,7 @@ lispobj  copy_unboxed_object(lispobj object, sword_t nwords);
 lispobj  copy_large_object(lispobj object, sword_t nwords);
 lispobj  copy_object(lispobj object, sword_t nwords);
 lispobj  copy_code_object(lispobj object, sword_t nwords);
+struct simple_fun *code_fun_addr(struct code*, int);
 
 lispobj *search_read_only_space(void *pointer);
 lispobj *search_static_space(void *pointer);
@@ -161,7 +199,7 @@ lispobj *search_dynamic_space(void *pointer);
 
 lispobj *gc_search_space(lispobj *start, size_t words, lispobj *pointer);
 
-extern int looks_like_valid_lisp_pointer_p(lispobj pointer, lispobj *start_addr);
+extern int properly_tagged_descriptor_p(lispobj pointer, lispobj *start_addr);
 
 extern void scavenge_control_stack(struct thread *th);
 extern void scrub_control_stack(void);
@@ -186,6 +224,9 @@ instance_scan_interleaved(void (*proc)(),
                           lispobj *instance_ptr,
                           sword_t n_words,
                           lispobj *layout_obj);
+
+#include "genesis/bignum.h"
+extern boolean positive_bignum_logbitp(int,struct bignum*);
 
 // Generalization of instance_scan_interleaved
 #define BIT_SCAN_INVERT 1

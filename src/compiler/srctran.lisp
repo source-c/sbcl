@@ -3492,36 +3492,15 @@
 ;;; Return T if in an arithmetic op including lvars X and Y, the
 ;;; result type is not affected by the type of X. That is, Y is at
 ;;; least as contagious as X.
-#+nil
 (defun not-more-contagious (x y)
-  (declare (type continuation x y))
   (let ((x (lvar-type x))
         (y (lvar-type y)))
-    (values (type= (numeric-contagion x y)
-                   (numeric-contagion y y)))))
-;;; Patched version by Raymond Toy. dtc: Should be safer although it
-;;; XXX needs more work as valid transforms are missed; some cases are
-;;; specific to particular transform functions so the use of this
-;;; function may need a re-think.
-(defun not-more-contagious (x y)
-  (declare (type lvar x y))
-  (flet ((simple-numeric-type (num)
-           (and (numeric-type-p num)
-                ;; Return non-NIL if NUM is integer, rational, or a float
-                ;; of some type (but not FLOAT)
-                (case (numeric-type-class num)
-                  ((integer rational)
-                   t)
-                  (float
-                   (numeric-type-format num))
-                  (t
-                   nil)))))
-    (let ((x (lvar-type x))
-          (y (lvar-type y)))
-      (if (and (simple-numeric-type x)
-               (simple-numeric-type y))
-          (values (type= (numeric-contagion x y)
-                         (numeric-contagion y y)))))))
+    (cond
+      ((csubtypep x (specifier-type 'rational)))
+      ((csubtypep x (specifier-type 'single-float))
+       (csubtypep y (specifier-type 'float)))
+      ((csubtypep x (specifier-type 'double-float))
+       (csubtypep y (specifier-type 'double-float))))))
 
 (def!type exact-number ()
   '(or rational (complex rational)))
@@ -4343,7 +4322,7 @@
     (aver (eq :rest (arg-info-kind info)))
     (setf (arg-info-default info) t)))
 
-;;; This determines of we the REF to a &REST variable is headed towards
+;;; This determines if the REF to a &REST variable is headed towards
 ;;; parts unknown, or if we can really use the context.
 (defun rest-var-more-context-ok (lvar)
   (let* ((use (lvar-use lvar))
@@ -5018,3 +4997,11 @@
    (if element-type
        `(sb!impl::%make-string-output-stream ',element-type)
        (give-up-ir1-transform))))
+
+(deftransform set ((symbol value) ((constant-arg symbol) *))
+  (let* ((symbol (lvar-value symbol)))
+    (case (info :variable :kind symbol)
+      ((:constant :global :special)
+       `(setq ,symbol value))
+      (t
+       (give-up-ir1-transform)))))

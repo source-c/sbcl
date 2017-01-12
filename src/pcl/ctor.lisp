@@ -439,9 +439,7 @@
     (if constant-class
         (let* ((class-or-name constant-class)
                (function-name (list 'ctor 'allocator class-or-name)))
-          (sb-int:check-deprecated-type (if (classp class-or-name)
-                                            (class-name class-or-name)
-                                            class-or-name))
+          (sb-int:check-deprecated-type class-or-name)
           ;; Return code constructing a ctor at load time, which,
           ;; when called, will set its funcallable instance
           ;; function to an optimized constructor function.
@@ -464,8 +462,7 @@
 
 (defun make-instance->constructor-call (form safe-code-p)
   (destructuring-bind (class-arg &rest args) (cdr form)
-    (flet (;;
-           ;; Return the name of parameter number I of a constructor
+    (flet (;; Return the name of parameter number I of a constructor
            ;; function.
            (parameter-name (i)
              (format-symbol *pcl-package* ".P~D." i))
@@ -480,28 +477,35 @@
                       (when (or (null more)
                                 (not (constant-symbol-p key))
                                 (eq :allow-other-keys (constant-form-value key)))
-                        (return-from make-instance->constructor-call nil)))))
+                        (return-from make-instance->constructor-call nil))))
+           (maybe-expand-constant (value)
+             (if (symbolp value)
+                 (constant-form-value value)
+                 value)))
       (check-args)
       ;; Collect a plist of initargs and constant values/parameter names
       ;; in INITARGS.  Collect non-constant initialization forms in
       ;; VALUE-FORMS.
-      (multiple-value-bind (initargs value-forms)
+      (multiple-value-bind (keys initargs value-forms)
           (loop for (key value) on args by #'cddr and i from 0
+                ;; Initarg key
+                collect (constant-form-value key) into keys
                 collect (constant-form-value key) into initargs
+                ;; Initarg value
                 if (constantp value)
-                collect value into initargs
+                collect (maybe-expand-constant value) into keys
+                and collect value into initargs
                 else
-                collect (parameter-name i) into initargs
+                collect (parameter-name i) into keys
+                and collect (parameter-name i) into initargs
                 and collect value into value-forms
                 finally
-                (return (values initargs value-forms)))
+                (return (values keys initargs value-forms)))
         (if (constant-class-p)
             (let* ((class-or-name (constant-form-value class-arg))
-                   (function-name (make-ctor-function-name class-or-name initargs
+                   (function-name (make-ctor-function-name class-or-name keys
                                                            safe-code-p)))
-              (sb-int:check-deprecated-type (if (classp class-or-name)
-                                                (class-name class-or-name)
-                                                class-or-name))
+              (sb-int:check-deprecated-type class-or-name)
               ;; Return code constructing a ctor at load time, which,
               ;; when called, will set its funcallable instance
               ;; function to an optimized constructor function.
@@ -791,7 +795,7 @@
          (allocation-function (raw-instance-allocator class))
          (slots-fetcher (slots-fetcher class)))
     (if (eq allocation-function 'allocate-standard-instance)
-        `(let ((.instance. (%make-standard-instance nil 0))
+        `(let ((.instance. (%make-standard-instance nil #-compact-instance-header 00))
                (.slots. (make-array
                          ,(layout-length wrapper)
                          ,@(when early-unbound-markers-p

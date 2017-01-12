@@ -189,8 +189,29 @@
        ;; Make sure we never return 0 (almost no chance of that anyway).
        (return answer)))))
 
-(declaim (inline std-instance-hash))
+
+#!+(and compact-instance-header x86-64)
+(progn
+  (declaim (inline %std-instance-hash))
+  (defun %std-instance-hash (slots) ; return or compute the 32-bit hash
+    (let ((stored-hash (sb!vm::get-header-data-high slots)))
+      (if (eql stored-hash 0)
+          (let ((new (logand (new-instance-hash-code) #xFFFFFFFF)))
+            (let ((old (sb!vm::cas-header-data-high slots 0 new)))
+              (if (eql old 0) new old)))
+          stored-hash))))
+
 (defun std-instance-hash (instance)
+  #!+(and compact-instance-header x86-64)
+  ;; The one logical slot (excluding layout) in the primitive object is index 0.
+  ;; That holds a vector of the clos slots, and its header holds the hash.
+  (let* ((slots (%instance-ref instance 0))
+         (hash (%std-instance-hash slots)))
+    ;; Simulate N-POSITIVE-FIXNUM-BITS of output for backward-compatibility,
+    ;; in case people use the high order bits.
+    ;; (There are only 32 bits of actual randomness, if even that)
+    (logxor (ash hash (- sb!vm:n-positive-fixnum-bits 32)) hash))
+  #!-(and compact-instance-header x86-64)
   (let ((hash (%instance-ref instance sb!pcl::std-instance-hash-slot-index)))
     (if (not (eql hash 0))
         hash
@@ -288,12 +309,13 @@
                    ;; simply returning the same value for all LAYOUT
                    ;; objects, as the next branch would do.
                    (layout-clos-hash x))
-                  ((or structure-object condition)
+                  (structure-object
                    (logxor 422371266
                            ;; FIXME: why not (LAYOUT-CLOS-HASH ...) ?
                            (sxhash      ; through DEFTRANSFORM
                             (classoid-name
                              (layout-classoid (%instance-layout x))))))
+                  (condition (sb!kernel::condition-hash x))
                   (t (std-instance-hash x))))
                (symbol (sxhash x))      ; through DEFTRANSFORM
                (array
@@ -396,13 +418,8 @@
   (declare (optimize speed))
   (declare (type structure-object key))
   (declare (type (integer 0 #.+max-hash-depthoid+) depthoid))
-  (let* ((layout (%instance-layout key)) ; i.e. slot #0
-         ;; Is there some reason the name of the layout's classoid
-         ;; should be preferred as the seed, instead of using the CLOS-HASH
-         ;; just like SXHASH does?
-         (classoid (layout-classoid layout))
-         (name (classoid-name classoid))
-         (result (mix (sxhash name) (the fixnum 79867))))
+  (let* ((layout (%instance-layout key))
+         (result (layout-clos-hash layout)))
     (declare (type fixnum result))
     (when (plusp depthoid)
       (let ((max-iterations depthoid)

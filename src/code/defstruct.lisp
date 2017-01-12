@@ -1734,23 +1734,12 @@ or they must be declared locally notinline at each call site.~@:>"
                                               slot-names)
   (let* ((dd (make-defstruct-description t class-name))
          (conc-name (string (gensymify* class-name "-")))
-         (dd-slots (let ((reversed-result nil)
-                         ;; The index starts at 1 for ordinary named
-                         ;; slots because slot 0 is magical, used for
-                         ;; the LAYOUT in CONDITIONs and
-                         ;; FUNCALLABLE-INSTANCEs.  (This is the same
-                         ;; in ordinary structures too: see (INCF
-                         ;; DD-LENGTH) in
-                         ;; PARSE-DEFSTRUCT-NAME-AND-OPTIONS).
-                         (index 1))
-                     (dolist (slot-name slot-names)
-                       (push (make-defstruct-slot-description
-                              :name slot-name
-                              :index index
-                              :accessor-name (symbolicate conc-name slot-name))
-                             reversed-result)
-                       (incf index))
-                     (nreverse reversed-result))))
+         ;; Without compact instance headers, the index starts at 1 for
+         ;; named slots, because slot 0 is the LAYOUT.
+         ;; This is the same in ordinary structures too: see (INCF DD-LENGTH)
+         ;; in PARSE-DEFSTRUCT-NAME-AND-OPTIONS.
+         ;; With compact instance headers, slot 0 is a data slot.
+         (slot-index sb!vm:instance-data-start))
     ;; We do *not* fill in the COPIER-NAME and PREDICATE-NAME
     ;; because none of the magical alternate-metaclass structures
     ;; have copiers and predicates that "Just work"
@@ -1766,8 +1755,14 @@ or they must be declared locally notinline at each call site.~@:>"
     (setf (dd-alternate-metaclass dd) (list superclass-name
                                             metaclass-name
                                             metaclass-constructor)
-          (dd-slots dd) dd-slots
-          (dd-length dd) (1+ (length slot-names))
+          (dd-slots dd)
+          (mapcar (lambda (slot-name)
+                    (make-defstruct-slot-description
+                     :name slot-name
+                     :index (prog1 slot-index (incf slot-index))
+                     :accessor-name (symbolicate conc-name slot-name)))
+                  slot-names)
+          (dd-length dd) slot-index
           (dd-type dd) dd-type)
     dd))
 
@@ -1840,7 +1835,7 @@ or they must be declared locally notinline at each call site.~@:>"
               :metaclass-constructor metaclass-constructor
               :dd-type dd-type))
          (dd-slots (dd-slots dd))
-         (dd-length (1+ (length slot-names)))
+         (dd-length (dd-length dd))
          (object-gensym (make-symbol "OBJECT"))
          (new-value-gensym (make-symbol "NEW-VALUE"))
          (delayed-layout-form `(%delayed-get-compiler-layout ,class-name)))
@@ -1851,7 +1846,10 @@ or they must be declared locally notinline at each call site.~@:>"
                    '%instance-ref))
           (funcallable-structure
            (values `(let ((,object-gensym
-                           (%make-funcallable-instance ,dd-length)))
+                           ;; TRULY-THE should not be needed. But it is, to avoid
+                           ;; a type check on the next SETF. Why???
+                           (truly-the funcallable-instance
+                            (%make-funcallable-instance ,dd-length))))
                       (setf (%funcallable-instance-layout ,object-gensym)
                             ,delayed-layout-form)
                       ,object-gensym)
@@ -1921,7 +1919,7 @@ or they must be declared locally notinline at each call site.~@:>"
   (let ((dd (make-defstruct-description t 'structure-object)))
     (setf
      (dd-slots dd) nil
-     (dd-length dd) 1
+     (dd-length dd) sb!vm:instance-data-start
      (dd-type dd) 'structure)
     (%compiler-set-up-layout dd)))
 #+sb-xc-host(!set-up-structure-object-class)

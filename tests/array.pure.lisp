@@ -11,6 +11,8 @@
 
 (in-package :cl-user)
 
+(load "compiler-test-util.lisp")
+
 ;;; Array initialization has complicated defaulting for :ELEMENT-TYPE,
 ;;; and both compile-time and run-time logic takes a whack at it.
 (with-test (:name (make-array :element-type :bug-126))
@@ -160,12 +162,42 @@
     (assert fail)
     (assert-error (funcall fun) sb-int:invalid-array-index-error)))
 
-(with-test (:name (make-array :element-type :compile-time-error))
+(with-test (:name (make-array :element-type :compile-time error))
   (multiple-value-bind (fun fail warnings style-warnings)
       (checked-compile `(lambda () (make-array 5 :element-type 'undefined-type))
                        :allow-style-warnings t)
     (declare (ignore fun fail warnings))
     (assert style-warnings)))
+
+(with-test (:name (make-array :default :element-type :supplied :compile-time warning))
+  ;; Supplied :initial-element, EQL to the default initial element,
+  ;; results in full warning, even if not "used" due to 0 array total
+  ;; size.
+  (flet ((check (dimensions)
+           (multiple-value-bind (fun fail warnings)
+               (checked-compile
+                `(lambda ()
+                   (make-array ,dimensions
+                               :initial-element 0 :element-type 'string))
+                :allow-warnings t)
+             (declare (ignore fun fail))
+             (assert (= (length warnings) 1)))))
+    (check 1)
+    (check 0)))
+
+(with-test (:name (make-array :default :element-type :implicit :compile-time style-warning))
+  ;; Implicit default initial element used to initialize array
+  ;; elements results in a style warning.
+  (multiple-value-bind (fun fail warnings style-warnings)
+      (checked-compile `(lambda () (make-array 5 :element-type 'string))
+                       :allow-style-warnings t)
+    (declare (ignore fun fail warnings))
+    (assert (= (length style-warnings) 1)))
+
+  ;; But not if the default initial-element is not actually used to
+  ;; initialize any elements due to 0 array total size.
+  (checked-compile `(lambda () (make-array 0 :element-type 'string)))
+  (checked-compile `(lambda () (make-array '(0 2) :element-type 'string))))
 
 (flet ((opaque-identity (x) x))
   (declare (notinline opaque-identity))
@@ -446,3 +478,28 @@
                                       :initial-contents
                                       `((,z ,z 1) (,z ,z ,z)))))))
     (assert (and f warningp errorp))))
+
+(with-test (:name :adjust-array-element-type)
+  (let ((fun (checked-compile '(lambda (array)
+                                (adjust-array array 3 :element-type '(signed-byte 2))))))
+    (assert-error (funcall fun #(1 2 3))))
+  (let ((fun (checked-compile '(lambda (array)
+                                (adjust-array array 5 :displaced-to #(1 2 3))))))
+    (assert-error (funcall fun (make-array 5 :adjustable t :element-type 'fixnum)))))
+
+(with-test (:name :make-array-transform-fill-pointer-nil)
+  (let ((fun (checked-compile '(lambda ()
+                                (make-array 3 :fill-pointer nil)))))
+    (assert (not (ctu:find-named-callees fun :name 'sb-kernel:%make-array))))
+  (let ((fun (checked-compile '(lambda ()
+                                (make-array 3 :fill-pointer t)))))
+    (assert (not (ctu:find-named-callees fun :name 'sb-kernel:%make-array))))
+  (let ((fun (checked-compile '(lambda ()
+                                (make-array 3 :adjustable nil)))))
+    (assert (not (ctu:find-named-callees fun :name 'sb-kernel:%make-array))))
+  (let ((fun (checked-compile '(lambda ()
+                                (make-array '(3 3) :adjustable nil)))))
+    (assert (not (ctu:find-named-callees fun :name 'sb-kernel:%make-array))))
+  (let ((fun (checked-compile '(lambda ()
+                                (make-array '(3 3) :fill-pointer nil)))))
+    (assert (not (ctu:find-named-callees fun :name 'sb-kernel:%make-array)))))

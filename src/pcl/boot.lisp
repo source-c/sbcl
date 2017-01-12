@@ -497,10 +497,11 @@ generic function lambda list ~S~:>"
              (specializers-form
               (make-method-specializers-form
                proto-gf proto-method specializers env)))
-    (mapc (lambda (specializer)
+    (mapc (lambda (specializer parameter)
             (when (typep specializer 'type-specifier)
-              (check-deprecated-type specializer)))
-          specializers)
+              (with-current-source-form (parameter)
+                (check-deprecated-type specializer))))
+          specializers lambda-list)
     ;; Note: We could DECLAIM the ftype of the generic function here,
     ;; since ANSI specifies that we create it if it does not
     ;; exist. However, I chose not to, because I think it's more
@@ -1826,7 +1827,7 @@ generic function lambda list ~S~:>"
           :format-arguments (list fun-name)))
 
 (defvar *sgf-wrapper*
-  (!boot-make-wrapper (early-class-size 'standard-generic-function)
+  (!boot-make-wrapper (!early-class-size 'standard-generic-function)
                       'standard-generic-function))
 
 (defvar *sgf-slots-init*
@@ -1837,7 +1838,7 @@ generic function lambda list ~S~:>"
                   (if initfunction
                       (funcall initfunction)
                       +slot-unbound+))))
-          (early-collect-inheritance 'standard-generic-function)))
+          (!early-collect-inheritance 'standard-generic-function)))
 
 (defconstant +sgf-method-class-index+
   (!bootstrap-slot-index 'standard-generic-function 'method-class))

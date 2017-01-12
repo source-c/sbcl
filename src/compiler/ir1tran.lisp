@@ -84,6 +84,14 @@
 (declaim (list *current-path*))
 (defvar *current-path*)
 
+(defun call-with-current-source-form (thunk &rest forms)
+  (let ((*current-path* (when (and (some #'identity forms)
+                                   (boundp '*source-paths*))
+                          (or (some #'get-source-path forms)
+                              (when (boundp '*current-path*)
+                                *current-path*)))))
+    (funcall thunk)))
+
 (defvar *derive-function-types* nil
   #!+sb-doc
   "Should the compiler assume that function types will never change,
@@ -220,33 +228,30 @@
         (when old-free-fun
           (clear-invalid-functionals old-free-fun)
           old-free-fun))
-      (ecase (info :function :kind name)
-        ;; FIXME: The :MACRO and :SPECIAL-FORM cases could be merged.
-        (:macro
-         (compiler-error "The macro name ~S was found ~A." name context))
-        (:special-form
-         (compiler-error "The special form name ~S was found ~A."
-                         name
-                         context))
-        ((:function nil)
-         (check-fun-name name)
-         (let ((expansion (fun-name-inline-expansion name))
-               (inlinep (info :function :inlinep name)))
-           (setf (gethash name *free-funs*)
-                 (if (or expansion inlinep)
-                     (let ((where (info :function :where-from name)))
-                       (make-defined-fun
-                        :%source-name name
-                        :inline-expansion expansion
-                        :inlinep inlinep
-                        :where-from (if (eq inlinep :notinline)
-                                        where
-                                        (maybe-defined-here name where))
-                        :type (if (and (eq inlinep :notinline)
-                                       (neq where :declared))
-                                  (specifier-type 'function)
-                                  (proclaimed-ftype name))))
-                     (find-global-fun name nil))))))))
+      (let ((kind (info :function :kind name)))
+        (ecase kind
+          ((:macro :special-form)
+           (compiler-error "The ~(~S~) name ~S was found ~A."
+                           kind name context))
+          ((:function nil)
+           (check-fun-name name)
+           (let ((expansion (fun-name-inline-expansion name))
+                 (inlinep (info :function :inlinep name)))
+             (setf (gethash name *free-funs*)
+                   (if (or expansion inlinep)
+                       (let ((where (info :function :where-from name)))
+                         (make-defined-fun
+                          :%source-name name
+                          :inline-expansion expansion
+                          :inlinep inlinep
+                          :where-from (if (eq inlinep :notinline)
+                                          where
+                                          (maybe-defined-here name where))
+                          :type (if (and (eq inlinep :notinline)
+                                         (neq where :declared))
+                                    (specifier-type 'function)
+                                    (proclaimed-ftype name))))
+                       (find-global-fun name nil)))))))))
 
 ;;; Return the LEAF structure for the lexically apparent function
 ;;; definition of NAME.
@@ -1249,7 +1254,7 @@
       (dolist (var-name (rest decl))
         (unless (symbolp var-name)
           (compiler-error "Variable name is not a symbol: ~S." var-name))
-        (when (boundp var-name)
+        (unless (eq (info :variable :kind var-name) :unknown)
           (program-assert-symbol-home-package-unlocked
            context var-name "declaring the type of ~A"))
         (let* ((bound-var (find-in-bindings vars var-name))
@@ -1705,11 +1710,9 @@
       (dolist (decl decls)
         (dolist (spec (rest decl))
           (if (eq context :compile)
-              (let ((*current-path* (or (get-source-path spec)
-                                        (get-source-path decl)
-                                        *current-path*)))
+              (with-current-source-form (spec decl) ; TODO this is a slight change to the previous code. make sure the behavior is identical
                 (process-it spec decl))
-            ;; Kludge: EVAL calls this function to deal with LOCALLY.
+              ;; Kludge: EVAL calls this function to deal with LOCALLY.
               (process-it spec decl)))))
     (warn-repeated-optimize-qualities (lexenv-policy lexenv) optimize-qualities)
     (values lexenv result-type *post-binding-variable-lexenv*

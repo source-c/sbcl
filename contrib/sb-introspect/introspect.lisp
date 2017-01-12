@@ -368,7 +368,13 @@ If an unsupported TYPE is requested, the function will return NIL.
                             (sb-c:fun-info-optimizer . sb-c:optimizer)
                             (sb-c:fun-info-ir2-convert . sb-c:ir2-convert)
                             (sb-c::fun-info-stack-allocate-result
-                             . sb-c::stack-allocate-result))))
+                             . sb-c::stack-allocate-result)
+                            (sb-c::fun-info-constraint-propagate
+                             . sb-c::constraint-propagate)
+                            (sb-c::fun-info-constraint-propagate-if
+                             . sb-c::constraint-propagate-if)
+                            (sb-c::fun-info-call-type-deriver
+                             . sb-c::call-type-deriver))))
               (loop for (reader . name) in otypes
                     for fn = (funcall reader fun-info)
                     when fn collect
@@ -377,10 +383,12 @@ If an unsupported TYPE is requested, the function will return NIL.
                             (list name))
                       source))))))
        (:vop
-        (let ((loc (sb-int:info :source-location type name)))
+        (let ((loc (sb-int:info :source-location type name))
+              (translated (find-vop-source name)))
           (if loc
-              (translate-source-location loc)
-              (find-vop-source name))))
+              (cons (translate-source-location loc)
+                    translated)
+              translated)))
        (:alien-type
         (let ((loc (sb-int:info :source-location type name)))
           (and loc
@@ -597,13 +605,8 @@ value."
      function
      spaces
      (lambda (code)
-       (let ((entry (sb-kernel:%code-entry-points  code)))
-         (cond ((not entry)
-                (push (princ-to-string code) referrers))
-               (t
-                (loop for e = entry then (sb-kernel::%simple-fun-next e)
-                      while e
-                      do (pushnew e referrers)))))))
+       (dotimes (i (sb-kernel:code-n-entries code))
+         (pushnew (sb-kernel:%code-entry-point code i) referrers))))
     referrers))
 
 ;;; XREF facility
@@ -949,17 +952,16 @@ Experimental: interface subject to change."
                (unless simple
                  (call (sb-kernel::%array-displaced-from object))))))
         (sb-kernel:code-component
-         (call (sb-kernel:%code-entry-points object))
          (call (sb-kernel:%code-debug-info object))
          (loop for i from sb-vm:code-constants-offset
                below (sb-kernel:code-header-words object)
-               do (call (sb-kernel:code-header-ref object i))))
+               do (call (sb-kernel:code-header-ref object i)))
+         (loop for i below (sb-kernel:code-n-entries object)
+               do (call (sb-kernel:%code-entry-point object i))))
         (sb-kernel:fdefn
          (call (sb-kernel:fdefn-name object))
          (call (sb-kernel:fdefn-fun object)))
         (sb-kernel:simple-fun
-         (unless simple
-           (call (sb-kernel:%simple-fun-next object)))
          (call (sb-kernel:fun-code-header object))
          (call (sb-kernel:%simple-fun-name object))
          (call (sb-kernel:%simple-fun-arglist object))
@@ -971,8 +973,9 @@ Experimental: interface subject to change."
            (call x)))
         (sb-kernel:funcallable-instance
          (call (sb-kernel:%funcallable-instance-function object))
-         (loop for i from 1 below (- (1+ (sb-kernel:get-closure-length object))
-                                     sb-vm::funcallable-instance-info-offset)
+         (loop for i from sb-vm:instance-data-start
+               below (- (1+ (sb-kernel:get-closure-length object))
+                        sb-vm:funcallable-instance-info-offset)
                do (call (sb-kernel:%funcallable-instance-info object i))))
         (symbol
          (when ext

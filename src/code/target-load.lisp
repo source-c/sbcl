@@ -163,10 +163,10 @@
       ;; Case 2: Open as binary, try to process as a fasl.
       (with-open-stream
           (stream (or (open pathspec :element-type '(unsigned-byte 8)
-                            :if-does-not-exist nil)
+                                     :if-does-not-exist nil)
                       (when (null (pathname-type pathspec))
                         (let ((defaulted-pathname
-                               (probe-load-defaults pathspec)))
+                                (probe-load-defaults pathspec)))
                           (if defaulted-pathname
                               (progn (setq pathname defaulted-pathname)
                                      (open pathname
@@ -178,9 +178,8 @@
                                  :pathname pathspec
                                  :format-control
                                  "~@<Couldn't load ~S: file does not exist.~@:>"
-                                 :format-arguments (list pathspec)))))
-        (unless stream
-          (return-from load nil))
+                                 :format-arguments (list pathspec))
+                          (return-from load nil))))
         (let* ((real (probe-file stream))
                (should-be-fasl-p
                 (and real (string-equal (pathname-type real) *fasl-file-type*))))
@@ -234,7 +233,7 @@
 
 ;;; Load a code object. BOX-NUM objects are popped off the stack for
 ;;; the boxed storage section, then CODE-LENGTH bytes of code are read in.
-(defun load-code (box-num code-length stack ptr input-stream)
+(defun load-code (nfuns box-num code-length stack ptr fasl-input)
   (declare (fixnum box-num code-length))
   (declare (simple-vector stack) (type index ptr))
   (let* ((debug-info-index (+ ptr box-num))
@@ -247,7 +246,19 @@
           for j of-type index from ptr below debug-info-index
           do (setf (code-header-ref code i) (svref stack j)))
     (without-gcing
-      (read-n-bytes input-stream (code-instructions code) 0 code-length))
+      ;; FIXME: can this be WITH-PINNED-OBJECTS? Probably.
+      ;; We must pin the range of bytes containing instructions,
+      ;; but we also must prevent scavenging the code object until
+      ;; the embedded simple-funs have been installed,
+      ;; otherwise GC could assert that the word referenced by
+      ;; a fun offset does not have the right widetag.
+      ;; This is achieved by not writing the 'nfuns' value
+      ;; until after the loop which stores the offsets.
+      (read-n-bytes (%fasl-input-stream fasl-input)
+                    (code-instructions code) 0 code-length)
+      (loop for i from (1- nfuns) downto 0
+            do (sb!c::new-simple-fun code i (read-varint-arg fasl-input)
+                                     nfuns)))
     code))
 
 ;;;; linkage fixups

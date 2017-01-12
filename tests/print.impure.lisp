@@ -32,6 +32,13 @@
   (assert-readable-output x)
   (assert-unreadable-output x))
 
+;;; Ensure that we don't print a value cell as #S(RANDOM-CLASS ...)
+(defun f (x) (lambda (y) (+ (incf x) y)))
+(compile 'f)
+(with-test (:name :output-value-cell)
+  (assert (search "#<value cell"
+                  (write-to-string (sb-kernel:%closure-index-ref (f 3) 0)))))
+
 ;;; Nathan Froyd reported that sbcl-0.6.11.34 screwed up output of
 ;;; floating point infinities.
 (with-test (:name (write float :infinities))
@@ -372,9 +379,7 @@
                       (assert (not (eql r (read-from-string (prin1-to-string r)))))
                       (let ((*print-radix* t))
                         (assert (= r (read-from-string
-                                      (princ-to-string r)))))))))
-         (write-char #\.)
-         (finish-output))))
+                                      (princ-to-string r))))))))))))
 
 ;;;; Bugs, found by PFD
 ;;; NIL parameter for ~^ means `not supplied'
@@ -797,9 +802,18 @@
 
 (define-condition foo () (a))
 (defvar *ccc* (make-condition 'foo))
-(define-condition foo (warning) (a))
+(handler-bind ((warning #'muffle-warning)) (define-condition foo (warning) (a)))
 (with-test (:name :write-obsolete-condition)
   (assert (search "UNPRINTABLE" (write-to-string *ccc*))))
 
 (with-test (:name (format :no-overeager-compile-time-processing))
   (checked-compile '(lambda (x) (format t "~/nopackage:nofun/" x))))
+
+(with-test (:name :print-case-capitalize)
+  (assert (string= (write-to-string 'fluffy-bunny-count :case :capitalize)
+                   "Fluffy-Bunny-Count")))
+
+(defclass foo2 () ())
+(with-test (:name :print-random-standard-object) ; lp# 1654550
+  (assert (search "#<FOO2 {" (write-to-string (make-instance 'foo2) :pretty nil)))
+  (assert (search "#<FOO2 {" (write-to-string (make-instance 'foo2) :pretty t))))

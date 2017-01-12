@@ -37,11 +37,6 @@
   ;; slot documentation
   (documentation nil :type (or string null)))
 
-;;; KLUDGE: It's not clear to me why CONDITION-CLASS has itself listed
-;;; in its CPL, while other classes derived from CONDITION-CLASS don't
-;;; have themselves listed in their CPLs. This behavior is inherited
-;;; from CMU CL, and didn't seem to be explained there, and I haven't
-;;; figured out whether it's right. -- WHN 19990612
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (/show0 "condition.lisp 103")
   (let ((condition-class (find-classoid 'condition)))
@@ -93,7 +88,7 @@
 ;;;     (defmethod print-object ((x c) stream)
 ;;;       (if *print-escape* (call-next-method) (report-name x stream)))
 ;;; The current code doesn't seem to quite match that.
-(def*method print-object ((object condition) stream)
+(defmethod print-object ((object condition) stream)
   (cond
     ((not *print-escape*)
      ;; KLUDGE: A comment from CMU CL here said
@@ -104,23 +99,14 @@
                   (error "no REPORT? shouldn't happen!"))
               object stream))
     ((and (typep object 'simple-condition)
-          (slot-value object 'format-control))
+          (condition-slot-value object 'format-control))
      (print-unreadable-object (object stream :type t :identity t)
        (write (simple-condition-format-control object)
               :stream stream :lines 1)))
     (t
      (print-unreadable-object (object stream :type t :identity t)))))
-
-;;; It is essential that there be a method that works in warm load
-;;; because any conditions signaled are not printable otherwise,
-;;; except by the method on type T which is completely unhelpful.
-(defmethod print-object ((x condition) stream)
-  (print-unreadable-object (x stream :type t :identity t)
-    (write (%instance-ref x 1) :stream stream :escape t)))
 
 ;;;; slots of CONDITION objects
-
-(defvar *empty-condition-slot* '(empty))
 
 (defun find-slot-default (class slot)
   (let ((initargs (condition-slot-initargs slot))
@@ -151,7 +137,7 @@
       (when (eq (condition-slot-name slot) slot-name)
         (return-from find-condition-class-slot slot)))))
 
-(defun condition-writer-function (condition new-value name)
+(defun set-condition-slot-value (condition new-value name)
   (dolist (cslot (condition-classoid-class-slots
                   (layout-classoid (%instance-layout condition)))
                  (setf (getf (condition-assigned-slots condition) name)
@@ -159,33 +145,37 @@
     (when (eq (condition-slot-name cslot) name)
       (return (setf (car (condition-slot-cell cslot)) new-value)))))
 
-(defun condition-reader-function (condition name)
-  (let ((class (layout-classoid (%instance-layout condition))))
-    (dolist (cslot (condition-classoid-class-slots class))
-      (when (eq (condition-slot-name cslot) name)
-        (return-from condition-reader-function
-                     (car (condition-slot-cell cslot)))))
-    (let ((val (getf (condition-assigned-slots condition) name
-                     *empty-condition-slot*)))
-      (if (eq val *empty-condition-slot*)
-          (let ((actual-initargs (condition-actual-initargs condition))
-                (slot (find-condition-class-slot class name)))
-            (unless slot
-              (error "missing slot ~S of ~S" name condition))
-            (do ((initargs actual-initargs (cddr initargs)))
-                ((endp initargs)
-                 (setf (getf (condition-assigned-slots condition) name)
-                       (find-slot-default class slot)))
-              (when (member (car initargs) (condition-slot-initargs slot))
-                (return-from condition-reader-function
-                  (setf (getf (condition-assigned-slots condition)
-                              name)
-                        (cadr initargs))))))
-          val))))
+(defun condition-slot-value (condition name)
+  (let ((val (getf (condition-assigned-slots condition) name sb!pcl:+slot-unbound+)))
+    (if (eq val sb!pcl:+slot-unbound+)
+        (let ((class (layout-classoid (%instance-layout condition))))
+          (dolist (cslot
+                   (condition-classoid-class-slots class)
+                   (let ((instance-length (%instance-length condition))
+                         (slot (or (find-condition-class-slot class name)
+                                   (error "missing slot ~S of ~S" name condition))))
+                     (setf (getf (condition-assigned-slots condition) name)
+                           (do ((i (+ sb!vm:instance-data-start 2) (+ i 2)))
+                               ((>= i instance-length) (find-slot-default class slot))
+                               (when (member (%instance-ref condition i)
+                                             (condition-slot-initargs slot))
+                                 (return (%instance-ref condition (1+ i))))))))
+            (when (eq (condition-slot-name cslot) name)
+              (return (car (condition-slot-cell cslot))))))
+        val)))
 
 ;;;; MAKE-CONDITION
 
 (defun allocate-condition (designator &rest initargs)
+  (when (oddp (length initargs))
+    (error 'simple-error
+           :format-control "odd-length initializer list: ~S."
+           :format-arguments
+           (let (list)
+             ;; avoid direct reference to INITARGS as a list
+             ;; so that it is not reified unless we reach here.
+             (do-rest-arg ((arg) initargs) (push arg list))
+             (nreverse list))))
   ;; I am going to assume that people are not somehow getting to here
   ;; with a CLASSOID, which is not strictly legal as a designator,
   ;; but which is accepted because it is actually the desired thing.
@@ -197,8 +187,17 @@
                      (class (lookup (class-name designator)))
                      (t designator)))))
     (if (condition-classoid-p classoid)
-        (let ((instance (%make-condition-object initargs '())))
-          (setf (%instance-layout instance) (classoid-layout classoid))
+        ;; Interestingly we fail to validate the actual-initargs,
+        ;; allowing any random initarg names.  Is this permissible?
+        ;; And why is lazily filling in ASSIGNED-SLOTS beneficial anyway?
+        (let ((instance (%make-instance (+ sb!vm:instance-data-start
+                                           2 ; ASSIGNED-SLOTS and HASH
+                                           (length initargs))))) ; rest
+          (setf (%instance-layout instance) (classoid-layout classoid)
+                (condition-assigned-slots instance) nil
+                (condition-hash instance) (sb!impl::new-instance-hash-code))
+          (do-rest-arg ((val index) initargs)
+            (setf (%instance-ref instance (+ sb!vm:instance-data-start index 2)) val))
           (values instance classoid))
         (error 'simple-type-error
                :datum designator
@@ -214,21 +213,24 @@
   ;; ALLOCATE-CONDITION will signal a type error if TYPE does not designate
   ;; a condition class. This seems fair enough.
   (declare (explicit-check))
+  ;; FIXME: the compiler should have a way to make GETF operate on a &MORE arg
+  ;; so that the initargs are never listified.
+  (declare (dynamic-extent initargs))
   (multiple-value-bind (condition classoid)
       (apply #'allocate-condition type initargs)
 
     ;; Set any class slots with initargs present in this call.
     (dolist (cslot (condition-classoid-class-slots classoid))
       (dolist (initarg (condition-slot-initargs cslot))
-        (let ((val (getf initargs initarg *empty-condition-slot*)))
-          (unless (eq val *empty-condition-slot*)
+        (let ((val (getf initargs initarg sb!pcl:+slot-unbound+)))
+          (unless (eq val sb!pcl:+slot-unbound+)
             (setf (car (condition-slot-cell cslot)) val)))))
 
     ;; Default any slots with non-constant defaults now.
     (dolist (hslot (condition-classoid-hairy-slots classoid))
       (when (dolist (initarg (condition-slot-initargs hslot) t)
-              (unless (eq (getf initargs initarg *empty-condition-slot*)
-                          *empty-condition-slot*)
+              (unless (eq (getf initargs initarg sb!pcl:+slot-unbound+)
+                          sb!pcl:+slot-unbound+)
                 (return nil)))
         (setf (getf (condition-assigned-slots condition)
                     (condition-slot-name hslot))
@@ -283,12 +285,12 @@
   (declare (ignore condition))
   (setf (fdefinition name)
         (lambda (condition)
-          (condition-reader-function condition slot-name))))
+          (condition-slot-value condition slot-name))))
 (defun install-condition-slot-writer (name condition slot-name)
   (declare (ignore condition))
   (setf (fdefinition name)
         (lambda (new-value condition)
-          (condition-writer-function condition new-value slot-name))))
+          (set-condition-slot-value condition new-value slot-name))))
 
 (!defvar *define-condition-hooks* nil)
 
@@ -336,7 +338,7 @@
                                 (let ((initfun (condition-slot-initfunction slot)))
                                   (aver (functionp initfun))
                                   (funcall initfun))
-                                *empty-condition-slot*))))
+                                sb!pcl:+slot-unbound+))))
               (push slot (condition-classoid-class-slots classoid)))
              ((:instance nil)
               (setf (condition-slot-allocation slot) :instance)
@@ -524,24 +526,6 @@
              (type-error-datum condition)
              (type-error-expected-type condition)))))
 
-(def*method print-object ((condition type-error) stream)
-  (if (and *print-escape*
-           (slot-boundp condition 'expected-type)
-           (slot-boundp condition 'datum))
-      (flet ((maybe-string (thing)
-               (ignore-errors
-                 (write-to-string thing :lines 1 :readably nil :array nil :pretty t))))
-        (let ((type (maybe-string (type-error-expected-type condition)))
-              (datum (maybe-string (type-error-datum condition))))
-          (if (and type datum)
-              (print-unreadable-object (condition stream :type t)
-                (format stream "~@<expected-type: ~
-                                 ~/sb-impl:print-type-specifier/~_datum: ~
-                                 ~A~:@>"
-                        type datum))
-              (call-next-method))))
-      (call-next-method)))
-
 ;;; not specified by ANSI, but too useful not to have around.
 (define-condition simple-style-warning (simple-condition style-warning) ())
 (define-condition simple-type-error (simple-condition type-error) ())
@@ -575,12 +559,6 @@
 
 (define-condition cell-error (error)
   ((name :reader cell-error-name :initarg :name)))
-
-(def*method print-object ((condition cell-error) stream)
-  (if (and *print-escape* (slot-boundp condition 'name))
-      (print-unreadable-object (condition stream :type t :identity t)
-        (princ (cell-error-name condition) stream))
-      (call-next-method)))
 
 (define-condition unbound-variable (cell-error) ()
   (:report
@@ -777,19 +755,6 @@
 (define-condition reference-condition ()
   ((references :initarg :references :reader reference-condition-references)))
 (defvar *print-condition-references* t)
-(def*method print-object :around ((o reference-condition) s)
-  (call-next-method)
-  (unless (or *print-escape* *print-readably*)
-    (when (and *print-condition-references*
-               (reference-condition-references o))
-      (format s "~&See also:~%")
-      (pprint-logical-block (s nil :per-line-prefix "  ")
-        (do* ((rs (reference-condition-references o) (cdr rs))
-              (r (car rs) (car rs)))
-             ((null rs))
-          (print-reference r s)
-          (unless (null (cdr rs))
-            (terpri s)))))))
 
 (define-condition simple-reference-error (reference-condition simple-error)
   ())
@@ -1596,7 +1561,7 @@ conditions."))
                   ,@(when documentation
                       `((:documentation ,documentation))))
 
-                (def*method print-object :after ((condition ,name) stream)
+                (defmethod print-object :after ((condition ,name) stream)
                   (when (and (not *print-escape*)
                              ,@(when check-runtime-error
                                 `((deprecation-condition-runtime-error condition))))
@@ -1604,13 +1569,11 @@ conditions."))
                             (deprecation-condition-software condition)
                             (deprecation-condition-name condition)))))))
 
-  ;; These print methods aren't defined until after PCL is compiled,
-  ;; at which point FORMAT has no auto-uncrossing macro.
-  ;; Better to just write PRINT-SYMBOL-WITH-PREFIX with a target package
-  ;; which drives home the point that you can't print the conditions
-  ;; until much later anyway, making them basically not helpful.
+  ;; PRINT-SYMBOL-WITH-PREFIX is spelled using its target package name,
+  ;; not its cold package name, because these methods aren't unsable until
+  ;; warm load. (!CALL-A-METHOD does not understand method qualifiers)
   (define-deprecation-warning early-deprecation-warning style-warning nil
-     "~%~@<~:@_In future ~A versions ~
+     "~%~@<~:@_In future~@[ ~A~] versions ~
       ~/sb-impl:print-symbol-with-prefix/ will signal a full warning ~
       at compile-time.~:@>"
     #!+sb-doc
@@ -1620,7 +1583,7 @@ compile-time. The use will work at run-time with no warning or
 error.")
 
   (define-deprecation-warning late-deprecation-warning warning t
-     "~%~@<~:@_In future ~A versions ~
+     "~%~@<~:@_In future~@[ ~A~] versions ~
       ~/sb-impl:print-symbol-with-prefix/ will signal a runtime ~
       error.~:@>"
     #!+sb-doc

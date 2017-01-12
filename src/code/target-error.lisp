@@ -213,8 +213,21 @@ with that condition (or with no condition) will be returned."
          (args (interactive-restart-arguments real-restart)))
     (apply (restart-function real-restart) args)))
 
+;;; To reduce expansion size of RESTART-CASE
+(defun with-simple-condition-restarts (function cerror-arg datum &rest arguments)
+  (let ((condition (coerce-to-condition datum arguments
+                                        (case function
+                                          (warn 'simple-warning)
+                                          (signal 'simple-condition)
+                                          (t 'simple-error))
+                                        function)))
+    (with-condition-restarts condition (car *restart-clusters*)
+      (if (eq function 'cerror)
+          (cerror cerror-arg condition)
+          (funcall function condition)))))
+
 
-(defun assert-error (assertion args-and-values places datum &rest arguments)
+(defun assert-error (assertion &optional args-and-values places datum &rest arguments)
   (let ((cond (if datum
                   (coerce-to-condition
                    datum arguments 'simple-error 'error)
@@ -245,7 +258,7 @@ with that condition (or with no condition) will be returned."
   (finish-output *query-io*)
   (list (eval (read *query-io*))))
 
-(defun check-type-error (place place-value type type-string)
+(defun check-type-error (place place-value type &optional type-string)
   (let ((condition
          (make-condition
           'simple-type-error

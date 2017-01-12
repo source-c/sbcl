@@ -225,10 +225,10 @@
                    list-pointer-lowtag
                    (* 2 n-word-bytes)))
 
-          (:closure
+          (:closure ; also funcallable-instance
            (values (tagged-object fun-pointer-lowtag)
                    widetag
-                   (boxed-size header-value)))
+                   (boxed-size (logand header-value short-header-max-words))))
 
           (:instance
            (values (tagged-object instance-pointer-lowtag)
@@ -243,7 +243,7 @@
           (:tiny-other
            (values (tagged-object other-pointer-lowtag)
                    widetag
-                   (boxed-size (logand header-value short-header-max-words))))
+                   (boxed-size (logand header-value #xFF))))
 
           (:vector-nil
            (values (tagged-object other-pointer-lowtag)
@@ -370,7 +370,7 @@
        ;; and apparent cons cells, since there can't be any.
        (dx-flet ((filter (obj type size)
                    (unless (or (and (code-component-p obj)
-                                    (not (%code-entry-points obj)))
+                                    (eql (code-n-entries obj) 0))
                                (consp obj))
                      (funcall fun obj type size))))
          (let ((start immobile-space-start)
@@ -754,7 +754,7 @@
 (defun sb!di::descriptor-sap (x)
   (int-sap (get-lisp-obj-address x)))
 
-;;; Calls FUNCTION with all object that have (possibly conservative)
+;;; Calls FUNCTION with all objects that have (possibly conservative)
 ;;; references to them on current stack.
 (defun map-stack-references (function)
   (let ((end
@@ -776,7 +776,7 @@
 
 (declaim (inline code-header-words))
 (defun code-header-words (code)
-  (logand (get-header-data code) #!+immobile-space short-header-max-words))
+  (logand (get-header-data code) short-header-max-words))
 
 (defun map-referencing-objects (fun space object)
   (declare (type spaces space)

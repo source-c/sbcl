@@ -222,12 +222,14 @@
             :operation operation)))
 
 (defun readtable-case (readtable)
-  (%readtable-case readtable))
+  (aref #(:upcase :downcase :preserve :invert) (%readtable-case readtable)))
 
 (defun (setf readtable-case) (case readtable)
   ;; This function does not accept a readtable designator, only a readtable.
   (assert-not-standard-readtable readtable '(setf readtable-case))
-  (setf (%readtable-case readtable) case))
+  (setf (%readtable-case readtable)
+        (ecase case (:upcase 0) (:downcase 1) (:preserve 2) (:invert 3)))
+  case)
 
 (defun readtable-normalization (readtable)
   #!+sb-doc
@@ -424,7 +426,7 @@ standard Lisp readtable when NIL."
 (defun flush-whitespace (stream)
   ;; This flushes whitespace chars, returning the last char it read (a
   ;; non-white one). It always gets an error on end-of-file.
-  (let* ((stream (in-synonym-of stream))
+  (let* ((stream (in-stream-from-designator stream))
          (rt *readtable*)
          (attribute-array (character-attribute-array rt))
          (attribute-hash-table (character-attribute-hash-table rt)))
@@ -789,7 +791,7 @@ standard Lisp readtable when NIL."
              'sb!kernel::character-decoding-error-in-macro-char-comment
              :position (file-position stream) :stream stream)
             (invoke-restart 'attempt-resync))))
-    (let ((stream (in-synonym-of stream)))
+    (let ((stream (in-stream-from-designator stream)))
       (if (ansi-stream-p stream)
           (prepare-for-fast-read-char stream
            (loop (let ((char (fast-read-char nil +EOF+)))
@@ -941,7 +943,7 @@ standard Lisp readtable when NIL."
     (let* ((token-buf *read-buffer*)
            (buf (token-buf-string token-buf))
            (rt *readtable*)
-           (stream (in-synonym-of stream))
+           (stream (in-stream-from-designator stream))
            (suppress *read-suppress*)
            (lim (length buf))
            (ptr 0)
@@ -1455,7 +1457,7 @@ extended <package-name>::<form-in-package> syntax."
         (#.+char-attr-package-delimiter+ (go COLON))
         (t (go SYMBOL)))
      SYMBOL ; not a dot, dots, or number
-      (let ((stream (in-synonym-of stream)))
+      (let ((stream (in-stream-from-designator stream)))
         (macrolet
            ((scan (read-a-char &optional finish)
              `(prog ()

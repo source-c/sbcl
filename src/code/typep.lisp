@@ -199,21 +199,53 @@
          (and (functionp object)
               (csubtypep (specifier-type (sb!impl::%fun-type object)) type))))))
 
+(defun cached-typep (cache object)
+  (let* ((type (cdr cache))
+         (ctype (if (ctype-p type)
+                    type
+                    (specifier-type type))))
+    (if (unknown-type-p ctype)
+        (%%typep object ctype)
+        ;; Most of the time an undefined type becomes defined is
+        ;; through structure or class definition, optimize that case
+        (let ((fun
+                (if (classoid-p ctype)
+                    (lambda (cache object)
+                      ;; TODO: structures can be optimized even further
+                      (block nil
+                        (classoid-typep
+                         (typecase object
+                           (instance (%instance-layout object))
+                           (funcallable-instance
+                            (%funcallable-instance-layout object))
+                           (t (return)))
+                         (cdr (truly-the cons cache))
+                         object)))
+                    (lambda (cache object)
+                      (%%typep object (cdr (truly-the cons cache)))))))
+          (setf (cdr cache) ctype)
+          (sb!thread:barrier (:write))
+          (setf (car cache) fun)
+          (funcall fun cache object)))))
+
 ;;; Do a type test from a class cell, allowing forward reference and
 ;;; redefinition.
-(defun classoid-cell-typep (obj-layout cell object)
-  (let ((classoid (classoid-cell-classoid cell)))
+(defun classoid-cell-typep (cell object)
+  (let ((layout (typecase object
+                  (instance (%instance-layout object))
+                  (funcallable-instance (%funcallable-instance-layout object))
+                  (t (return-from classoid-cell-typep))))
+        (classoid (classoid-cell-classoid cell)))
     (unless classoid
       (error "The class ~S has not yet been defined."
              (classoid-cell-name cell)))
-    (classoid-typep obj-layout classoid object)))
+    (classoid-typep layout classoid object)))
 
 ;;; Test whether OBJ-LAYOUT is from an instance of CLASSOID.
 (defun classoid-typep (obj-layout classoid object)
-  (declare (optimize speed))
   ;; FIXME & KLUDGE: We could like to grab the *WORLD-LOCK* here (to ensure that
   ;; class graph doesn't change while we're doing the typep test), but in
-  ;; pratice that causes trouble -- deadlocking against the compiler
+  ;; practice that causes trouble -- deadlocking against the compiler
   ;; if compiler output (or macro, or compiler-macro expansion) causes
   ;; another thread to do stuff. Not locking is a shoddy bandaid as it is remains
   ;; easy to trigger the same problem using a different code path -- but in practice

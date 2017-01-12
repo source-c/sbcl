@@ -341,7 +341,7 @@
 (defun read-line (&optional (stream *standard-input*) (eof-error-p t) eof-value
                             recursive-p)
   (declare (explicit-check))
-  (let ((stream (in-synonym-of stream)))
+  (let ((stream (in-stream-from-designator stream)))
     (if (ansi-stream-p stream)
         (ansi-stream-read-line stream eof-error-p eof-value recursive-p)
         ;; must be Gray streams FUNDAMENTAL-STREAM
@@ -367,7 +367,7 @@
                             eof-value
                             recursive-p)
   (declare (explicit-check))
-  (let ((stream (in-synonym-of stream)))
+  (let ((stream (in-stream-from-designator stream)))
     (if (ansi-stream-p stream)
         (ansi-stream-read-char stream eof-error-p eof-value recursive-p)
         ;; must be Gray streams FUNDAMENTAL-STREAM
@@ -395,7 +395,7 @@
 
 (defun unread-char (character &optional (stream *standard-input*))
   (declare (explicit-check))
-  (let ((stream (in-synonym-of stream)))
+  (let ((stream (in-stream-from-designator stream)))
     (if (ansi-stream-p stream)
         (ansi-stream-unread-char character stream)
         ;; must be Gray streams FUNDAMENTAL-STREAM
@@ -414,7 +414,7 @@
 
 (defun listen (&optional (stream *standard-input*))
   (declare (explicit-check))
-  (let ((stream (in-synonym-of stream)))
+  (let ((stream (in-stream-from-designator stream)))
     (if (ansi-stream-p stream)
         (ansi-stream-listen stream)
         ;; Fall through to Gray streams FUNDAMENTAL-STREAM case.
@@ -432,7 +432,7 @@
                                     eof-value
                                     recursive-p)
   (declare (explicit-check))
-  (let ((stream (in-synonym-of stream)))
+  (let ((stream (in-stream-from-designator stream)))
     (if (ansi-stream-p stream)
         (ansi-stream-read-char-no-hang stream eof-error-p eof-value
                                        recursive-p)
@@ -449,7 +449,7 @@
 
 (defun clear-input (&optional (stream *standard-input*))
   (declare (explicit-check))
-  (let ((stream (in-synonym-of stream)))
+  (let ((stream (in-stream-from-designator stream)))
     (if (ansi-stream-p stream)
         (ansi-stream-clear-input stream)
         ;; must be Gray streams FUNDAMENTAL-STREAM
@@ -660,7 +660,7 @@
 
 (defun fresh-line (&optional (stream *standard-output*))
   (declare (explicit-check))
-  (let ((stream (out-synonym-of stream)))
+  (let ((stream (out-stream-from-designator stream)))
     (if (ansi-stream-p stream)
         (ansi-stream-fresh-line stream)
         ;; must be Gray streams FUNDAMENTAL-STREAM
@@ -675,7 +675,7 @@
              stream data offset-start offset-end)))
 
 (defun %write-string (string stream start end)
-  (let ((stream (out-synonym-of stream)))
+  (let ((stream (out-stream-from-designator stream)))
     (if (ansi-stream-p stream)
         (ansi-stream-write-string string stream start end)
         ;; must be Gray streams FUNDAMENTAL-STREAM
@@ -694,7 +694,7 @@
   (declare (type string string))
   (declare (type stream-designator stream))
   (declare (explicit-check))
-  (let ((stream (out-synonym-of stream)))
+  (let ((stream (out-stream-from-designator stream)))
     (cond ((ansi-stream-p stream)
            (ansi-stream-write-string string stream start end)
            (funcall (ansi-stream-out stream) stream #\newline))
@@ -730,8 +730,8 @@
 
 (defun write-byte (integer stream)
   (declare (explicit-check))
-  (with-out-stream/no-synonym stream (ansi-stream-bout integer)
-                              (stream-write-byte integer))
+  ;; The STREAM argument is not allowed to be a designator.
+  (%with-out-stream stream (ansi-stream-bout integer) (stream-write-byte integer))
   integer)
 
 
@@ -1469,13 +1469,10 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
     (tagbody
      :more
        (when (plusp here)
-         (etypecase string
-           ((simple-array character (*))
+         (string-dispatch
+              (simple-character-string simple-base-string sb!kernel::simple-array-nil)
+              string
             (replace buffer string :start1 pointer :start2 start :end2 stop))
-           (simple-base-string
-            (replace buffer string :start1 pointer :start2 start :end2 stop))
-           ((simple-array nil (*))
-            (replace buffer string :start1 pointer :start2 start :end2 stop)))
          (setf (string-output-stream-pointer stream) (+ here pointer)))
        (when (plusp overflow)
          (setf start stop
@@ -1677,10 +1674,7 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
          (current+1 (1+ current)))
     (declare (fixnum current))
     (with-array-data ((workspace buffer) (start) (end))
-      (string-dispatch
-          ((simple-array character (*))
-           (simple-array base-char (*)))
-          workspace
+      (string-dispatch (simple-character-string simple-base-string) workspace
         (let ((offset-current (+ start current)))
           (declare (fixnum offset-current))
           (if (= offset-current end)
@@ -1702,10 +1696,7 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
 
 (defun fill-pointer-sout (stream string start end)
   (declare (fixnum start end))
-  (string-dispatch
-      ((simple-array character (*))
-       (simple-array base-char (*)))
-      string
+  (string-dispatch (simple-character-string simple-base-string) string
     (let* ((buffer (fill-pointer-output-stream-string stream))
            (current (fill-pointer buffer))
            (string-len (- end start))
@@ -1761,11 +1752,12 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
      (let* ((buffer (fill-pointer-output-stream-string stream))
             (current (fill-pointer buffer)))
        (with-array-data ((string buffer) (start) (end current))
-         (declare (simple-string string) (ignore start))
+         (declare (simple-string string))
          (let ((found (position #\newline string :test #'char=
-                                :end end :from-end t)))
+                                                 :start start :end end
+                                                 :from-end t)))
            (if found
-               (- end (the fixnum found))
+               (1- (- end found))
                current)))))
     (:element-type
       (array-element-type
@@ -2173,8 +2165,7 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
                         (len (min (- end %frc-index%)
                                   (- needed read))))
                    (declare (type index end len read needed))
-                   (string-dispatch (simple-base-string
-                                     (simple-array character (*)))
+                   (string-dispatch (simple-base-string simple-character-string)
                        seq
                      (replace seq %frc-buffer%
                               :start1 (+ start read)

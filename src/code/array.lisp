@@ -66,8 +66,9 @@
         (values vector index))
       (values (truly-the (simple-array * (*)) array) index)))
 
+
 ;;;; MAKE-ARRAY
-(defun %integer-vector-widetag-and-n-bits (signed high)
+(defun %integer-vector-widetag-and-n-bits-shift (signed high)
   (let ((unsigned-table
           #.(let ((map (make-array (1+ sb!vm:n-word-bits))))
               (loop for saetp across
@@ -77,7 +78,7 @@
                               (eq (numeric-type-class ctype) 'integer)
                               (zerop (numeric-type-low ctype)))
                     do (fill map (cons (sb!vm:saetp-typecode saetp)
-                                       (sb!vm:saetp-n-bits saetp))
+                                       (sb!vm:saetp-n-bits-shift saetp))
                              :end (1+ (integer-length (numeric-type-high ctype)))))
               map))
         (signed-table
@@ -89,11 +90,12 @@
                               (eq (numeric-type-class ctype) 'integer)
                               (minusp (numeric-type-low ctype)))
                     do (fill map (cons (sb!vm:saetp-typecode saetp)
-                                       (sb!vm:saetp-n-bits saetp))
+                                       (sb!vm:saetp-n-bits-shift saetp))
                              :end (+ (integer-length (numeric-type-high ctype)) 2)))
               map)))
     (cond ((> high sb!vm:n-word-bits)
-           (values #.sb!vm:simple-vector-widetag #.sb!vm:n-word-bits))
+           (values #.sb!vm:simple-vector-widetag
+                   #.(1- (integer-length sb!vm:n-word-bits))))
           (signed
            (let ((x (aref signed-table high)))
              (values (car x) (cdr x))))
@@ -103,7 +105,7 @@
 
 ;;; This is a bit complicated, but calling subtypep over all
 ;;; specialized types is exceedingly slow
-(defun %vector-widetag-and-n-bits (type)
+(defun %vector-widetag-and-n-bits-shift (type)
   (macrolet ((with-parameters ((arg-type &key intervals)
                                (&rest args) &body body)
                (let ((type-sym (gensym)))
@@ -136,7 +138,7 @@
              (result (widetag)
                (let ((value (symbol-value widetag)))
                  `(values ,value
-                          ,(sb!vm:saetp-n-bits
+                          ,(sb!vm:saetp-n-bits-shift
                             (find value
                                   sb!vm:*specialized-array-element-type-properties*
                                   :key #'sb!vm:saetp-typecode))))))
@@ -146,10 +148,10 @@
                     type))
            (integer-interval-widetag (low high)
              (if (minusp low)
-                 (%integer-vector-widetag-and-n-bits
+                 (%integer-vector-widetag-and-n-bits-shift
                   t
                   (1+ (max (integer-length low) (integer-length high))))
-                 (%integer-vector-widetag-and-n-bits
+                 (%integer-vector-widetag-and-n-bits-shift
                   nil
                   (max (integer-length low) (integer-length high))))))
       (let* ((consp (consp type))
@@ -182,12 +184,12 @@
            (with-parameters ((integer 1)) (high)
              (if (eq high '*)
                  (result sb!vm:simple-vector-widetag)
-                 (%integer-vector-widetag-and-n-bits nil high))))
+                 (%integer-vector-widetag-and-n-bits-shift nil high))))
           (signed-byte
            (with-parameters ((integer 1)) (high)
              (if (eq high '*)
                  (result sb!vm:simple-vector-widetag)
-                 (%integer-vector-widetag-and-n-bits t high))))
+                 (%integer-vector-widetag-and-n-bits-shift t high))))
           (double-float
            (with-parameters (double-float :intervals t) (low high)
              (if (and (not (eq low '*))
@@ -211,7 +213,7 @@
                     (consp (cdr type))
                     (null (cddr type))
                     (typep (cadr type) '(integer 1)))
-               (%integer-vector-widetag-and-n-bits
+               (%integer-vector-widetag-and-n-bits-shift
                 nil (integer-length (1- (cadr type))))
                (ill-type)))
           #!+long-float
@@ -311,7 +313,7 @@
                   (let ((expansion (type-specifier ctype)))
                     (if (equal expansion type)
                         (result sb!vm:simple-vector-widetag)
-                        (%vector-widetag-and-n-bits expansion)))))))))))))
+                        (%vector-widetag-and-n-bits-shift expansion)))))))))))))
 
 (defun %complex-vector-widetag (widetag)
   (macrolet ((make-case ()
@@ -324,29 +326,37 @@
                    #.sb!vm:complex-vector-widetag))))
     (make-case)))
 
-(defglobal %%simple-array-n-bits%% (make-array (1+ sb!vm:widetag-mask)))
+(defglobal %%simple-array-n-bits-shifts%% (make-array (1+ sb!vm:widetag-mask)))
 #.(loop for info across sb!vm:*specialized-array-element-type-properties*
-        collect `(setf (aref %%simple-array-n-bits%% ,(sb!vm:saetp-typecode info))
-                       ,(sb!vm:saetp-n-bits info)) into forms
+        collect `(setf (aref %%simple-array-n-bits-shifts%% ,(sb!vm:saetp-typecode info))
+                       ,(sb!vm:saetp-n-bits-shift info)) into forms
         finally (return `(progn ,@forms)))
 
-(declaim (type (simple-vector #.(1+ sb!vm:widetag-mask)) %%simple-array-n-bits%%))
+(declaim (type (simple-vector #.(1+ sb!vm:widetag-mask)) %%simple-array-n-bits-shifts%%))
 
-(defun allocate-vector-with-widetag (widetag length &optional n-bits)
+(declaim (inline vector-length-in-words))
+(defun vector-length-in-words (length n-bits-shift)
+  (declare (type (integer 0 7) n-bits-shift))
+  (let ((mask (ash (1- sb!vm:n-word-bits) (- n-bits-shift)))
+        (shift (- n-bits-shift
+                  (1- (integer-length sb!vm:n-word-bits)))))
+    (ash (+ length mask) shift)))
+
+;;; N-BITS-SHIFT is the shift amount needed to turn LENGTH into bits
+;;; or NIL, %%simple-array-n-bits-shifts%% will be used in that case.
+(defun allocate-vector-with-widetag (widetag length n-bits-shift)
   (declare (type (unsigned-byte 8) widetag)
            (type index length))
-  (let ((n-bits (or n-bits (aref %%simple-array-n-bits%% widetag))))
-    (declare (type (integer 0 256) n-bits))
+  (let* ((n-bits-shift (or n-bits-shift
+                           (aref %%simple-array-n-bits-shifts%% widetag)))
+         (full-length (if (or (= widetag sb!vm:simple-base-string-widetag)
+                              #!+sb-unicode
+                              (= widetag
+                                 sb!vm:simple-character-string-widetag))
+                          (1+ length)
+                          length)))
     (allocate-vector widetag length
-                     (ceiling
-                      (* (if (or (= widetag sb!vm:simple-base-string-widetag)
-                                 #!+sb-unicode
-                                 (= widetag
-                                    sb!vm:simple-character-string-widetag))
-                             (1+ length)
-                             length)
-                         n-bits)
-                      sb!vm:n-word-bits))))
+                     (vector-length-in-words full-length n-bits-shift))))
 
 (defun array-underlying-widetag (array)
   (macrolet ((make-case ()
@@ -367,7 +377,7 @@
       (make-case))))
 
 (defun make-vector-like (vector length)
-  (allocate-vector-with-widetag (array-underlying-widetag vector) length))
+  (allocate-vector-with-widetag (array-underlying-widetag vector) length nil))
 
 ;; Complain in various ways about wrong :INITIAL-foo arguments,
 ;; returning the two initialization arguments needed for DATA-VECTOR-FROM-INITS.
@@ -510,8 +520,8 @@
                    initial-contents adjustable
                    fill-pointer displaced-to displaced-index-offset))
   (declare (explicit-check))
-  (multiple-value-bind (widetag n-bits) (%vector-widetag-and-n-bits element-type)
-    (apply #'%make-array dimensions widetag n-bits args)))
+  (multiple-value-bind (widetag shift) (%vector-widetag-and-n-bits-shift element-type)
+    (apply #'%make-array dimensions widetag shift args)))
 
 (defun make-static-vector (length &key
                            (element-type '(unsigned-byte 8))
@@ -548,12 +558,12 @@ of specialized arrays is supported."
   ;; STEP 2
   ;;
   ;; Allocate and possibly initialize the vector.
-  (multiple-value-bind (type n-bits)
-      (%vector-widetag-and-n-bits element-type)
+  (multiple-value-bind (type n-bits-shift)
+      (%vector-widetag-and-n-bits-shift element-type)
     (let ((vector
             (allocate-static-vector type length
-                                    (ceiling (* length n-bits)
-                                             sb!vm:n-word-bits))))
+                                    (vector-length-in-words length
+                                                            n-bits-shift))))
       (cond (initial-element-p
              (fill vector initial-element))
             (initial-contents-p
@@ -1110,10 +1120,10 @@ of specialized arrays is supported."
            fill-pointer))))
 
 ;;; Widetags of FROM and TO should be equal
-(defun copy-vector-data (from to start end n-bits)
+(defun copy-vector-data (from to start end n-bits-shift)
   (declare (vector from to)
            (index start end)
-           ((integer 0 255) n-bits))
+           ((integer 0 7) n-bits-shift))
   (let ((from-length (length from)))
     (cond ((simple-vector-p from)
            (replace (truly-the simple-vector to)
@@ -1127,12 +1137,10 @@ of specialized arrays is supported."
           ;; floats or word bignums.
           ((and (= start 0)
                 (= end from-length))
-           (let ((words (ceiling (* from-length n-bits)
-                                 sb!vm:n-word-bits)))
-             (loop for i below words
-                   do (setf
-                       (%vector-raw-bits to i)
-                       (%vector-raw-bits from i)))))
+           (loop for i below (vector-length-in-words from-length n-bits-shift)
+                 do (setf
+                     (%vector-raw-bits to i)
+                     (%vector-raw-bits from i))))
           (t
            (replace to
                     from
@@ -1153,10 +1161,10 @@ of specialized arrays is supported."
     (with-array-data ((old-data vector) (old-start)
                       (old-end old-length))
       (let* ((widetag (%other-pointer-widetag old-data))
-             (n-bits (aref %%simple-array-n-bits%% widetag))
+             (n-bits-shift (aref %%simple-array-n-bits-shifts%% widetag))
              (new-data
-               (allocate-vector-with-widetag widetag new-length n-bits)))
-        (copy-vector-data old-data new-data old-start old-end n-bits)
+               (allocate-vector-with-widetag widetag new-length n-bits-shift)))
+        (copy-vector-data old-data new-data old-start old-end n-bits-shift)
         (setf (%array-data-vector vector) new-data
               (%array-available-elements vector) new-length
               (%array-fill-pointer vector) fill-pointer
@@ -1205,24 +1213,25 @@ of specialized arrays is supported."
   "Adjust ARRAY's dimensions to the given DIMENSIONS and stuff."
   (when (invalid-array-p array)
     (invalid-array-error array))
-  (binding* ((dimensions (ensure-list dimensions))
+  (binding* ((dimensions-rank (if (listp dimensions)
+                                  (length dimensions)
+                                  1))
              (array-rank (array-rank array))
              (()
-              (unless (= (length dimensions) array-rank)
+              (unless (= dimensions-rank array-rank)
                 (error "The number of dimensions not equal to rank of array.")))
              ((initialize initial-data)
               (validate-array-initargs initial-element-p initial-element
                                        initial-contents-p initial-contents
-                                       displaced-to)))
+                                       displaced-to))
+             (widetag (array-underlying-widetag array)))
     (cond ((and element-type-p
-                (not (subtypep element-type (array-element-type array))))
-           ;; This is weird. Should check upgraded type against actual
-           ;; array element type I think. See lp#1331299. CLHS says that
-           ;; "consequences are unspecified" so current behavior isn't wrong.
+                (/= (%vector-widetag-and-n-bits-shift element-type)
+                    widetag))
            (error "The new element type, ~
-                    ~/sb!impl:print-type-specifier/, is incompatible ~
-                    with old type."
-                  element-type))
+                   ~/sb-impl:print-type-specifier/, is incompatible ~
+                   with old type, ~/sb-impl:print-type-specifier/."
+                  element-type (array-element-type array)))
           ((and fill-pointer (/= array-rank 1))
            (error "Only vectors can have fill pointers."))
           ((and fill-pointer (not (array-has-fill-pointer-p array)))
@@ -1233,33 +1242,36 @@ of specialized arrays is supported."
            (fill-pointer-error array)))
     (cond (initial-contents-p
              ;; array former contents replaced by INITIAL-CONTENTS
-             (let* ((array-size (apply #'* dimensions))
-                    (array-data (data-vector-from-inits
-                                 dimensions array-size element-type nil nil
-                                 initialize initial-data)))
-               (cond ((adjustable-array-p array)
-                      (set-array-header array array-data array-size
-                                        (get-new-fill-pointer array array-size
-                                                              fill-pointer)
-                                        0 dimensions nil nil))
-                     ((array-header-p array)
-                      ;; simple multidimensional or single dimensional array
-                       (make-array dimensions
-                                   :element-type element-type
-                                   :initial-contents initial-contents))
-                     (t
-                      array-data))))
+           (let* ((array-size (if (listp dimensions)
+                                  (apply #'* dimensions)
+                                  dimensions))
+                  (array-data (data-vector-from-inits
+                               dimensions array-size element-type nil nil
+                               initialize initial-data)))
+             (cond ((adjustable-array-p array)
+                    (set-array-header array array-data array-size
+                                      (get-new-fill-pointer array array-size
+                                                            fill-pointer)
+                                      0 dimensions nil nil))
+                   ((array-header-p array)
+                    ;; simple multidimensional or single dimensional array
+                    (%make-array dimensions widetag
+                                 (aref %%simple-array-n-bits-shifts%% widetag)
+                                 :initial-contents initial-contents))
+                   (t
+                    array-data))))
           (displaced-to
              ;; We already established that no INITIAL-CONTENTS was supplied.
-             (unless (or (eql element-type (array-element-type displaced-to))
-                         (subtypep element-type (array-element-type displaced-to)))
+             (when (/= (array-underlying-widetag displaced-to) widetag)
                ;; See lp#1331299 again. Require exact match on upgraded type?
                (error "can't displace an array of type ~
                         ~/sb!impl:print-type-specifier/ into another ~
                         of type ~/sb!impl:print-type-specifier/"
-                        element-type (array-element-type displaced-to)))
+                      element-type (array-element-type displaced-to)))
              (let ((displacement (or displaced-index-offset 0))
-                   (array-size (apply #'* dimensions)))
+                   (array-size  (if (listp dimensions)
+                                    (apply #'* dimensions)
+                                    dimensions)))
                (declare (fixnum displacement array-size))
                (if (< (the fixnum (array-total-size displaced-to))
                       (the fixnum (+ displacement array-size)))
@@ -1271,14 +1283,16 @@ of specialized arrays is supported."
                                                            fill-pointer)
                                      displacement dimensions t nil)
                    ;; simple multidimensional or single dimensional array
-                   (make-array dimensions
-                               :element-type element-type
-                               :displaced-to displaced-to
-                               :displaced-index-offset
-                               displaced-index-offset))))
+                   (%make-array dimensions widetag
+                                (aref %%simple-array-n-bits-shifts%% widetag)
+                                :displaced-to displaced-to
+                                :displaced-index-offset
+                                displaced-index-offset))))
           ((= array-rank 1)
              (let ((old-length (array-total-size array))
-                   (new-length (car dimensions))
+                   (new-length (if (listp dimensions)
+                                   (car dimensions)
+                                   dimensions))
                    new-data)
                (declare (fixnum old-length new-length))
                (with-array-data ((old-data array) (old-start)

@@ -305,7 +305,12 @@
            (when (policy *lexenv* (> speed inhibit-warnings))
              (compiler-notify "can't open-code test of unknown type ~S"
                               (type-specifier type)))
-           `(%typep ,object ',spec))
+           `(let ((object ,object)
+                  (cache (load-time-value (cons #'sb!kernel::cached-typep ',spec)
+                                          t)))
+              (truly-the (values t &optional)
+                         (funcall (truly-the function (car (truly-the cons cache)))
+                                  cache object))))
           (t
            (ecase (first spec)
              (satisfies
@@ -709,10 +714,8 @@
 
            (t
             (/noshow "default case -- ,PRED and CLASS-CELL-TYPEP")
-            `(block typep
-               (classoid-cell-typep ,get-layout-or-return-false
-                                       ',(find-classoid-cell name :create t)
-                                       object)))))))))
+            `(classoid-cell-typep ',(find-classoid-cell name :create t)
+                                  object))))))))
 
 ;;; If the specifier argument is a quoted constant, then we consider
 ;;; converting into a simple predicate or other stuff. If the type is

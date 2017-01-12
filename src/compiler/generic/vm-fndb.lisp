@@ -125,12 +125,17 @@
   (unsigned-byte #.sb!vm:n-widetag-bits)
   (flushable movable))
 
-;; FIXME: Sure looks like 24 should be (- n-word-bytes n-widetag-bits).
-;;        If not, add a comment why not.
-(defknown (get-header-data get-closure-length) (t) (unsigned-byte 24)
+(defknown (get-header-data get-closure-length) (t)
+    (unsigned-byte #.(- sb!vm:n-word-bits sb!vm:n-widetag-bits))
   (flushable))
-(defknown set-header-data (t (unsigned-byte 24)) t
-  ())
+;;; This unconventional setter returns its first arg, not the newval.
+(defknown set-header-data
+    (t (unsigned-byte #.(- sb!vm:n-word-bits sb!vm:n-widetag-bits))) t)
+#!+64-bit
+(progn
+(defknown sb!vm::get-header-data-high (t) (unsigned-byte 32) (flushable))
+(defknown sb!vm::cas-header-data-high
+    (t (unsigned-byte 32) (unsigned-byte 32)) (unsigned-byte 32)))
 
 (defknown %array-dimension (t index) index
   (flushable))
@@ -150,7 +155,11 @@
   (flushable always-translatable))
 (defknown %instance-layout (instance) layout
   (foldable flushable))
+(defknown %funcallable-instance-layout (funcallable-instance) layout
+  (foldable flushable))
 (defknown %set-instance-layout (instance layout) layout
+  ())
+(defknown %set-funcallable-instance-layout (funcallable-instance layout) layout
   ())
 (defknown %instance-length (instance) index
   (foldable flushable))
@@ -419,10 +428,6 @@
           #.sb!vm:closure-header-widetag
           #.sb!vm:funcallable-instance-header-widetag)
   (flushable))
-(defknown ((setf fun-subtype))
-          ((unsigned-byte #.sb!vm:n-widetag-bits) function)
-  (unsigned-byte #.sb!vm:n-widetag-bits)
-  ())
 
 (defknown make-fdefn (t) fdefn (flushable movable))
 (defknown fdefn-p (t) boolean (movable foldable flushable))

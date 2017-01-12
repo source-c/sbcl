@@ -30,10 +30,9 @@
      (lambda (obj type size)
        (declare (ignore type size))
        (when (sb-kernel:code-component-p obj)
-         (do ((f (sb-kernel:%code-entry-points obj)
-                 (sb-kernel:%simple-fun-next f)))
-             ((null f))
-           (let ((type (funcall raw-accessor f)))
+         (dotimes (i (sb-kernel:code-n-entries obj))
+           (let* ((f (sb-kernel:%code-entry-point obj i))
+                  (type (funcall raw-accessor f)))
              (setf (sb-kernel:%simple-fun-type f)
                    (or (gethash type ht) (setf (gethash type ht) type)))))))
      :dynamic))
@@ -83,6 +82,19 @@
 (with-package-iterator (iter "CL-USER" :internal :external)
   (loop (multiple-value-bind (winp symbol) (iter)
           (if winp (unintern symbol "CL-USER") (return)))))
+
+;;; In case there is xref data for internals, repack it here to
+;;; achieve a more compact encoding.
+;;;
+;;; However, repacking changes
+;;; SB-C::**MOST-COMMON-XREF-NAMES-BY-{INDEX,NAME}** thereby changing
+;;; the interpretation of xref data written into and loaded from
+;;; fasls. Since fasls should be compatible between images originating
+;;; from the same SBCL build, REPACK-XREF is of no use after the
+;;; target image has been built.
+#+sb-xref-for-internals (sb-c::repack-xref :verbose t)
+(with-unlocked-packages (#:sb-c)
+  (fmakunbound 'sb-c::repack-xref))
 
 #+immobile-code (setq sb-c::*compile-to-memory-space* :dynamic)
 #+sb-fasteval (setq sb-ext:*evaluator-mode* :interpret)

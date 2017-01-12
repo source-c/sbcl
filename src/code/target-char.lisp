@@ -14,8 +14,9 @@
 ;;; We compile some trivial character operations via inline expansion.
 #!-sb-fluid
 (declaim (inline standard-char-p graphic-char-p alpha-char-p
-                 upper-case-p lower-case-p both-case-p alphanumericp))
-(declaim (maybe-inline digit-char-p))
+                 alphanumericp))
+(declaim (maybe-inline upper-case-p lower-case-p both-case-p
+                       digit-char-p two-arg-char-equal))
 
 (deftype char-code ()
   `(integer 0 (,sb!xc:char-code-limit)))
@@ -26,13 +27,6 @@
 (defun pack-3-codepoints (first &optional (second 0) (third 0))
   (declare (type (unsigned-byte 21) first second third))
   (sb!c::mask-signed-field 63 (logior first (ash second 21) (ash third 42))))
-
-(define-load-time-global **character-misc-database** nil)
-(declaim (type (simple-array (unsigned-byte 8) (*)) **character-misc-database**))
-(declaim (inline both-case-index-p))
-(defun both-case-index-p (misc-index)
-  (declare (type (unsigned-byte 16) misc-index))
-  (logbitp 7 (aref **character-misc-database** (+ 5 misc-index))))
 
 (macrolet ((frob ()
              (flet ((coerce-it (array)
@@ -51,15 +45,15 @@
                                        length :element-type '(unsigned-byte 8))))
                           (read-sequence array stream)
                           array)))
-                    (init-global (name type)
+                    (init-global (name type &optional length)
                       `(progn
                          (defglobal ,name
                              ,(if (eql type 'hash-table)
                                   `(make-hash-table)
-                                  `(make-array 0 :element-type ',type)))
+                                  `(make-array ,length :element-type ',type)))
                          (declaim (type ,(if (eql type 'hash-table)
                                              'hash-table
-                                             `(simple-array ,type (*))) ,name)))))
+                                             `(simple-array ,type (,length))) ,name)))))
                (let ((misc-database (coerce-it (read-ub8-vector (file "ucdmisc" "dat"))))
                      (ucd-high-pages (coerce-it (read-ub8-vector (file "ucdhigh" "dat"))))
                      (ucd-low-pages (coerce-it (read-ub8-vector (file "ucdlow" "dat"))))
@@ -70,19 +64,24 @@
                      (collations (coerce-it (read-ub8-vector (file "collation" "dat")))))
                  `(progn
                     ;; KLUDGE: All temporary values, fixed up in cold-load
-                    ,(init-global '**character-misc-database** '(unsigned-byte 8))
-                    ,(init-global '**character-high-pages** '(unsigned-byte 16))
-                    ,(init-global '**character-low-pages** '(unsigned-byte 16))
-                    ,(init-global '**character-decompositions** '(unsigned-byte 21))
-                    ,(init-global '**character-case-pages** '(unsigned-byte 8))
+                    ,(init-global '**character-misc-database** '(unsigned-byte 8)
+                                  (length misc-database))
+                    ,(init-global '**character-high-pages** '(unsigned-byte 16)
+                                  (/ (length ucd-high-pages) 2))
+                    ,(init-global '**character-low-pages** '(unsigned-byte 16)
+                                  (/ (length ucd-low-pages) 2))
+                    ,(init-global '**character-decompositions** '(unsigned-byte 21)
+                                  (/ (length decompositions) 3))
+                    ,(init-global '**character-case-pages** '(unsigned-byte 8)
+                                  (length case-pages))
                     ,(init-global '**character-primary-compositions** 'hash-table)
-                    ,(init-global '**character-cases** '(unsigned-byte 32))
-                    ,(init-global '**character-unicode-cases** t)
+                    ,(init-global '**character-unicode-cases** t
+                                  (* 64 (1+ (aref case-pages
+                                                  (1- (length case-pages))))))
+                    ,(init-global '**character-cases** '(unsigned-byte 32)
+                                  (* 2 64 (1+ (aref case-pages
+                                                    (1- (length case-pages))))))
                     ,(init-global '**character-collations** 'hash-table)
-                    ,(init-global '**unicode-char-name-database** t)
-                    ,(init-global '**unicode-name-char-database** t)
-                    ,(init-global '**unicode-1-char-name-database** t)
-                    ,(init-global '**unicode-1-name-char-database** t)
 
                     (defun !character-database-cold-init ()
                       (flet ((make-ubn-vector (raw-bytes n)
@@ -153,14 +152,19 @@
                                   for i = (+ (ash page 6) (ldb (byte 6 0) key))
                                   do
                                   (setf (aref unicode-table i) (cons upper lower))
-                                  when (and (atom upper)
-                                            (atom lower)
-                                            ;; Some characters are only equal under unicode rules,
-                                            ;; e.g. #\MICRO_SIGN and #\GREEK_CAPITAL_LETTER_MU
-                                            #!+sb-unicode
-                                            (both-case-index-p (misc-index (code-char lower)))
-                                            #!+sb-unicode
-                                            (both-case-index-p (misc-index (code-char upper))))
+                                  when
+                                  (flet (#!+sb-unicode
+                                         (both-case-p (code)
+                                           (logbitp 7 (aref **character-misc-database**
+                                                            (+ 5 (misc-index (code-char code)))))))
+                                    (and (atom upper)
+                                         (atom lower)
+                                         ;; Some characters are only equal under unicode rules,
+                                         ;; e.g. #\MICRO_SIGN and #\GREEK_CAPITAL_LETTER_MU
+                                         #!+sb-unicode
+                                         (both-case-p lower)
+                                         #!+sb-unicode
+                                         (both-case-p upper)))
                                   do
                                   (setf (aref table (* i 2)) lower
                                         (aref table (1+ (* i 2))) upper)))
@@ -250,24 +254,32 @@
                                            code->u1-name))
                                         u1-names)
                                (setf name->code
-                                     (sort (copy-seq code->name) #'< :key #'cdr))
-                               (setf code->name
-                                     (sort (copy-seq name->code) #'< :key #'car))
-                               (setf u1-name->code
-                                     (sort (copy-seq code->u1-name) #'< :key #'cdr))
-                               (setf code->u1-name
+                                     (sort (copy-seq code->name) #'< :key #'cdr)
+                                     code->name
+                                     (sort (copy-seq name->code) #'< :key #'car)
+                                     u1-name->code
+                                     (sort (copy-seq code->u1-name) #'< :key #'cdr)
+                                     code->u1-name
                                      (sort (copy-seq u1-name->code) #'< :key #'car))
-                               (setf names nil u1-names nil)
-                               `(defun !character-name-database-cold-init ()
-                                  (setf **unicode-character-name-huffman-tree** ',tree
-                                        **unicode-char-name-database**
-                                        ',(convert-to-double-vector code->name)
-                                        **unicode-name-char-database**
-                                        ',(convert-to-double-vector name->code t)
-                                        **unicode-1-char-name-database**
-                                        ',(convert-to-double-vector code->u1-name)
-                                        **unicode-1-name-char-database**
-                                        ',(convert-to-double-vector u1-name->code t)))))))))))))
+                               `(progn
+                                  ,(init-global '**unicode-char-name-database** t
+                                                (* 2 (length code->name)))
+                                  ,(init-global '**unicode-name-char-database** t
+                                                (* 2 (length name->code)))
+                                  ,(init-global '**unicode-1-char-name-database** t
+                                                (* 2 (length code->u1-name)))
+                                  ,(init-global '**unicode-1-name-char-database** t
+                                                (* 2 (length u1-name->code)))
+                                  (defun !character-name-database-cold-init ()
+                                    (setf **unicode-character-name-huffman-tree** ',tree
+                                          **unicode-char-name-database**
+                                          ',(convert-to-double-vector code->name)
+                                          **unicode-name-char-database**
+                                          ',(convert-to-double-vector name->code t)
+                                          **unicode-1-char-name-database**
+                                          ',(convert-to-double-vector code->u1-name)
+                                          **unicode-1-name-char-database**
+                                          ',(convert-to-double-vector u1-name->code t))))))))))))))
 
   (frob))
 #+sb-xc-host (!character-name-database-cold-init)
@@ -558,50 +570,72 @@ NIL."
 argument is an alphabetic character, A-Z or a-z; otherwise NIL."
   (< (ucd-general-category char) 5))
 
+(defmacro with-case-info ((char index-var cases-var
+                           &key miss-value)
+                          &body body)
+  (let ((code-var (gensym "CODE"))
+        (shifted-var (gensym "SHIFTED"))
+        (page-var (gensym "PAGE")))
+    `(block nil
+       (locally
+           (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+         (let ((,code-var (char-code ,char)))
+           (let* ((,shifted-var (ash ,code-var -6))
+                  (,page-var (if (>= ,shifted-var (length **character-case-pages**))
+                                 (return ,miss-value)
+                                 (aref **character-case-pages** ,shifted-var))))
+             (if (= ,page-var 255)
+                 ,miss-value
+                 (let ((,index-var (* (+ (ash ,page-var 6)
+                                         (ldb (byte 6 0) ,code-var))
+                                      2))
+                       (,cases-var **character-cases**))
+                   ,@body))))))))
+
 (defun both-case-p (char)
   #!+sb-doc
   "The argument must be a character object. BOTH-CASE-P returns T if the
 argument is an alphabetic character and if the character exists in both upper
 and lower case. For ASCII, this is the same as ALPHA-CHAR-P."
-  (both-case-index-p (misc-index char)))
+  (with-case-info (char index cases)
+    (plusp (aref cases index))))
 
 (defun upper-case-p (char)
   #!+sb-doc
   "The argument must be a character object; UPPER-CASE-P returns T if the
 argument is an upper-case character, NIL otherwise."
-  (let ((index (misc-index char)))
-    (and
-     (both-case-index-p index)
-     (= (aref **character-misc-database** index) 0))))
+  (with-case-info (char index cases)
+    (= (aref cases (1+ index))
+       (char-code char))))
 
 (defun lower-case-p (char)
   #!+sb-doc
   "The argument must be a character object; LOWER-CASE-P returns T if the
 argument is a lower-case character, NIL otherwise."
-  (let ((index (misc-index char)))
-    (and
-     (both-case-index-p index)
-     (= (aref **character-misc-database** index) 1))))
+  (with-case-info (char index cases)
+    (= (aref cases index)
+       (char-code char))))
 
-(defun digit-char-p (char &optional (radix 10.))
+(defun char-upcase (char)
   #!+sb-doc
-  "If char is a digit in the specified radix, returns the fixnum for which
-that digit stands, else returns NIL."
-  (if (<= (char-code char) 127)
-      (let ((weight (- (char-code char) 48)))
-        (cond ((minusp weight) nil)
-              ((<= radix 10.)
-               ;; Special-case ASCII digits in decimal and smaller radices.
-               (if (< weight radix) weight nil))
-              ;; Digits 0 - 9 are used as is, since radix is larger.
-              ((< weight 10) weight)
-              ;; Check for upper case A - Z.
-              ((and (>= (decf weight 7) 10) (< weight radix)) weight)
-              ;; Also check lower case a - z.
-              ((and (>= (decf weight 32) 10) (< weight radix)) weight)))
-      (let ((number (ucd-decimal-digit char)))
-        (when (and number (< (truly-the fixnum number) radix))
-          number))))
+  "Return CHAR converted to upper-case if that is possible. Don't convert
+lowercase eszet (U+DF)."
+  (with-case-info (char index cases
+                   :miss-value char)
+    (let ((code (aref cases (1+ index))))
+      (if (zerop code)
+          char
+          (code-char code)))))
+
+(defun char-downcase (char)
+  #!+sb-doc
+  "Return CHAR converted to lower-case if that is possible."
+  (with-case-info (char index cases
+                   :miss-value char)
+    (let ((code (aref cases index)))
+      (if (zerop code)
+          char
+          (code-char code)))))
 
 (defun alphanumericp (char)
   #!+sb-doc
@@ -657,16 +691,22 @@ is either numeric or alphabetic."
                      (and (< 415 sum 461))
                      (and (< 463 sum 477))))))))
     (declare (inline base-char-equal-p))
-    (or (eq c1 c2)
-        #!-sb-unicode
-        (base-char-equal-p)
-        #!+sb-unicode
-        (typecase c1
-          (base-char
+    (cond ((eq c1 c2))
+          #!-sb-unicode
+          (t
+           (base-char-equal-p))
+          #!+sb-unicode
+          ((base-char-p c1)
            (and (base-char-p c2)
                 (base-char-equal-p)))
+          #!+sb-unicode
+          ((base-char-p c2)
+           nil)
+          #!+sb-unicode
           (t
-           (= (equal-char-code c1) (equal-char-code c2)))))))
+           (with-case-info (c1 index cases)
+             (or (= (aref cases index) (char-code c2)) ;; lower case
+                 (= (aref cases (1+ index)) (char-code c2))))))))
 
 (defun char-equal-constant (x char reverse-case-char)
   (declare (type character x) (explicit-check))
@@ -674,7 +714,8 @@ is either numeric or alphabetic."
       (eq reverse-case-char x)))
 
 (defun two-arg-char-not-equal (c1 c2)
-  (/= (equal-char-code c1) (equal-char-code c2)))
+  (declare (inline two-arg-char-equal))
+  (not (two-arg-char-equal c1 c2)))
 
 (macrolet ((def (name test doc)
              (declare (ignorable doc))
@@ -749,45 +790,25 @@ Case is ignored." t)
 Case is ignored." t))
 
 
-;;;; miscellaneous functions
-
-(defun char-upcase (char)
+(defun digit-char-p (char &optional (radix 10.))
   #!+sb-doc
-  "Return CHAR converted to upper-case if that is possible. Don't convert
-lowercase eszet (U+DF)."
-  (let* ((code (char-code char))
-         (shifted (ash code -6))
-         (page (if (>= shifted (length **character-case-pages**))
-                   (return-from char-upcase char)
-                   (aref **character-case-pages** shifted))))
-    (if (= page 255)
-        char
-        (let ((code
-                (aref **character-cases**
-                      (1+ (* (+ (ash page 6)
-                                (ldb (byte 6 0) code))
-                             2)))))
-          (if (zerop code)
-              char
-              (code-char code))))))
-
-(defun char-downcase (char)
-  #!+sb-doc
-  "Return CHAR converted to lower-case if that is possible."
-  (let* ((code (char-code char))
-         (shifted (ash code -6))
-         (page (if (< shifted (length **character-case-pages**))
-                   (aref **character-case-pages** shifted)
-                   (return-from char-downcase char))))
-    (if (= page 255)
-        char
-        (let ((code
-                (aref **character-cases**
-                      (* 2 (+ (ash page 6)
-                              (ldb (byte 6 0) code))))))
-          (if (zerop code)
-              char
-              (code-char code))))))
+  "If char is a digit in the specified radix, returns the fixnum for which
+that digit stands, else returns NIL."
+  (if (<= (char-code char) 127)
+      (let ((weight (- (char-code char) 48)))
+        (cond ((minusp weight) nil)
+              ((<= radix 10.)
+               ;; Special-case ASCII digits in decimal and smaller radices.
+               (if (< weight radix) weight nil))
+              ;; Digits 0 - 9 are used as is, since radix is larger.
+              ((< weight 10) weight)
+              ;; Check for upper case A - Z.
+              ((and (>= (decf weight 7) 10) (< weight radix)) weight)
+              ;; Also check lower case a - z.
+              ((and (>= (decf weight 32) 10) (< weight radix)) weight)))
+      (let ((number (ucd-decimal-digit char)))
+        (when (and number (< (truly-the fixnum number) radix))
+          number))))
 
 (defun digit-char (weight &optional (radix 10))
   #!+sb-doc
@@ -797,32 +818,3 @@ character exists."
   (and (typep weight 'fixnum)
        (>= weight 0) (< weight radix) (< weight 36)
        (code-char (if (< weight 10) (+ 48 weight) (+ 55 weight)))))
-
-;;; Moved from 'string' because ALPHANUMERICP wants to be inlined,
-;;; and moving ALPHANUMERICP earlier causes a snowball effect of
-;;; other inlining failures.
-(flet ((%capitalize (string start end)
-         (declare (string string) (index start) (type sequence-end end))
-         (let ((saved-header string))
-           (with-one-string (string start end)
-             (do ((index start (1+ index))
-                  (new-word? t)
-                  (char nil))
-                 ((= index (the fixnum end)))
-               (declare (fixnum index))
-               (setq char (schar string index))
-               (cond ((not (alphanumericp char))
-                      (setq new-word? t))
-                     (new-word?
-                      ;; CHAR is the first case-modifiable character after
-                      ;; a sequence of non-case-modifiable characters.
-                      (setf (schar string index) (char-upcase char))
-                      (setq new-word? nil))
-                     (t
-                      (setf (schar string index) (char-downcase char))))))
-           saved-header)))
-(defun string-capitalize (string &key (start 0) end)
-  (%capitalize (copy-seq (string string)) start end))
-(defun nstring-capitalize (string &key (start 0) end)
-  (%capitalize string start end))
-) ; FLET

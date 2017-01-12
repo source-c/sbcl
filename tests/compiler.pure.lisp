@@ -513,7 +513,8 @@
                                             (bar (&environment env)
                                               `',(macro-function 'foo env)))
                                    (bar)))
-                              :allow-style-warnings t))))
+                              ;; FIXME  :allow-failure is for the annotated case above
+                              :allow-failure t :allow-style-warnings t))))
       (assert style-warnings))))
 
 ;; Uh, this test is semi-bogus - it's trying to test that you can't
@@ -6056,3 +6057,47 @@
     (assert (= (length warnings) 1))
     (search "The function CONS is called by"
             (princ-to-string (first warnings)))))
+
+(with-test (:name :set-type-conflict)
+  (assert (nth-value 1
+                     (checked-compile
+                      '(lambda () (set '// 10))
+                      :allow-warnings t))))
+
+(with-test (:name :two-arg-funs-check)
+  (loop for (nil x) in sb-c::*two-arg-functions*
+        do
+        (assert (fboundp x))
+        (assert (sb-int:info :function :info x))))
+
+(with-test (:name :two-arg-with-two-arguments-only)
+  (assert (funcall (checked-compile `(lambda (x y) (string-lessp x y :start1 0)))
+                   "a"
+                   "b")))
+
+(with-test (:name :optimize-functional-arguments-casts)
+  (let ((fun (checked-compile
+              '(lambda (list key)
+                (declare (type atom key))
+                (find 1 list :key (the (member car) key))))))
+    (assert (equal (funcall fun '((a b) (1 a)) 'car)
+                   '(1 a)))
+    (assert-error (equal (funcall fun '((a b) (1 a)) 'cdr)
+                         '(1 a)))))
+
+(with-test (:name :two-arg-rewriting-find-if)
+  (assert (= (funcall (checked-compile
+                       `(lambda (x)
+                          (declare (type vector x))
+                          (find-if #'oddp x :key '-)))
+                      #(1))
+             1)))
+
+(with-test (:name :transforms-check-policy-first)
+  (assert (eql (funcall (checked-compile
+                         `(lambda (x)
+                            (declare (optimize speed space))
+                            (find x "a b c" :test #'char-equal))
+                         :allow-notes nil)
+                        #\B)
+               #\b)))

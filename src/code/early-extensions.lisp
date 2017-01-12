@@ -305,6 +305,7 @@
 (defun memq (item list)
   #!+sb-doc
   "Return tail of LIST beginning with first element EQ to ITEM."
+  (declare (explicit-check))
   ;; KLUDGE: These could be and probably should be defined as
   ;;   (MEMBER ITEM LIST :TEST #'EQ)),
   ;; but when I try to cross-compile that, I get an error from
@@ -321,6 +322,7 @@
 ;;;   Return the first pair of ALIST where ITEM is EQ to the key of
 ;;;   the pair.
 (defun assq (item alist)
+  (declare (explicit-check))
   ;; KLUDGE: CMU CL defined this with
   ;;   (DECLARE (INLINE ASSOC))
   ;;   (ASSOC ITEM ALIST :TEST #'EQ))
@@ -343,14 +345,15 @@
 ;;;   Delete all LIST entries EQ to ITEM (destructively modifying
 ;;;   LIST), and return the modified LIST.
 (defun delq (item list)
+  (declare (explicit-check))
   (let ((list list))
     (do ((x list (cdr x))
          (splice '()))
         ((endp x) list)
       (cond ((eq item (car x))
              (if (null splice)
-               (setq list (cdr x))
-               (rplacd splice (cdr x))))
+                 (setq list (cdr x))
+                 (rplacd splice (cdr x))))
             (t (setq splice x)))))) ; Move splice along to include element.
 
 
@@ -512,6 +515,28 @@
                   listp nil
                   decls nil))
       body)))
+
+;;;; macro writing utilities
+
+(defmacro with-current-source-form ((&rest forms) &body body)
+  #!+sb-doc
+  "In a macroexpander, indicate that FORMS are being processed by BODY.
+
+FORMS are usually sub-forms of the whole form passed to the expander.
+
+If more than one form is supplied, FORMS should be ordered by
+specificity, with the most specific form first. This allows the
+compiler to try and obtain a source path using subsequent elements of
+FORMS if it fails for the first one.
+
+Indicating the processing of sub-forms lets the compiler report
+precise source locations in case conditions are signaled during the
+execution of BODY.
+
+NOTE: This interface is experimental and subject to change."
+  #-sb-xc-host `(sb!c::call-with-current-source-form
+                 (lambda () ,@body) ,@forms)
+  #+sb-xc-host `(progn (list ,@forms) ,@body))
 
 ;;;; hash cache utility
 
@@ -1318,13 +1343,9 @@
     ((or symbol cons)
      (%check-deprecated-type type-specifier))
     (class
-     ;; FIXME: this case does not acknowledge that improperly named classes
-     ;; can exist. Suppose a few classes each have CLASS-NAME = FRED
-     ;; but (FIND-CLASS 'FRED) does not return any of them; and simultaneously
-     ;; FRED is a completely unrelated type specifier defined via DEFTYPE.
-     ;; This should see that class-name does not properly name the class.
      (let ((name (class-name type-specifier)))
-       (when (and name (symbolp name))
+       (when (and name (symbolp name)
+                  (eq type-specifier (find-class name nil)))
          (%check-deprecated-type name))))))
 
 ;; This is the moral equivalent of a warning from /usr/bin/ld that
@@ -1693,12 +1714,14 @@ to :INTERPRET, an interpreter will be used.")
            (truly-the (simple-array character (*))
                       (get-output-stream-string ,var))))))
 
+;;; Ensure basicness if possible, and simplicity always
 (defun possibly-base-stringize (s)
+  (declare (string s))
   (cond #!+(and sb-unicode (host-feature sb-xc))
         ((and (typep s '(array character (*))) (every #'base-char-p s))
          (coerce s 'base-string))
         (t
-         s)))
+         (coerce s 'simple-string))))
 
 (defun self-evaluating-p (x)
   (typecase x

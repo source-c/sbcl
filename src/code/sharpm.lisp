@@ -281,7 +281,7 @@
                     (unless (eq old new)
                       (setf (%instance-ref tree i) new)))))
                ((typep tree 'funcallable-instance)
-                (do ((i 1 (1+ i))
+                (do ((i sb!vm:instance-data-start (1+ i))
                      (end (- (1+ (get-closure-length tree)) sb!vm:funcallable-instance-info-offset)))
                     ((= i end))
                   (let* ((old (%funcallable-instance-info tree i))
@@ -383,7 +383,7 @@
              'sb!kernel::character-decoding-error-in-dispatch-macro-char-comment
              :sub-char sub-char :position (file-position stream) :stream stream)
             (invoke-restart 'attempt-resync))))
-    (let ((stream (in-synonym-of stream)))
+    (let ((stream (in-stream-from-designator stream)))
       (macrolet ((munch (get-char &optional finish)
                    `(do ((level 1)
                          (prev ,get-char char)

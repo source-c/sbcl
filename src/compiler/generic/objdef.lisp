@@ -158,16 +158,17 @@
   (code-size :type index
              :ref-known (flushable movable)
              :ref-trans %code-code-size)
-  (entry-points :type (or function null)
-                :ref-known (flushable)
-                :ref-trans %code-entry-points
-                :set-known ()
-                :set-trans (setf %code-entry-points))
   (debug-info :type t
               :ref-known (flushable)
               :ref-trans %code-debug-info
               :set-known ()
               :set-trans (setf %code-debug-info))
+  #!-64-bit
+  (n-entries :type fixnum
+             :set-known ()
+             :set-trans (setf %code-n-entries)
+             :ref-trans %code-n-entries
+             :ref-known (flushable foldable))
   (constants :rest-p t))
 
 (!define-primitive-object (fdefn :type fdefn
@@ -204,11 +205,6 @@
           ;; stuff here in order to allow this old hack to work in the
           ;; new world. -- WHN 2001-08-82
           )
-  (next :type (or function null)
-        :ref-known (flushable)
-        :ref-trans %simple-fun-next
-        :set-known ()
-        :set-trans (setf %simple-fun-next))
   (name :ref-known (flushable)
         :ref-trans %simple-fun-name
         :set-known ()
@@ -239,6 +235,7 @@
              :set-trans (setf %simple-fun-debug-fun))
   (code :rest-p t :c-type "unsigned char"))
 
+#!-(or x86 x86-64)
 (!define-primitive-object (return-pc :lowtag other-pointer-lowtag :widetag t)
   (return-point :c-type "unsigned char" :rest-p t))
 
@@ -257,6 +254,12 @@
                           :widetag funcallable-instance-header-widetag
                           :alloc-trans %make-funcallable-instance)
   (trampoline :init :funcallable-instance-tramp)
+  ;; TODO: if we can switch places of 'function' and 'fsc-instance-slots'
+  ;; (at least for the builds with compact-instance-header)
+  ;; then for both funcallable and non-funcallable instances,
+  ;; the CLOS slot vector will be in the word 5 bytes past the tagged pointer.
+  ;; This shouldn't be too hard to arrange, since nothing needs to know where
+  ;; the tagged function lives except the funcallable instance trampoline.
   (function :ref-known (flushable) :ref-trans %funcallable-instance-function
             :set-known () :set-trans (setf %funcallable-instance-function))
   (info :rest-p t))

@@ -587,31 +587,72 @@
                 do (setf pointer (cdr (rplaca pointer item)))))))
   sequence)
 
-(defun vector-fill* (sequence item start end)
-  (declare (type index start) (type (or index null) end))
-  (with-array-data ((data sequence)
+(defglobal %%fill-bashers%% (make-array (1+ sb!vm:widetag-mask)))
+#.`(progn
+   ,@(loop for saetp across sb!vm:*specialized-array-element-type-properties*
+           for et = (sb!vm:saetp-specifier saetp)
+           if (or (null et)
+                  (sb!vm:valid-bit-bash-saetp-p saetp))
+           collect
+           (multiple-value-bind (basher value-transform)
+               (if et
+                   (sb!c::find-basher saetp)
+                   '(lambda (item vector start length)
+                     (declare (ignore item start length))
+                     (data-nil-vector-ref (truly-the (simple-array nil (*)) vector) 0)))
+             `(setf
+               (aref %%fill-bashers%% ,(sb!vm:saetp-typecode saetp))
+               (cons #',basher
+                     ,(if et
+                          `(lambda (sb!c::item)
+                             (declare (type ,et sb!c::item))
+                             ,value-transform)
+                          '#'identity))))
+           else do
+           ;; vector-fill* depends on this assertion
+           (assert (member et '(t (complex double-float)
+                                #!-64-bit (complex single-float)
+                                #!-64-bit double-float)
+                           :test #'equal))))
+
+(defun vector-fill* (vector item start end)
+  (declare (type index start) (type (or index null) end)
+           (optimize speed))
+  (with-array-data ((vector vector)
                     (start start)
                     (end end)
                     :force-inline t
                     :check-fill-pointer t)
-    ;; This has vastly different performance for (VECTOR T) and anything else.
-    ;; The rationale is that it is surprising to users that an unoptimized
-    ;; call to MAKE-ARRAY with no keywords, just an integer dimension,
-    ;; pays such a heavy performance penalty - up to 3x slower - merely
-    ;; because you "care" about the size of your code, which causes FILL
-    ;; not to be transformed into a loop.
-    (if (simple-vector-p sequence)
+    (if (simple-vector-p vector)
         (locally
-         (declare (optimize (speed 3) (safety 0))) ; transform will kick in
-         (fill (truly-the simple-vector sequence) item
-               :start start :end end))
-        (let ((setter (!find-data-vector-setter data)))
-          (declare (optimize (speed 3) (safety 0)))
-          (do ((index start (1+ index)))
-              ((= index end))
-            (declare (index index))
-            (funcall setter data index item)))))
-  sequence)
+            (declare (optimize (speed 3) (safety 0))) ; transform will kick in
+          (fill (truly-the simple-vector vector) item
+                :start start :end end))
+        (let* ((widetag (%other-pointer-widetag vector))
+               (bashers (svref %%fill-bashers%% widetag)))
+          (macrolet ((fill-float (type)
+                       `(locally
+                            (declare (optimize (speed 3) (safety 0))
+                                     (type ,type item)
+                                     (type (simple-array ,type (*))
+                                           vector))
+                          (do ((index start (1+ index)))
+                              ((= index end))
+                            (declare (index index))
+                            (setf (aref vector index) item)))))
+            (cond ((neq bashers 0)
+                   (funcall (truly-the function (car (truly-the cons bashers)))
+                            (funcall (truly-the function (cdr bashers)) item)
+                            vector start (- end start)))
+                  #!-64-bit
+                  ((eq widetag sb!vm:simple-array-double-float-widetag)
+                   (fill-float double-float))
+                  #!-64-bit
+                  ((eq widetag sb!vm:simple-array-complex-single-float-widetag)
+                   (fill-float (complex single-float)))
+                  (t
+                   (fill-float (complex double-float))))))))
+  vector)
 
 (defun string-fill* (sequence item start end)
   (declare (string sequence))
@@ -852,7 +893,7 @@ many elements are copied."
                       :check-fill-pointer t)
       (declare (ignore start))
       (let* ((tag (%other-pointer-widetag vector))
-             (new-vector (allocate-vector-with-widetag tag length)))
+             (new-vector (allocate-vector-with-widetag tag length nil)))
         (cond ((= tag sb!vm:simple-vector-widetag)
                (do ((left-index 0 (1+ left-index))
                     (right-index end))
@@ -1082,7 +1123,7 @@ many elements are copied."
     (declare (index length))
     (do-rest-arg ((seq) sequences)
       (incf length (length seq)))
-    (let ((result (allocate-vector-with-widetag widetag length))
+    (let ((result (allocate-vector-with-widetag widetag length nil))
           (setter (the function (svref %%data-vector-setters%% widetag)))
           (index 0))
       (declare (index index))

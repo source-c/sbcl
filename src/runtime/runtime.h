@@ -275,7 +275,7 @@ HeaderValue(lispobj obj)
 }
 
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
-#define HEADER_VALUE_MASKED(x) HeaderValue(x) & SHORT_HEADER_MAX_WORDS
+#define HEADER_VALUE_MASKED(x) (HeaderValue(x) & SHORT_HEADER_MAX_WORDS)
 #else
 #define HEADER_VALUE_MASKED(x) HeaderValue(x)
 #endif
@@ -369,7 +369,7 @@ fixnum_value(lispobj n)
 static inline uword_t
 code_header_words(lispobj header) // given header = code->header
 {
-  return HEADER_VALUE_MASKED(header);
+  return HeaderValue(header) & SHORT_HEADER_MAX_WORDS;
 }
 
 static inline sword_t
@@ -439,5 +439,9 @@ extern char *copied_string (char *string);
 #endif
 
 void *os_dlsym_default(char *name);
+
+struct lisp_startup_options {
+    boolean noinform;
+};
 
 #endif /* _SBCL_RUNTIME_H_ */

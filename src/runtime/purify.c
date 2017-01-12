@@ -276,55 +276,41 @@ ptrans_vector(lispobj thing, long bits, long extra,
 static lispobj
 ptrans_code(lispobj thing)
 {
-    struct code *code, *new;
-    long nwords;
-    lispobj func, result;
+    struct code *code = (struct code *)native_pointer(thing);
+    long nwords = code_header_words(code->header)
+                + code_instruction_words(code->code_size);
 
-    code = (struct code *)native_pointer(thing);
-    // FIXME: CEILING is likely redundant.
-    //  - The header word count can't be odd
-    //  - The instruction word count is rounded by the accessor macro
-    nwords = CEILING(HeaderValue(code->header) + code_instruction_words(code->code_size),
-                     2);
-
-    new = (struct code *)newspace_alloc(nwords,1); /* constant */
+    struct code *new = (struct code *)newspace_alloc(nwords,1); /* constant */
 
     bcopy(code, new, nwords * sizeof(lispobj));
 
-    result = make_lispobj(new, OTHER_POINTER_LOWTAG);
-
-    /* Stick in a forwarding pointer for the code object. */
-    *(lispobj *)code = result;
+    lispobj result = make_lispobj(new, OTHER_POINTER_LOWTAG);
 
     /* Put in forwarding pointers for all the functions. */
-    for (func = code->entry_points;
-         func != NIL;
-         func = ((struct simple_fun *)native_pointer(func))->next) {
+    uword_t displacement = result - thing;
+    for_each_simple_fun(i, newfunc, new, 1, {
+        lispobj* old = (lispobj*)((char*)newfunc - displacement);
+        *old = make_lispobj(newfunc, FUN_POINTER_LOWTAG);
+    });
 
-        gc_assert(lowtag_of(func) == FUN_POINTER_LOWTAG);
-
-        *(lispobj *)native_pointer(func) = result + (func - thing);
-    }
+    /* Stick in a forwarding pointer for the code object. */
+    /* This smashes the header, so do it only after reading n_funs */
+    *(lispobj *)code = result;
 
     /* Arrange to scavenge the debug info later. */
     pscav_later(&new->debug_info, 1);
 
     /* Scavenge the constants. */
     pscav(new->constants,
-          HeaderValue(new->header) - (offsetof(struct code, constants) >> WORD_SHIFT),
+          code_header_words(new->header) - (offsetof(struct code, constants) >> WORD_SHIFT),
           1);
 
     /* Scavenge all the functions. */
-    pscav(&new->entry_points, 1, 1);
-    for (func = new->entry_points;
-         func != NIL;
-         func = ((struct simple_fun *)native_pointer(func))->next) {
-        gc_assert(lowtag_of(func) == FUN_POINTER_LOWTAG);
-        gc_assert(!dynamic_pointer_p(func));
-
-        pscav(&((struct simple_fun *)native_pointer(func))->self, 2, 1);
-        pscav_later(&((struct simple_fun *)native_pointer(func))->name, 4);
-    }
+    for_each_simple_fun(i, func, new, 1, {
+        gc_assert(!dynamic_pointer_p((lispobj)func));
+        pscav(&func->self, 1, 1);
+        pscav_later(&func->name, 4);
+    })
 
     return result;
 }
@@ -815,24 +801,24 @@ pscav(lispobj *addr, long nwords, boolean constant)
 
               case INSTANCE_HEADER_WIDETAG:
                 {
-                    struct instance *instance = (struct instance *) addr;
                     struct layout *layout
-                        = (struct layout *) native_pointer(instance->slots[0]);
-                    long nslots = HeaderValue(*addr);
+                        = (struct layout *)native_pointer(instance_layout(addr));
+                    lispobj* slots = addr + 1;
+                    long nslots = instance_length(*addr) | 1;
                     int index;
                     if (fixnump(layout->bitmap)) {
                       sword_t bitmap = (sword_t)layout->bitmap >> N_FIXNUM_TAG_BITS;
                       for (index = 0; index < nslots ; index++, bitmap >>= 1)
                         if (bitmap & 1)
-                          pscav(addr + 1 + index, 1, constant);
+                          pscav(slots + index, 1, constant);
                     } else {
                       struct bignum * bitmap;
                       bitmap = (struct bignum*)native_pointer(layout->bitmap);
                       for (index = 0; index < nslots ; index++)
                         if (positive_bignum_logbitp(index, bitmap))
-                          pscav(addr + 1 + index, 1, constant);
+                          pscav(slots + index, 1, constant);
                     }
-                    count = CEILING(1 + nslots, 2);
+                    count = 1 + nslots;
                 }
                 break;
 

@@ -22,6 +22,29 @@
  *  3. Specify space size on startup
  */
 
+// Work around a bug in some llvm/clang versions affecting the memcpy
+// call in defrag_immobile_space:
+//
+// When compiled with _FORTIFY_SOURCE nonzero, as seems to be the
+// default, memcpy is a macro that expands to
+// __builtin_memcpy_chk(dst, source, size, __builtin_object_size(...)).
+//
+// Now usually if the compiler knows that it does not know
+// __builtin_object_size for the source of the copy, the
+// __builtin_memcpy_chk call becomes plain old memcpy. But in the
+// buggy case, the compiler is convinced that it does know the
+// size. This shows up clearly in the disassembly, where the library
+// routine receives a source size that was erroneously determined to
+// be a compile-time constant 0. Thus the assertion failure is that
+// you are reading from a range with 0 bytes in it.
+//
+// Defining _FORTIFY_LEVEL 0 disables the above macro and thus works
+// around the problem. Since it is unclear which clang versions are
+// affected, only apply the workaround for the known-bad version.
+#if (defined(__clang__) && (__clang_major__ == 6) && (__clang_minor__ == 0))
+#define _FORTIFY_SOURCE 0
+#endif
+
 #include "gc.h"
 #include "gc-internal.h"
 #include "genesis/vector.h"
@@ -451,9 +474,11 @@ void immobile_space_preserve_pointer(void* addr)
         header_addr = gc_search_space(start,
                                       native_pointer((lispobj)addr)+2 - start,
                                       (lispobj*)addr);
-        if (!header_addr || immobile_filler_p(header_addr))
+        if (!header_addr ||
+            immobile_filler_p(header_addr) ||
+            (widetag_of(*header_addr) != CODE_HEADER_WIDETAG &&
+             !properly_tagged_descriptor_p((lispobj)addr, header_addr)))
             return;
-        gc_assert(other_immediate_lowtag_p(*header_addr));
     } else if (fixedobj_pages[page_index].gens & (1<<from_space)) {
         int obj_spacing = (page_obj_align(page_index) << WORD_SHIFT);
         int obj_index = ((uword_t)addr & (IMMOBILE_CARD_BYTES-1)) / obj_spacing;
@@ -461,8 +486,10 @@ void immobile_space_preserve_pointer(void* addr)
                  addr, page_index, obj_index));
         char* page_start_addr = (char*)((uword_t)addr & ~(IMMOBILE_CARD_BYTES-1));
         header_addr = (lispobj*)(page_start_addr + obj_index * obj_spacing);
-        if (fixnump(*header_addr))
-            return;
+        if (fixnump(*header_addr) ||
+            (lispobj*)addr >= header_addr + page_obj_size(page_index) ||
+            !properly_tagged_descriptor_p((lispobj)addr, header_addr))
+           return;
     } else {
         return;
     }
@@ -787,12 +814,7 @@ varyobj_points_to_younger_p(lispobj* obj, int gen, int keep_gen, int new_gen,
     lispobj *begin, *end, word = *obj;
     unsigned char widetag = widetag_of(word);
     if (widetag == CODE_HEADER_WIDETAG) { // usual case. Like scav_code_header()
-        lispobj entry_point; /* tagged pointer to entry point */
-        struct simple_fun *function_ptr; /* untagged pointer to entry point */
-        for (entry_point = ((struct code*)obj)->entry_points;
-             entry_point != NIL;
-             entry_point = function_ptr->next) {
-            function_ptr = (struct simple_fun *) native_pointer(entry_point);
+        for_each_simple_fun(i, function_ptr, (struct code*)obj, 0, {
             begin = SIMPLE_FUN_SCAV_START(function_ptr);
             end   = begin + SIMPLE_FUN_SCAV_NWORDS(function_ptr);
             if (page_begin > (os_vm_address_t)begin) begin = (lispobj*)page_begin;
@@ -800,12 +822,12 @@ varyobj_points_to_younger_p(lispobj* obj, int gen, int keep_gen, int new_gen,
             if (end > begin
                 && range_points_to_younger_p(begin, end, gen, keep_gen, new_gen))
                 return 1;
-        }
-        begin = obj;
-        end = obj + code_header_words(word); // exclusive bound
+        })
+        begin = obj + 1; // skip the header
+        end = obj + code_header_words(word); // exclusive bound on boxed slots
     } else if (widetag == SIMPLE_VECTOR_WIDETAG) {
         sword_t length = fixnum_value(((struct vector *)obj)->length);
-        begin = obj;
+        begin = obj + 2; // skip the header and length
         end = obj + CEILING(length + 2, 2);
     } else if (widetag >= SIMPLE_ARRAY_UNSIGNED_BYTE_2_WIDETAG &&
                widetag <= MAXIMUM_STRING_WIDETAG) {
@@ -1064,7 +1086,6 @@ sweep_varyobj_pages(int raise)
                     struct code* code  = (struct code*)obj;
                     code->header       = 2<<N_WIDETAG_BITS | CODE_HEADER_WIDETAG;
                     code->code_size    = make_fixnum((size - 2) * N_WORD_BYTES);
-                    code->entry_points = NIL;
                     code->debug_info   = varyobj_holes;
                     varyobj_holes      = (lispobj)code;
                 }
@@ -1105,7 +1126,7 @@ static void compute_immobile_space_bound()
 
     for (max = (IMMOBILE_SPACE_SIZE/IMMOBILE_CARD_BYTES)-1 ;
          max >= FIRST_VARYOBJ_PAGE ; --max)
-        if (VARYOBJ_PAGE_GENS(max))
+        if (varyobj_page_gens_augmented(max))
             break;
      max_used_varyobj_page = max; // this is a page index, not the number of pages.
 }
@@ -1353,6 +1374,8 @@ int immobile_space_handle_wp_violation(void* fault_addr)
     low_page_index_t page_index = find_immobile_page_index(fault_addr);
     if (page_index < 0) return 0;
 
+    os_protect((os_vm_address_t)((lispobj)fault_addr & ~(IMMOBILE_CARD_BYTES-1)),
+               IMMOBILE_CARD_BYTES, OS_VM_PROT_ALL);
     if (page_index >= FIRST_VARYOBJ_PAGE) {
         // The free pointer can move up or down. Attempting to insist that a WP
         // fault not occur above the free pointer (plus some slack) is not
@@ -1368,8 +1391,6 @@ int immobile_space_handle_wp_violation(void* fault_addr)
             return 0;
         SET_WP_FLAG(page_index, WRITE_PROTECT_CLEARED);
     }
-    os_protect((os_vm_address_t)((lispobj)fault_addr & ~(IMMOBILE_CARD_BYTES-1)),
-               IMMOBILE_CARD_BYTES, OS_VM_PROT_ALL);
     return 1;
 }
 
@@ -1554,11 +1575,9 @@ static lispobj adjust_fun_entry(lispobj raw_entry)
 static void fixup_space(lispobj* where, size_t n_words)
 {
     lispobj* end = where + n_words;
-    lispobj header_word, obj;
+    lispobj header_word;
     int widetag;
     long size;
-    struct simple_fun* f;
-    lispobj next;
 
     while (where < end) {
         header_word = *where;
@@ -1578,28 +1597,25 @@ static void fixup_space(lispobj* where, size_t n_words)
             lose("Unhandled widetag in fixup_range: %p\n", (void*)header_word);
           break;
         case INSTANCE_HEADER_WIDETAG:
-          instance_scan_interleaved(adjust_words, where,
+          instance_scan_interleaved(adjust_words, where+1,
                                     instance_length(header_word) | 1,
                                     native_pointer(instance_layout(where)));
           break;
         case CODE_HEADER_WIDETAG:
-          // Fixup all embedded simple-funs
-          for ( obj = ((struct code*)where)->entry_points ; obj != NIL ; obj = next ) {
-              f = (struct simple_fun*)(obj - FUN_POINTER_LOWTAG);
-              next = f->next; // Read before adjusting.
-              f->self = adjust_fun_entry(f->self);
-              adjust_words(&f->next, 5);
-          }
-          // Fixup the constant pool. Do this last so that 'entry_points'
-          // is read before adjustment.
+          // Fixup the constant pool.
           adjust_words(where+1, code_header_words(header_word)-1);
+          // Fixup all embedded simple-funs
+          for_each_simple_fun(i, f, (struct code*)where, 1, {
+              f->self = adjust_fun_entry(f->self);
+              adjust_words(SIMPLE_FUN_SCAV_START(f), SIMPLE_FUN_SCAV_NWORDS(f));
+          });
           break;
         case CLOSURE_HEADER_WIDETAG:
           where[1] = adjust_fun_entry(where[1]);
           // Fallthrough intended.
         case FUNCALLABLE_INSTANCE_HEADER_WIDETAG:
           // skip the trampoline word at where[1]
-          adjust_words(where+2, HeaderValue(header_word)-1);
+          adjust_words(where+2, (HeaderValue(header_word)&0xFFFF) - 1);
           break;
         case FDEFN_WIDETAG:
           adjust_words(where+1, 2);
@@ -1689,15 +1705,14 @@ void defrag_immobile_space(int* components)
         if ((new_vaddr = components[i*2+1]) != 0) {
             addr = native_pointer(components[i*2]);
             int displacement = new_vaddr - (lispobj)addr;
-            struct simple_fun* f;
-            lispobj obj;
             set_load_address(addr, new_vaddr);
-            if (widetag_of(*addr) == CODE_HEADER_WIDETAG) {
-                for ( obj = ((struct code*)addr)->entry_points ; obj != NIL ; obj = f->next ) {
-                    set_load_address(native_pointer(obj), obj + displacement);
-                    f = (struct simple_fun*)(obj - FUN_POINTER_LOWTAG);
-                }
-            }
+            // FIXME: what is the 'if' for? Doesn't it _have_ to be code?
+            if (widetag_of(*addr) == CODE_HEADER_WIDETAG)
+                for_each_simple_fun(index, fun, (struct code*)addr, 1, {
+                    set_load_address((lispobj*)fun,
+                                     make_lispobj((char*)fun + displacement,
+                                                  FUN_POINTER_LOWTAG));
+                });
         }
     }
 

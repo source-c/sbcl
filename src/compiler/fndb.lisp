@@ -259,6 +259,18 @@
 (defknown (1+ 1-) (number) number
   (movable foldable flushable))
 
+(defknown (two-arg-* two-arg-+ two-arg-- two-arg-/)
+  (number number) number
+  ())
+
+(defknown (two-arg-< two-arg-= two-arg->)
+  (number number) boolean
+  ())
+
+(defknown (two-arg-gcd two-arg-lcm two-arg-and two-arg-ior two-arg-xor two-arg-eqv)
+  (integer integer) integer
+  ())
+
 (defknown conjugate (number) number
   (movable foldable flushable))
 
@@ -934,7 +946,7 @@
 
 (defknown %make-array ((or index list)
                        (unsigned-byte #.sb!vm:n-widetag-bits)
-                       (unsigned-byte 16)
+                       (mod #.sb!vm:n-word-bits)
                        &key
                        (:element-type type-specifier)
                        (:initial-element t)
@@ -1054,6 +1066,18 @@
   (or index null)
   (foldable flushable))
 
+(defknown (two-arg-string= two-arg-string-equal)
+  (string-designator string-designator)
+  boolean
+  (foldable flushable))
+
+(defknown (two-arg-string< two-arg-string> two-arg-string<= two-arg-string>=
+           two-arg-string/= two-arg-string-lessp two-arg-string-greaterp
+           two-arg-string-not-lessp two-arg-string-not-greaterp two-arg-string-not-equal)
+  (string-designator string-designator)
+  (or index null)
+  (foldable flushable))
+
 (defknown make-string (index &key (:element-type type-specifier)
                        (:initial-element character))
   simple-string (flushable))
@@ -1132,7 +1156,8 @@
   (character character &optional readtable (or readtable null)) (eql t)
   ())
 
-(defknown set-macro-character (character (callable 2) &optional t (or readtable null))
+(defknown set-macro-character (character (callable 2 no-function-conversion)
+                               &optional t (or readtable null))
   (eql t)
   (call))
 (defknown get-macro-character (character &optional (or readtable null))
@@ -1140,9 +1165,13 @@
 
 (defknown make-dispatch-macro-character (character &optional t readtable)
   (eql t) ())
+;;; FIXME: (CALLABLE 3 ...) causes a style warning in the :UNICODE-DISPATCH-MACROS
+;;; test in reader.impure.lisp
+;;;   The function NIL is called by SET-DISPATCH-MACRO-CHARACTER with three arguments, but wants exactly two.
 (defknown set-dispatch-macro-character
-  (character character callable &optional (or readtable null)) (eql t)
-  ())
+  (character character (callable 3 no-function-conversion)
+   &optional (or readtable null)) (eql t)
+  (call))
 (defknown get-dispatch-macro-character
   (character character &optional (or readtable null)) (or callable null)
   ())
@@ -1177,10 +1206,10 @@
   null
   ())
 (defknown set-pprint-dispatch
-  (type-specifier (or null callable)
+  (type-specifier (callable 2 no-function-conversion)
    &optional real sb!pretty:pprint-dispatch-table)
   null
-  ())
+  (call))
 
 ;;; may return any type due to eof-value...
 ;;; and because READ generally returns anything.
@@ -1439,8 +1468,8 @@
 (defknown cerror (format-control t &rest t) null)
 (defknown invalid-method-error (t format-control &rest t) *) ; FIXME: first arg is METHOD
 (defknown method-combination-error (format-control &rest t) *)
-(defknown signal (t &rest t) null)
-(defknown warn (t &rest t) null)
+(defknown (signal warn assert-error) (t &rest t) null)
+(defknown check-type-error (t t type-specifier &optional (or null string)) t)
 (defknown invoke-debugger (condition) nil)
 (defknown break (&optional format-control &rest t) null)
 (defknown make-condition (type-specifier &rest t) condition ())
@@ -1592,6 +1621,11 @@
 (defknown %typep-wrapper (t t (or type-specifier ctype)) t
   (movable flushable always-translatable))
 
+;;; An identity wrapper to avoid complaints about constant modification
+(defknown ltv-wrapper (t) t
+  (movable flushable always-translatable)
+  :derive-type #'result-type-first-arg)
+
 (defknown %cleanup-point () t)
 (defknown %special-bind (t t) t)
 (defknown %special-unbind (index) t)
@@ -1666,11 +1700,11 @@
 (defknown array-bounding-indices-bad-error (t t t) nil)
 (defknown sequence-bounding-indices-bad-error (t t t) nil)
 (defknown %find-position
-  (t sequence t index sequence-end function function)
+  (t sequence t index sequence-end (function 1) (function 2))
   (values t (or index null))
   (flushable call))
 (defknown (%find-position-if %find-position-if-not)
-  (function sequence t index sequence-end function)
+  ((function 1) sequence t index sequence-end (function 1))
   (values t (or index null))
   (call))
 (defknown effective-find-position-test (callable callable)
