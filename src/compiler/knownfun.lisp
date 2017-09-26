@@ -73,10 +73,8 @@
 (defun %defknown (names type attributes location
                   &key derive-type optimizer destroyed-constant-args result-arg
                        overwrite-fndb-silently
-                       foldable-call-check
-                       callable-check
-                       call-type-deriver
-                       functional-args)
+                       callable-map
+                       call-type-deriver)
   (let ((ctype (specifier-type type)))
     (dolist (name names)
       (unless overwrite-fndb-silently
@@ -103,10 +101,8 @@
                            :optimizer optimizer
                            :destroyed-constant-args destroyed-constant-args
                            :result-arg result-arg
-                           :foldable-call-check foldable-call-check
-                           :callable-check callable-check
-                           :call-type-deriver call-type-deriver
-                           :functional-args functional-args))
+                           :callable-map callable-map
+                           :call-type-deriver call-type-deriver))
       (if location
           (setf (getf (info :source-location :declaration name) 'defknown)
                 location)
@@ -119,6 +115,22 @@
   (or (info :function :info name) (error "~S is not a known function." name)))
 
 ;;;; generic type inference methods
+
+(defun symeval-derive-type (node &aux (args (basic-combination-args node))
+                                      (lvar (pop args)))
+  (unless (and lvar (endp args))
+    (return-from symeval-derive-type))
+  (if (constant-lvar-p lvar)
+      (let* ((sym (lvar-value lvar))
+             (var (maybe-find-free-var sym))
+             (local-type (when var
+                           (let ((*lexenv* (node-lexenv node)))
+                             (lexenv-find var type-restrictions))))
+             (global-type (info :variable :type sym)))
+        (if local-type
+            (type-intersection local-type global-type)
+            global-type))
+      *universal-type*))
 
 ;;; Derive the type to be the type of the xxx'th arg. This can normally
 ;;; only be done when the result value is that argument.

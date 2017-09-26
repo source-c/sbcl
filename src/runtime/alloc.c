@@ -23,7 +23,7 @@
 #ifdef LISP_FEATURE_GENCGC
 lispobj alloc_code_object (unsigned boxed, unsigned unboxed) {
     struct code * code;
-    struct thread *th = arch_os_get_current_thread();
+    struct thread __attribute__((unused)) *th = arch_os_get_current_thread();
     /* boxed is the number of constants, add other slots, align it to
      * two words, so that the code start is aligned, and convert it to
      * bytes. */
@@ -47,7 +47,7 @@ lispobj alloc_code_object (unsigned boxed, unsigned unboxed) {
     /* It used to be that even on gencgc builds the
      * ALLOCATE-CODE-OBJECT VOP did all this initialization within
      * pseudo atomic. Here, we rely on gc being inhibited. */
-    if (SymbolValue(GC_INHIBIT, arch_os_get_current_thread()) == NIL)
+    if (read_TLS(GC_INHIBIT, arch_os_get_current_thread()) == NIL)
         lose("alloc_code_object called with GC enabled.");
     boxed = boxed << (N_WIDETAG_BITS - WORD_SHIFT);
     code->header = boxed | CODE_HEADER_WIDETAG;

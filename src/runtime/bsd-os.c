@@ -42,9 +42,7 @@
 #include <signal.h>
 /* #include <sys/sysinfo.h> */
 #include "validate.h"
-#if defined LISP_FEATURE_GENCGC
-#include "gencgc-internal.h"
-#endif
+#include "gc-internal.h"
 
 #if defined(LISP_FEATURE_SB_WTIMER) && !defined(LISP_FEATURE_DARWIN)
 # include <sys/event.h>
@@ -127,11 +125,26 @@ os_context_sigmask_addr(os_context_t *context)
 }
 
 os_vm_address_t
-os_validate(os_vm_address_t addr, os_vm_size_t len)
+os_validate(int movable, os_vm_address_t addr, os_vm_size_t len)
 {
     int flags = MAP_PRIVATE | MAP_ANON;
 
-    if (addr)
+    /* FIXME: use of MAP_FIXED here looks decidedly wrong! (and not what we do
+     * in linux-os.c). Granted there are differences between *BSD and Linux,
+     * but on MAP_FIXED they agree: it destroys an existing mapping.
+
+     * macOS says:
+       If the memory region specified by addr and len overlaps pages of any existing
+       mapping(s), then the overlapped part of the existing mapping(s) will be discarded.
+
+     * FreeBSD says:
+       If MAP_EXCL is not specified, a successful MAP_FIXED request replaces any
+       previous mappings for the process' pages ...
+
+     * OpenBSD says:
+       Except for MAP_FIXED mappings, the system will never replace existing mappings. */
+
+    if (!movable && addr)
         flags |= MAP_FIXED;
 
 #ifdef __NetBSD__
@@ -179,60 +192,12 @@ os_invalidate(os_vm_address_t addr, os_vm_size_t len)
         perror("munmap");
 }
 
-os_vm_address_t
-os_map(int fd, int offset, os_vm_address_t addr, os_vm_size_t len)
-{
-    addr = mmap(addr, len,
-                OS_VM_PROT_ALL,
-                MAP_PRIVATE | MAP_FILE | MAP_FIXED,
-                fd, (off_t) offset);
-
-    if (addr == MAP_FAILED) {
-        perror("mmap");
-        lose("unexpected mmap(..) failure\n");
-    }
-
-    return addr;
-}
-
 void
 os_protect(os_vm_address_t address, os_vm_size_t length, os_vm_prot_t prot)
 {
     if (mprotect(address, length, prot) == -1) {
         perror("mprotect");
     }
-}
-
-static boolean
-in_range_p(os_vm_address_t a, lispobj sbeg, size_t slen)
-{
-    char* beg = (char*) sbeg;
-    char* end = (char*) sbeg + slen;
-    char* adr = (char*) a;
-    return (adr >= beg && adr < end);
-}
-
-boolean
-is_valid_lisp_addr(os_vm_address_t addr)
-{
-    struct thread *th;
-
-    if (in_range_p(addr, READ_ONLY_SPACE_START, READ_ONLY_SPACE_SIZE) ||
-        in_range_p(addr, STATIC_SPACE_START, STATIC_SPACE_SIZE) ||
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-        in_range_p(addr, IMMOBILE_SPACE_START, IMMOBILE_SPACE_SIZE) ||
-#endif
-        in_range_p(addr, DYNAMIC_SPACE_START, dynamic_space_size))
-        return 1;
-    for_each_thread(th) {
-        if (((os_vm_address_t)th->control_stack_start <= addr) &&
-            (addr < (os_vm_address_t)th->control_stack_end))
-            return 1;
-        if (in_range_p(addr, (lispobj) th->binding_stack_start,
-                       BINDING_STACK_SIZE))
-            return 1;
-    }
-    return 0;
 }
 
 /*
@@ -280,6 +245,7 @@ void
 os_install_interrupt_handlers(void)
 {
     SHOW("os_install_interrupt_handlers()/bsd-os/defined(GENCGC)");
+    if (INSTALL_SIG_MEMORY_FAULT_HANDLER) {
 #if defined(LISP_FEATURE_MACH_EXCEPTION_HANDLER)
     undoably_install_low_level_interrupt_handler(SIG_MEMORY_FAULT,
                                                  mach_error_memory_fault_handler);
@@ -290,6 +256,7 @@ os_install_interrupt_handlers(void)
 #endif
                                                  memory_fault_handler);
 #endif
+    }
 
 #ifdef LISP_FEATURE_SB_THREAD
 # ifdef LISP_FEATURE_SB_SAFEPOINT

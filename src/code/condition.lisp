@@ -74,6 +74,7 @@
              (not (mismatch (layout-inherits olayout) new-inherits)))
         olayout
         (make-layout :classoid (make-undefined-classoid name)
+                     :%flags +condition-layout-flag+
                      :inherits new-inherits
                      :depthoid -1
                      :length (layout-length cond-layout)))))
@@ -147,7 +148,7 @@
 
 (defun condition-slot-value (condition name)
   (let ((val (getf (condition-assigned-slots condition) name sb!pcl:+slot-unbound+)))
-    (if (eq val sb!pcl:+slot-unbound+)
+    (if (unbound-marker-p val)
         (let ((class (layout-classoid (%instance-layout condition))))
           (dolist (cslot
                    (condition-classoid-class-slots class)
@@ -207,7 +208,6 @@
                :format-arguments (list designator)))))
 
 (defun make-condition (type &rest initargs)
-  #!+sb-doc
   "Make an instance of a condition object using the specified initargs."
   ;; Note: While ANSI specifies no exceptional situations in this function,
   ;; ALLOCATE-CONDITION will signal a type error if TYPE does not designate
@@ -223,14 +223,13 @@
     (dolist (cslot (condition-classoid-class-slots classoid))
       (dolist (initarg (condition-slot-initargs cslot))
         (let ((val (getf initargs initarg sb!pcl:+slot-unbound+)))
-          (unless (eq val sb!pcl:+slot-unbound+)
+          (unless (unbound-marker-p val)
             (setf (car (condition-slot-cell cslot)) val)))))
 
     ;; Default any slots with non-constant defaults now.
     (dolist (hslot (condition-classoid-hairy-slots classoid))
       (when (dolist (initarg (condition-slot-initargs hslot) t)
-              (unless (eq (getf initargs initarg sb!pcl:+slot-unbound+)
-                          sb!pcl:+slot-unbound+)
+              (unless (unbound-marker-p (getf initargs initarg sb!pcl:+slot-unbound+))
                 (return nil)))
         (setf (getf (condition-assigned-slots condition)
                     (condition-slot-name hslot))
@@ -354,7 +353,6 @@
 
 (defmacro define-condition (name (&rest parent-types) (&rest slot-specs)
                                  &body options)
-  #!+sb-doc
   "DEFINE-CONDITION Name (Parent-Type*) (Slot-Spec*) Option*
    Define NAME as a condition type. This new type inherits slots and its
    report function from the specified PARENT-TYPEs. A slot spec is a list of:
@@ -459,6 +457,8 @@
           (t
            (error "unknown option: ~S" (first option)))))
 
+      ;; Maybe kill docstring, but only under the cross-compiler.
+      #!+(and (not sb-doc) (host-feature sb-xc-host)) (setq documentation nil)
       `(progn
          (eval-when (:compile-toplevel)
            (%compiler-define-condition ',name ',parent-types ',layout
@@ -514,17 +514,42 @@
 
 (define-condition storage-condition (serious-condition) ())
 
+(defun decode-type-error-context (context type)
+  (typecase context
+    (cons
+     (case (car context)
+       (:struct
+        (format nil "when setting slot ~s of structure ~s"
+                (cddr context) (cadr context)))
+       (:bind
+        (format nil "when binding ~s"
+                (cdr context)))
+       (t context)))
+    ((eql aref)
+     (let (*print-circle*)
+       (format nil "when setting an element of (ARRAY ~s)"
+               type)))
+    ((eql :ftype)
+     "from the function type declaration.")
+    (t
+     context)))
+
 (define-condition type-error (error)
   ((datum :reader type-error-datum :initarg :datum)
-   (expected-type :reader type-error-expected-type :initarg :expected-type))
+   (expected-type :reader type-error-expected-type :initarg :expected-type)
+   (context :initform nil :reader type-error-context :initarg :context))
   (:report
    (lambda (condition stream)
-     (format stream  "~@<The value ~
+     (let ((type (type-error-expected-type condition)))
+       (format stream  "~@<The value ~
                       ~@:_~2@T~S ~
                       ~@:_is not of type ~
-                      ~@:_~2@T~/sb!impl:print-type-specifier/~:@>"
-             (type-error-datum condition)
-             (type-error-expected-type condition)))))
+                      ~@:_~2@T~/sb!impl:print-type-specifier/~@[ ~
+                      ~@:_~a~]~:@>"
+               (type-error-datum condition)
+               type
+               (decode-type-error-context (type-error-context condition)
+                                          type))))))
 
 ;;; not specified by ANSI, but too useful not to have around.
 (define-condition simple-style-warning (simple-condition style-warning) ())
@@ -567,6 +592,9 @@
              "The variable ~S is unbound."
              (cell-error-name condition)))))
 
+(define-condition retry-unbound-variable
+    (simple-condition unbound-variable) ())
+
 (define-condition undefined-function (cell-error) ()
   (:report
    (lambda (condition stream)
@@ -574,6 +602,9 @@
        (format stream
                "The function ~S is undefined."
                (cell-error-name condition))))))
+
+(define-condition retry-undefined-function
+    (simple-condition undefined-function) ())
 
 (define-condition special-form-function (undefined-function) ()
   (:report
@@ -594,7 +625,7 @@
                      (type-of condition))
              (when (arithmetic-error-operation condition)
                (format stream
-                       "~%Operation was ~S, operands ~S."
+                       "~%Operation was (~S ~{~S~^ ~})."
                        (arithmetic-error-operation condition)
                        (arithmetic-error-operands condition))))))
 
@@ -645,7 +676,7 @@
                  (simple-condition-format-control condition)
                  (simple-condition-format-arguments condition))
           (prin1 (class-name (class-of condition)) stream))
-      (format stream "~2I~@[~_~_~:{~:(~A~): ~S~:^, ~:_~}~]~_~_Stream: ~S"
+      (format stream "~2I~@[~:@_ ~:@_~:{~:(~A~): ~S~:^, ~:_~}~]~:@_ ~:@_Stream: ~S"
               (stream-error-position-info error-stream position)
               error-stream))))
 
@@ -780,7 +811,7 @@
 (define-condition duplicate-definition (reference-condition warning)
   ((name :initarg :name :reader duplicate-definition-name))
   (:report report-duplicate-definition)
-  (:default-initargs :references (list '(:ansi-cl :section (3 2 2 3)))))
+  (:default-initargs :references '((:ansi-cl :section (3 2 2 3)))))
 ;; To my thinking, DUPLICATE-DEFINITION should be the ancestor condition,
 ;; and not fatal. But changing the meaning of that concept would be a bad idea,
 ;; so instead there is a new condition for the softer variant, which does not
@@ -798,18 +829,18 @@
              (format s "~@<Destructive function ~S called on ~
                         constant data.~@:>"
                      (constant-modified-fun-name c))))
-  (:default-initargs :references (list '(:ansi-cl :special-operator quote)
-                                       '(:ansi-cl :section (3 2 2 3)))))
+  (:default-initargs :references '((:ansi-cl :special-operator quote)
+                                   (:ansi-cl :section (3 2 2 3)))))
 
 (define-condition package-at-variance (reference-condition simple-warning)
   ()
-  (:default-initargs :references (list '(:ansi-cl :macro defpackage)
-                                       '(:sbcl :variable *on-package-variance*))))
+  (:default-initargs :references '((:ansi-cl :macro defpackage)
+                                   (:sbcl :variable *on-package-variance*))))
 
 (define-condition package-at-variance-error (reference-condition simple-condition
                                              package-error)
   ()
-  (:default-initargs :references (list '(:ansi-cl :macro defpackage))))
+  (:default-initargs :references '((:ansi-cl :macro defpackage))))
 
 (define-condition defconstant-uneql (reference-condition error)
   ((name :initarg :name :reader defconstant-uneql-name)
@@ -822,31 +853,30 @@
              (defconstant-uneql-name condition)
              (defconstant-uneql-old-value condition)
              (defconstant-uneql-new-value condition))))
-  (:default-initargs :references (list '(:ansi-cl :macro defconstant)
-                                       '(:sbcl :node "Idiosyncrasies"))))
+  (:default-initargs :references '((:ansi-cl :macro defconstant)
+                                   (:sbcl :node "Idiosyncrasies"))))
 
 (define-condition array-initial-element-mismatch
     (reference-condition simple-warning)
   ()
   (:default-initargs
-      :references (list
-                   '(:ansi-cl :function make-array)
-                   '(:ansi-cl :function sb!xc:upgraded-array-element-type))))
+      :references '((:ansi-cl :function make-array)
+                    (:ansi-cl :function sb!xc:upgraded-array-element-type))))
 
 (define-condition type-warning (reference-condition simple-warning)
   ()
-  (:default-initargs :references (list '(:sbcl :node "Handling of Types"))))
+  (:default-initargs :references '((:sbcl :node "Handling of Types"))))
 (define-condition type-style-warning (reference-condition simple-style-warning)
   ()
-  (:default-initargs :references (list '(:sbcl :node "Handling of Types"))))
+  (:default-initargs :references '((:sbcl :node "Handling of Types"))))
 
 (define-condition local-argument-mismatch (reference-condition simple-warning)
   ()
-  (:default-initargs :references (list '(:ansi-cl :section (3 2 2 3)))))
+  (:default-initargs :references '((:ansi-cl :section (3 2 2 3)))))
 
 (define-condition format-args-mismatch (reference-condition)
   ()
-  (:default-initargs :references (list '(:ansi-cl :section (22 3 10 2)))))
+  (:default-initargs :references '((:ansi-cl :section (22 3 10 2)))))
 
 (define-condition format-too-few-args-warning
     (format-args-mismatch simple-warning)
@@ -860,7 +890,7 @@
   (:report
    (lambda (condition stream)
      (format stream "~@<Implicitly creating new generic function ~
-                     ~/sb-impl::print-symbol-with-prefix/.~:@>"
+                     ~/sb-ext:print-symbol-with-prefix/.~:@>"
              (implicit-generic-function-name condition)))))
 
 (define-condition extension-failure (reference-condition simple-error)
@@ -869,7 +899,7 @@
 (define-condition structure-initarg-not-keyword
     (reference-condition simple-style-warning)
   ()
-  (:default-initargs :references (list '(:ansi-cl :section (2 4 8 13)))))
+  (:default-initargs :references '((:ansi-cl :section (2 4 8 13)))))
 
 #!+sb-package-locks
 (progn
@@ -894,20 +924,17 @@
                current-package))))
   ;; no :default-initargs -- reference-stuff provided by the
   ;; signalling form in target-package.lisp
-  #!+sb-doc
   (:documentation
    "Subtype of CL:PACKAGE-ERROR. A subtype of this error is signalled
 when a package-lock is violated."))
 
 (define-condition package-locked-error (package-lock-violation) ()
-  #!+sb-doc
   (:documentation
    "Subtype of SB-EXT:PACKAGE-LOCK-VIOLATION. An error of this type is
 signalled when an operation on a package violates a package lock."))
 
 (define-condition symbol-package-locked-error (package-lock-violation)
   ((symbol :initarg :symbol :reader package-locked-error-symbol))
-  #!+sb-doc
   (:documentation
    "Subtype of SB-EXT:PACKAGE-LOCK-VIOLATION. An error of this type is
 signalled when an operation on a symbol violates a package lock. The
@@ -937,6 +964,13 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
          (format stream "The alien function ~s is undefined."
                  (cell-error-name condition))
          (format stream "Attempt to call an undefined alien function.")))))
+
+(define-condition unknown-keyword-argument (program-error)
+  ((name :reader unknown-keyword-argument-name :initarg :name))
+  (:report
+   (lambda (condition stream)
+     (format stream "Unknown &KEY argument: ~S"
+             (unknown-keyword-argument-name condition)))))
 
 
 ;;;; various other (not specified by ANSI) CONDITIONs
@@ -1046,9 +1080,9 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
                      "An attempt to access an array of element-type ~
                       NIL was made.  Congratulations!")))
   (:default-initargs
-      :references (list '(:ansi-cl :function sb!xc:upgraded-array-element-type)
-                        '(:ansi-cl :section (15 1 2 1))
-                        '(:ansi-cl :section (15 1 2 2)))))
+      :references '((:ansi-cl :function sb!xc:upgraded-array-element-type)
+                    (:ansi-cl :section (15 1 2 1))
+                    (:ansi-cl :section (15 1 2 2)))))
 
 (define-condition namestring-parse-error (parse-error)
   ((complaint :reader namestring-parse-error-complaint :initarg :complaint)
@@ -1133,22 +1167,20 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
                                                    simple-error)
   ()
   (:default-initargs
-   :format-control  "Symbol ~/sb-impl:print-symbol-with-prefix/ cannot ~
+   :format-control  "Symbol ~/sb-ext:print-symbol-with-prefix/ cannot ~
                      be both the name of a type and the name of a ~
                      declaration"
-   :references (list '(:ansi-cl :section (3 8 21)))))
+   :references '((:ansi-cl :section (3 8 21)))))
 
 ;;; Single stepping conditions
 
 (define-condition step-condition ()
   ((form :initarg :form :reader step-condition-form))
 
-  #!+sb-doc
   (:documentation "Common base class of single-stepping conditions.
 STEP-CONDITION-FORM holds a string representation of the form being
 stepped."))
 
-#!+sb-doc
 (setf (fdocumentation 'step-condition-form 'function)
       "Form associated with the STEP-CONDITION.")
 
@@ -1165,7 +1197,6 @@ stepped."))
                (list (step-condition-form condition))
                (eq (step-condition-args condition) :unknown)
                (step-condition-args condition)))))
-  #!+sb-doc
   (:documentation "Condition signalled by code compiled with
 single-stepping information when about to execute a form.
 STEP-CONDITION-FORM holds the form, STEP-CONDITION-PATHNAME holds the
@@ -1177,14 +1208,12 @@ STEP-NEXT, and STEP-CONTINUE."))
 (define-condition step-result-condition (step-condition)
   ((result :initarg :result :reader step-condition-result)))
 
-#!+sb-doc
 (setf (fdocumentation 'step-condition-result 'function)
       "Return values associated with STEP-VALUES-CONDITION as a list,
 or the variable value associated with STEP-VARIABLE-CONDITION.")
 
 (define-condition step-values-condition (step-result-condition)
   ()
-  #!+sb-doc
   (:documentation "Condition signalled by code compiled with
 single-stepping information after executing a form.
 STEP-CONDITION-FORM holds the form, and STEP-CONDITION-RESULT holds
@@ -1196,12 +1225,10 @@ the values returned by the form as a list. No associated restarts."))
    (lambda (condition stream)
      (declare (ignore condition))
      (format stream "Returning from STEP")))
-  #!+sb-doc
   (:documentation "Condition signaled when STEP returns."))
 
 ;;; A knob for muffling warnings, mostly for use while loading files.
 (defvar *muffled-warnings* 'uninteresting-redefinition
-  #!+sb-doc
   "A type that ought to specify a subtype of WARNING.  Whenever a
 warning is signaled, if the warning is of this type and is not
 handled by any other handler, it will be muffled.")
@@ -1226,21 +1253,21 @@ handled by any other handler, it will be muffled.")
 (define-condition redefinition-with-defun (function-redefinition-warning)
   ()
   (:report (lambda (warning stream)
-             (format stream "redefining ~/sb-impl::print-symbol-with-prefix/ ~
+             (format stream "redefining ~/sb-ext:print-symbol-with-prefix/ ~
                              in DEFUN"
                      (redefinition-warning-name warning)))))
 
 (define-condition redefinition-with-defmacro (function-redefinition-warning)
   ()
   (:report (lambda (warning stream)
-             (format stream "redefining ~/sb-impl::print-symbol-with-prefix/ ~
+             (format stream "redefining ~/sb-ext:print-symbol-with-prefix/ ~
                              in DEFMACRO"
                      (redefinition-warning-name warning)))))
 
 (define-condition redefinition-with-defgeneric (redefinition-warning)
   ()
   (:report (lambda (warning stream)
-             (format stream "redefining ~/sb-impl::print-symbol-with-prefix/ ~
+             (format stream "redefining ~/sb-ext:print-symbol-with-prefix/ ~
                              in DEFGENERIC"
                      (redefinition-warning-name warning)))))
 
@@ -1533,7 +1560,6 @@ the usual naming convention (names like *FOO*) for special variables"
    :software (missing-arg)
    :version (missing-arg)
    :references '((:sbcl :node "Deprecation Conditions")))
-  #!+sb-doc
   (:documentation
    "Superclass for deprecation-related error and warning
 conditions."))
@@ -1574,9 +1600,8 @@ conditions."))
   ;; warm load. (!CALL-A-METHOD does not understand method qualifiers)
   (define-deprecation-warning early-deprecation-warning style-warning nil
      "~%~@<~:@_In future~@[ ~A~] versions ~
-      ~/sb-impl:print-symbol-with-prefix/ will signal a full warning ~
+      ~/sb-ext:print-symbol-with-prefix/ will signal a full warning ~
       at compile-time.~:@>"
-    #!+sb-doc
     "This warning is signaled when the use of a variable,
 function, type, etc. in :EARLY deprecation is detected at
 compile-time. The use will work at run-time with no warning or
@@ -1584,9 +1609,8 @@ error.")
 
   (define-deprecation-warning late-deprecation-warning warning t
      "~%~@<~:@_In future~@[ ~A~] versions ~
-      ~/sb-impl:print-symbol-with-prefix/ will signal a runtime ~
+      ~/sb-ext:print-symbol-with-prefix/ will signal a runtime ~
       error.~:@>"
-    #!+sb-doc
     "This warning is signaled when the use of a variable,
 function, type, etc. in :LATE deprecation is detected at
 compile-time. The use will work at run-time with no warning or
@@ -1594,15 +1618,13 @@ error.")
 
   (define-deprecation-warning final-deprecation-warning warning t
      "~%~@<~:@_~*An error will be signaled at runtime for ~
-      ~/sb-impl:print-symbol-with-prefix/.~:@>"
-    #!+sb-doc
+      ~/sb-ext:print-symbol-with-prefix/.~:@>"
     "This warning is signaled when the use of a variable,
 function, type, etc. in :FINAL deprecation is detected at
 compile-time. An error will be signaled at run-time."))
 
 (define-condition deprecation-error (error deprecation-condition)
   ()
-  #!+sb-doc
   (:documentation
    "This error is signaled at run-time when an attempt is made to use
 a thing that is in :FINAL deprecation, i.e. call a function or access
@@ -1615,7 +1637,6 @@ a variable."))
    "An ABORT restart was found that failed to transfer control dynamically."))
 
 (defun abort (&optional condition)
-  #!+sb-doc
   "Transfer control to a restart named ABORT, signalling a CONTROL-ERROR if
    none exists."
   (invoke-restart (find-restart-or-control-error 'abort condition))
@@ -1625,7 +1646,6 @@ a variable."))
   (error 'abort-failure))
 
 (defun muffle-warning (&optional condition)
-  #!+sb-doc
   "Transfer control to a restart named MUFFLE-WARNING, signalling a
    CONTROL-ERROR if none exists."
   (invoke-restart (find-restart-or-control-error 'muffle-warning condition)))
@@ -1636,9 +1656,8 @@ a variable."))
       (apply #'invoke-restart restart arguments))))
 
 (macrolet ((define-nil-returning-restart (name args doc)
-             #!-sb-doc (declare (ignore doc))
              `(defun ,name (,@args &optional condition)
-                #!+sb-doc ,doc
+                ,doc
                 (try-restart ',name condition ,@args))))
   (define-nil-returning-restart continue ()
     "Transfer control to a restart named CONTINUE, or return NIL if none exists.")
@@ -1655,9 +1674,8 @@ return NIL if none exists."))
 ;;; single-stepping restarts
 
 (macrolet ((def (name doc)
-               #!-sb-doc (declare (ignore doc))
                `(defun ,name (condition)
-                 #!+sb-doc ,doc
+                 ,doc
                  (invoke-restart (find-restart-or-control-error ',name condition)))))
   (def step-continue
       "Transfers control to the STEP-CONTINUE restart associated with

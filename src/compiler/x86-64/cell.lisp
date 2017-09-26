@@ -32,30 +32,31 @@
     (progn name) ; ignore it
     (generate-set-slot object value temp offset lowtag)))
 
-(defun generate-set-slot (object value temp offset lowtag)
+(defun generate-set-slot (object value temp offset lowtag &optional zeroed)
     (if (sc-is value immediate)
         (move-immediate (make-ea :qword
                                  :base object
                                  :disp (- (* offset n-word-bytes)
                                           lowtag))
                         (encode-value-if-immediate value)
-                        temp)
+                        temp zeroed)
         ;; Else, value not immediate.
         (storew value object offset lowtag)))
 
 ;; INIT-SLOT has to know about the :COMPACT-INSTANCE-HEADER feature.
 (define-vop (init-slot set-slot)
+  (:info name dx-p offset lowtag)
   (:generator 1
-    (progn name)
+    (progn name dx-p)
     (if (or #!+compact-instance-header
             (and (eq name '%make-structure-instance) (eql offset :layout)))
         ;; The layout is in the upper half of the header word.
-        ;; FIXME: It would be nice if FIXED-ALLOC could write the header word
-        ;; in one shot, but this is an acceptable workaround.
         (inst mov
               (make-ea :dword :base object :disp (- 4 instance-pointer-lowtag))
-              (reg-in-size value :dword))
-        (generate-set-slot object value temp offset lowtag))))
+              (if (sc-is value immediate)
+                  (make-fixup (tn-value value) :layout)
+                  (reg-in-size value :dword)))
+        (generate-set-slot object value temp offset lowtag (not dx-p)))))
 
 (define-vop (compare-and-swap-slot)
   (:args (object :scs (descriptor-reg) :to :eval)
@@ -82,11 +83,11 @@
 (define-vop (fast-symbol-global-value cell-ref)
   (:variant symbol-value-slot other-pointer-lowtag)
   (:policy :fast)
-  (:translate symbol-global-value))
+  (:translate sym-global-val))
 
 (define-vop (symbol-global-value)
   (:policy :fast-safe)
-  (:translate symbol-global-value)
+  (:translate sym-global-val)
   (:args (object :scs (descriptor-reg) :to (:result 1)))
   (:results (value :scs (descriptor-reg any-reg)))
   (:vop-var vop)
@@ -120,6 +121,12 @@
 (defun symbol-always-thread-local-p (symbol)
   (let ((where (info :variable :wired-tls symbol)))
     (or (eq where :ALWAYS-THREAD-LOCAL) (integerp where))))
+
+(deftransform %compare-and-swap-symbol-value ((symbol old new)
+                                              ((constant-arg symbol) t t))
+  (if (eq (info :variable :kind (sb!c::lvar-value symbol)) :global)
+      `(%cas-symbol-global-value symbol old new)
+      (sb!c::give-up-ir1-transform)))
 
 (macrolet (;; Logic common to thread-aware SET and CAS. CELL is assigned
            ;; to the location that should be accessed to modify SYMBOL's
@@ -179,24 +186,47 @@
         (inst jmp :e unbound)
         (move result rax))))
 
+  (define-vop (%cas-symbol-global-value)
+    (:translate %cas-symbol-global-value)
+    (:args (symbol :scs (descriptor-reg) :to (:result 0)
+                   :load-if (not (sc-is symbol immediate)))
+           (old :scs (descriptor-reg any-reg) :target rax)
+           (new :scs (descriptor-reg any-reg)))
+    (:temporary (:sc descriptor-reg :offset rax-offset
+                 :from (:argument 1) :to (:result 0)) rax)
+    (:results (result :scs (descriptor-reg any-reg)))
+    (:policy :fast-safe)
+    (:generator 10
+      (move rax old)
+      (inst cmpxchg
+            (if (sc-is symbol immediate)
+                (symbol-slot-addr (tn-value symbol) symbol-value-slot)
+                (access-value-slot symbol))
+            new :lock)
+      (move result rax)))
+
   #!+sb-thread
   (progn
     ;; TODO: SET could be shorter for any known wired-tls symbol.
     (define-vop (set)
       (:args (symbol :scs (descriptor-reg))
-             (value :scs (descriptor-reg any-reg)))
+             (value :scs (descriptor-reg any-reg)
+                    :load-if (or (not (sc-is value immediate))
+                                 (not (typep (encode-value-if-immediate value)
+                                             '(or (signed-byte 32) fixup))))))
       (:temporary (:sc descriptor-reg) cell)
       (:generator 4
         ;; Compute the address into which to store. CMOV can only move into
         ;; a register, so we can't conditionally move into the TLS and
         ;; conditionally move in the opposite flag sense to the symbol.
         (compute-virtual-symbol)
-        (inst mov (access-value-slot cell) value)))
+        (inst mov (access-value-slot cell)
+              (encode-value-if-immediate value))))
 
   ;; With Symbol-Value, we check that the value isn't the trap object. So
   ;; Symbol-Value of NIL is NIL.
     (define-vop (symbol-value)
-      (:translate symbol-value)
+      (:translate symeval)
       (:policy :fast-safe)
       (:args (symbol :scs (descriptor-reg constant) :to (:result 1)))
       (:temporary (:sc descriptor-reg) symbol-reg)
@@ -225,9 +255,12 @@
           (inst cmp (reg-in-size value :dword) no-tls-value-marker-widetag)
           (inst cmov :e value (access-value-slot symbol-reg)))
         (when check-boundp
-          (inst cmp (reg-in-size value :dword) unbound-marker-widetag)
-          (inst jmp :e (generate-error-code vop 'unbound-symbol-error
-                                            symbol-reg)))))
+          (assemble ()
+            (inst cmp (reg-in-size value :dword) unbound-marker-widetag)
+            (let ((*location-context* (make-restart-location RETRY value)))
+              (inst jmp :e (generate-error-code vop 'unbound-symbol-error
+                                                symbol-reg)))
+            RETRY))))
 
     (define-vop (fast-symbol-value symbol-value)
     ;; KLUDGE: not really fast, in fact, because we're going to have to
@@ -243,7 +276,7 @@
     ;; load the symbol except in the case of error, and uses no temp either.
     ;; There's no way to express the lack of encumbrances in the general vop.
     (define-vop (symeval/static-wired)
-      (:translate symbol-value)
+      (:translate symeval)
       (:policy :fast-safe)
       ;; The predicates are orthogonal. Symbols can satisfy one, the other,
       ;; both, or neither. This vop applies only if both.
@@ -295,9 +328,9 @@
 #!-sb-thread
 (progn
   (define-vop (symbol-value symbol-global-value)
-    (:translate symbol-value))
+    (:translate symeval))
   (define-vop (fast-symbol-value fast-symbol-global-value)
-    (:translate symbol-value))
+    (:translate symeval))
   (define-vop (set %set-symbol-global-value))
   (define-vop (boundp)
     (:translate boundp)
@@ -339,9 +372,12 @@
     (loadw value object fdefn-fun-slot other-pointer-lowtag)
     ;; byte comparison works because lowtags of function and nil differ
     (inst cmp (reg-in-size value :byte) (logand nil-value #xff))
-    (let ((err-lab (generate-error-code vop 'undefined-fun-error object)))
-      (inst jmp :e err-lab))))
+    (let* ((*location-context* (make-restart-location RETRY value))
+           (err-lab (generate-error-code vop 'undefined-fun-error object)))
+      (inst jmp :e err-lab))
+    RETRY))
 
+#!-immobile-code
 (define-vop (set-fdefn-fun)
   (:policy :fast-safe)
   (:translate (setf fdefn-fun))
@@ -356,7 +392,7 @@
           (make-ea :byte :base function
                    :disp (- (* simple-fun-code-offset n-word-bytes)
                             fun-pointer-lowtag)))
-    (inst cmp (reg-in-size type :byte) simple-fun-header-widetag)
+    (inst cmp (reg-in-size type :byte) simple-fun-widetag)
     (inst jmp :e NORMAL-FUN)
     (inst mov raw (make-fixup 'closure-tramp :assembly-routine))
     NORMAL-FUN
@@ -369,10 +405,27 @@
   (:translate fdefn-makunbound)
   (:args (fdefn :scs (descriptor-reg) :target result))
   (:results (result :scs (descriptor-reg)))
+  #!+immobile-code (:temporary (:sc unsigned-reg) temp)
   (:generator 38
-    (storew nil-value fdefn fdefn-fun-slot other-pointer-lowtag)
-    (storew (make-fixup 'undefined-tramp :assembly-routine)
-            fdefn fdefn-raw-addr-slot other-pointer-lowtag)
+    #!+immobile-code
+    (progn
+     (inst mov (reg-in-size temp :dword)
+           (make-fixup 'undefined-tramp :assembly-routine))
+     ;; Compute displacement from the call site
+     (inst sub (reg-in-size temp :dword) (reg-in-size fdefn :dword))
+     (inst sub (reg-in-size temp :dword)
+           (+ (- other-pointer-lowtag) (ash fdefn-raw-addr-slot word-shift) 5))
+     ;; Compute the encoding of a "CALL rel32" instruction
+     (inst shl temp 8)
+     (inst or (reg-in-size temp :byte) #xE8)
+     ;; Store
+     (storew nil-value fdefn fdefn-fun-slot other-pointer-lowtag)
+     (storew temp fdefn fdefn-raw-addr-slot other-pointer-lowtag))
+    #!-immobile-code
+    (progn
+     (storew nil-value fdefn fdefn-fun-slot other-pointer-lowtag)
+     (storew (make-fixup 'undefined-tramp :assembly-routine)
+             fdefn fdefn-raw-addr-slot other-pointer-lowtag))
     (move result fdefn)))
 
 ;;;; binding and unbinding

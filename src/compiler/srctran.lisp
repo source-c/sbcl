@@ -46,26 +46,6 @@
       (give-up-ir1-transform
        "The function doesn't have a fixed argument count.")))))
 
-;;;; SYMBOL-VALUE &co
-(defun derive-symbol-value-type (lvar node)
-  (if (constant-lvar-p lvar)
-      (let* ((sym (lvar-value lvar))
-             (var (maybe-find-free-var sym))
-             (local-type (when var
-                           (let ((*lexenv* (node-lexenv node)))
-                             (lexenv-find var type-restrictions))))
-             (global-type (info :variable :type sym)))
-        (if local-type
-            (type-intersection local-type global-type)
-            global-type))
-      *universal-type*))
-
-(defoptimizer (symbol-value derive-type) ((symbol) node)
-  (derive-symbol-value-type symbol node))
-
-(defoptimizer (symbol-global-value derive-type) ((symbol) node)
-  (derive-symbol-value-type symbol node))
-
 ;;;; list hackery
 
 ;;; Translate CxR into CAR/CDR combos.
@@ -3375,7 +3355,7 @@
   (and (/= x -1)
        (1- (integer-length (logxor x (1+ x))))))
 
-(deftransform logand ((x y) (* (constant-arg t)) *)
+(deftransform logand ((x y) (* (constant-arg integer)) *)
   "fold identity operation"
   (let* ((y (lvar-value y))
          (width (or (least-zero-bit y) '*)))
@@ -4209,9 +4189,26 @@
                          arg)))
           (cond ((not (funcall one-arg-constant-p value))
                  (not-constants arg))
-                (reduced-value
-                 (setf reduced-value (funcall fun reduced-value value)
-                       reduced-p t))
+                 (reduced-value
+                  (handler-case (funcall fun reduced-value value)
+                    (arithmetic-error ()
+                      (not-constants arg))
+                    (:no-error (value)
+                      ;; Some backends have no float traps
+                      (cond #!+(and (or arm arm64)
+                                    (not (host-feature sb-xc-host)))
+                            ((or (and (floatp value)
+                                      (or (float-infinity-p value)
+                                          (float-nan-p value)))
+                                 (and (complex-float-p value)
+                                      (or (float-infinity-p (imagpart value))
+                                          (float-nan-p (imagpart value))
+                                          (float-infinity-p (realpart value))
+                                          (float-nan-p (realpart value)))))
+                             (not-constants arg))
+                            (t
+                             (setf reduced-value value
+                                   reduced-p t))))))
                 (t
                  (setf reduced-value value)))))
       ;; It is tempting to drop constants reduced to identity here,
@@ -4512,7 +4509,7 @@
   (declare (ignore control args))
   (when (and (constant-lvar-p dest)
              (null (lvar-value dest)))
-    (specifier-type '(simple-array character (*)))))
+    (specifier-type 'simple-string)))
 
 ;;; We disable this transform in the cross-compiler to save memory in
 ;;; the target image; most of the uses of FORMAT in the compiler are for
@@ -4995,13 +4992,56 @@
                                (and (csubtypep specifier (specifier-type 'character))
                                     (type-specifier specifier)))))))
    (if element-type
-       `(sb!impl::%make-string-output-stream ',element-type)
+       `(sb!impl::%make-string-output-stream
+         ',element-type
+         (function ,(case element-type
+                      (base-char 'sb!impl::string-ouch/base-char)
+                      (t 'sb!impl::string-ouch))))
        (give-up-ir1-transform))))
 
-(deftransform set ((symbol value) ((constant-arg symbol) *))
-  (let* ((symbol (lvar-value symbol)))
-    (case (info :variable :kind symbol)
-      ((:constant :global :special)
-       `(setq ,symbol value))
-      (t
-       (give-up-ir1-transform)))))
+(flet ((xform (symbol match-kind fallback)
+         (when (constant-lvar-p symbol)
+           (let* ((symbol (lvar-value symbol))
+                  (kind (info :variable :kind symbol))
+                  (state (deprecated-thing-p 'variable symbol)))
+             (when state
+               (check-deprecated-thing 'variable symbol)
+               (case state
+                 ((:early :late)
+                  (unless (gethash symbol *free-vars*)
+                    (setf (gethash symbol *free-vars*) :deprecated)))))
+             ;; :global in the test below is redundant if match-kind is :global
+             ;; but it's harmless and a convenient way to express this.
+             ;; Note that some 3rd-party libraries use variations on DEFCONSTANT
+             ;; expanding into expressions such as:
+             ;;  (CL:DEFCONSTANT S (IF (BOUNDP 'S) (SYMBOL-VALUE 'S) (COMPUTE)))
+             ;; which means we have to use care if S in for-evaluation position would
+             ;; be converted to (LOAD-TIME-VALUE (SYMBOL-VALUE 'S)).
+             ;; When S's value is directly dumpable, it works fine, but otherwise
+             ;; it's dangerous. If the user wishes to avoid eager evaluation entirely,
+             ;; a local notinline declaration on SYMBOL-VALUE will do.
+             (when (or (eq kind match-kind)
+                       (eq kind :global)
+                       (and (eq kind :constant)
+                            (boundp symbol)
+                            (typep (symbol-value symbol) '(or number character symbol))))
+               (return-from xform symbol))))
+         fallback))
+  (deftransform symbol-global-value ((symbol))
+    (xform symbol :global `(sym-global-val symbol)))
+  (deftransform symbol-value ((symbol))
+    (xform symbol :special `(symeval symbol))))
+
+(flet ((xform (symbol match-kind)
+         (let* ((symbol (lvar-value symbol))
+                (kind (info :variable :kind symbol)))
+           (if (or (eq kind match-kind) (memq kind '(:constant :global))) ; as above
+               `(setq ,symbol value)
+               (give-up-ir1-transform)))))
+  (deftransform set-symbol-global-value ((symbol value) ((constant-arg symbol) *))
+    (xform symbol :global))
+  (deftransform set ((symbol value) ((constant-arg symbol) *))
+    (xform symbol :special)))
+
+(deftransforms (prin1-to-string princ-to-string) ((object) (number))
+  `(stringify-object object))

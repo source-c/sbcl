@@ -32,12 +32,12 @@
   (princ (if (and (eq width :byte)
                   (<= 4 value 7)
                   (not (dstate-get-inst-prop dstate +rex+)))
-             (aref *high-byte-reg-names* (- value 4))
+             (aref #("AH" "CH" "DH" "BH") (- value 4))
              (aref (ecase width
-                     (:byte *byte-reg-names*)
-                     (:word *word-reg-names*)
-                     (:dword *dword-reg-names*)
-                     (:qword *qword-reg-names*))
+                     (:byte sb!vm::+byte-register-names+)
+                     (:word sb!vm::+word-register-names+)
+                     (:dword sb!vm::+dword-register-names+)
+                     (:qword sb!vm::+qword-register-names+))
                    value))
          stream)
   ;; XXX plus should do some source-var notes
@@ -121,13 +121,15 @@
       (print-mem-ref :ref value nil stream dstate)))
 
 (defun print-imm/asm-routine (value stream dstate)
-  (maybe-note-assembler-routine value nil dstate)
-  (maybe-note-static-symbol value dstate)
-  (princ value stream))
+  (if (or #!+immobile-space (maybe-note-lisp-callee value dstate)
+          (maybe-note-assembler-routine value nil dstate)
+          (maybe-note-static-symbol value dstate))
+      (princ16 value stream)
+      (princ value stream)))
 
 ;;; Return either a MACHINE-EA or a register (a fixnum).
-;;; VALUE is a list of the mod and r/m fields of the instruction's ModRM byte.
-;;; Depending on VALUE, a SIB byte and/or displacement may be read.
+;;; MOD and R/M are the extracted bits from the instruction's ModRM byte.
+;;; Depending on MOD and R/M, a SIB byte and/or displacement may be read.
 ;;; The REX.B and REX.X from dstate are appropriately consumed.
 (defun prefilter-reg/mem (dstate mod r/m)
   (declare (type disassem-state dstate)
@@ -166,6 +168,27 @@
             ;; rex.b is not decoded in determining RIP-relative mode
             ((= r/m #b101) (make-machine-ea :rip (read-signed-suffix 32 dstate)))
             (t (make-machine-ea full-reg))))))
+
+#!+sb-thread
+(defun static-symbol-from-tls-index (index)
+  (dovector (sym +static-symbols+)
+    (when (= (symbol-tls-index sym) index)
+      (return sym))))
+
+;;; Return contents of memory if either it refers to an unboxed code constant
+;;; or is RIP-relative with a displacement of 0.
+(defun unboxed-constant-ref (dstate segment-offset addr disp)
+  (or  (and (eql disp 0)
+            ;; Assume this is safe to read, since we're disassembling
+            ;; from the memory just a few bytes preceding 'addr'.
+            (sap-ref-word (int-sap addr) 0))
+       (let* ((seg (dstate-segment dstate))
+              (code-offset
+               (sb!disassem::segment-offs-to-code-offs segment-offset seg))
+              (unboxed-range (sb!disassem::seg-unboxed-data-range seg)))
+         (or (and unboxed-range
+                  (<= (car unboxed-range) code-offset (cdr unboxed-range))
+                  (sap-ref-word (dstate-segment-sap dstate) segment-offset))))))
 
 ;;; Prints a memory reference to STREAM. VALUE is a list of
 ;;; (BASE-REG OFFSET INDEX-REG INDEX-SCALE), where any component may be
@@ -214,24 +237,7 @@
       (unless (or firstp (minusp disp))
         (write-char #\+ stream))
       (cond ((eq (machine-ea-base value) :rip)
-             (princ disp stream)
-             (unless (eq mode :compute)
-               (let ((addr (+ disp (dstate-next-addr dstate))))
-                 ;; The origin is zero when disassembling into a trace-file.
-                 ;; Don't crash on account of it.
-                 (when (plusp addr)
-                   (or (nth-value
-                        1 (note-code-constant-absolute addr dstate width))
-                       (maybe-note-assembler-routine addr nil dstate)
-                       ;; Show the absolute address and maybe the contents.
-                       (note (format nil "[#x~x]~@[ = ~x~]"
-                                     addr
-                                     (case width
-                                       (:qword
-                                        (unboxed-constant-ref
-                                         dstate
-                                         (+ (dstate-next-offs dstate) disp)))))
-                             dstate))))))
+             (princ disp stream))
             (firstp
                (princ16 disp stream)
                (or (minusp disp)
@@ -244,6 +250,25 @@
             (t
              (princ disp stream))))
     (write-char #\] stream)
+    (when (and (eq (machine-ea-base value) :rip) (neq mode :compute))
+      ;; Always try to print the EA as a note
+      (let ((addr (+ disp (dstate-next-addr dstate))))
+        ;; The origin is zero when disassembling into a trace-file.
+        ;; Don't crash on account of it.
+        (when (plusp addr)
+          (or (nth-value
+               1 (note-code-constant-absolute addr dstate width))
+              (maybe-note-assembler-routine addr nil dstate)
+              ;; Show the absolute address and maybe the contents.
+              (note (format nil "[#x~x]~@[ = #x~x~]"
+                            addr
+                            (case width
+                              (:qword
+                               (unboxed-constant-ref
+                                dstate
+                                (+ (dstate-next-offs dstate) disp)
+                                addr disp))))
+                    dstate)))))
     #!+sb-thread
     (when (and (eql base-reg #.(ash (tn-offset sb!vm::thread-base-tn) -1))
                (not index-reg) ; no index
@@ -252,13 +277,19 @@
       ;; Try to reverse-engineer which thread-local binding this is
       (let* ((code (seg-code (dstate-segment dstate)))
              (header-n-words (code-header-words code))
-             (tls-index (ash disp (- n-fixnum-tag-bits))))
-        (loop for word-num from code-constants-offset below header-n-words
-              for obj = (code-header-ref code word-num)
-              when (and (symbolp obj) (= (symbol-tls-index obj) tls-index))
-              do (return-from print-mem-ref
-                   (note (lambda (stream) (format stream "tls: ~S" obj))
-                         dstate))))
+             (tls-index (ash disp (- n-fixnum-tag-bits)))
+             (symbol
+              (or (loop for word-num from code-constants-offset below header-n-words
+                        for obj = (code-header-ref code word-num)
+                        when (and (symbolp obj) (= (symbol-tls-index obj) tls-index))
+                        do (return obj))
+                  ;; static symbols with known TLS index don't go in the code header,
+                  ;; but it'd be nice to guess at the symbol.
+                  (static-symbol-from-tls-index tls-index))))
+        (when symbol
+          (return-from print-mem-ref
+            (note (lambda (stream) (format stream "tls: ~S" symbol))
+                  dstate))))
       ;; Or maybe we're looking at the 'struct thread' itself
       (when (< disp max-interrupts)
         (let* ((thread-slots
@@ -317,17 +348,6 @@
     (when addr
       (note (lambda (s) (format s fmt addr)) dstate))))
 
-(defun unboxed-constant-ref (dstate segment-offset)
-  (let* ((seg (dstate-segment dstate))
-         (code-offset
-          (sb!disassem::segment-offs-to-code-offs segment-offset seg))
-         (unboxed-range (sb!disassem::seg-unboxed-data-range seg)))
-    (and unboxed-range
-         (<= (car unboxed-range) code-offset (cdr unboxed-range))
-         (sap-ref-int (dstate-segment-sap dstate)
-                      segment-offset n-word-bytes
-                      (dstate-byte-order dstate)))))
-
 ;;;; interrupt instructions
 
 (defun break-control (chunk inst stream dstate)
@@ -359,6 +379,7 @@
 ;;;;
 
 #!+immobile-code
+(progn
 (defun sb!vm::collect-immobile-code-relocs ()
   (let ((code-components
          (make-array 20000 :element-type '(unsigned-byte 32)
@@ -382,8 +403,7 @@
                 (when (and (or (eq inst jmp-inst)
                                (eq inst call-inst))
                            (funcall predicate
-                                    (+ (sb!disassem::sign-extend
-                                        (ldb (byte 32 8) dchunk) 32)
+                                    (+ (near-jump-displacement dchunk dstate)
                                        (dstate-next-addr dstate))))
                   (vector-push-extend (dstate-cur-addr dstate) relocs)))
               seg dstate nil))
@@ -392,18 +412,13 @@
                (vector-push-extend (get-lisp-obj-address code) code-components)
                (vector-push-extend start-relocs-index code-components))))
 
-      ;; Assembler routines are in read-only space, and they can have
-      ;; relative jumps to immobile space.
+      ;; Assembler routines contain jumps to immobile code.
       ;; Since these code components do not contain simple-funs,
       ;; we have to group the routines by looking at addresses.
       (let ((asm-routines
-             (mapcar #'cdr (%hash-table-alist sb!fasl:*assembler-routines*)))
-            code-components)
-        (sb!vm::map-allocated-objects (lambda (obj type size)
-                                        (declare (ignore type size))
-                                        (push obj code-components))
-                                      :read-only)
-        (dolist (code (nreverse code-components))
+             (loop for addr being each hash-value of sb!fasl:*assembler-routines*
+                   collect addr)))
+        (dovector (code sb!fasl::*assembler-objects*)
           (let* ((text-origin (sap-int (code-instructions code)))
                  (text-end (+ text-origin (%code-code-size code)))
                  (relocs-index (fill-pointer relocs)))
@@ -411,9 +426,7 @@
                     (scan-function (car list)
                                    (if (cdr list) (cadr list) text-end)
                                    ;; Look for transfers into immobile code
-                                   (lambda (jmp-targ-addr)
-                                     (<= sb!vm:immobile-space-start
-                                         jmp-targ-addr sb!vm:immobile-space-end))))
+                                   #'immobile-space-addr-p))
                   (sort (remove-if-not (lambda (address)
                                          (<= text-origin address text-end))
                                        asm-routines) #'<))
@@ -446,3 +459,127 @@
     (vector-push-extend 0 code-components)
     (vector-push-extend (fill-pointer relocs) code-components)
     (values code-components relocs)))
+
+(defmacro do-immobile-functions ((code-var fun-var addr-var &key (if t)) &body body)
+  ;; Loop over all code objects
+  `(let* ((call (find-inst #xE8 (get-inst-space)))
+          (jmp  (find-inst #xE9 (get-inst-space)))
+          (dstate (make-dstate))
+          (sap (int-sap 0))
+          (seg (sb!disassem::%make-segment :sap-maker (lambda () sap))))
+     (sb!vm::map-objects-in-range
+      (lambda (,code-var obj-type obj-size)
+        (declare (ignore obj-size))
+        (when (and (= obj-type code-header-widetag) ,if)
+          ;; Loop over all embedded functions
+          (dotimes (fun-index (code-n-entries ,code-var))
+            (let* ((,fun-var (%code-entry-point ,code-var fun-index))
+                   (,addr-var (+ (get-lisp-obj-address ,fun-var)
+                                 (- fun-pointer-lowtag)
+                                 (ash simple-fun-code-offset word-shift))))
+              (with-pinned-objects (sap) ; Mutate SAP to point to fun
+                (setf (sap-ref-word (int-sap (get-lisp-obj-address sap))
+                                    (- n-word-bytes other-pointer-lowtag))
+                      ,addr-var))
+              (setf (seg-virtual-location seg) ,addr-var
+                    (seg-length seg)
+                    (- (let ((next (%code-entry-point ,code-var (1+ fun-index))))
+                         (if next
+                             (- (get-lisp-obj-address next) fun-pointer-lowtag)
+                             (+ (sap-int (code-instructions ,code-var))
+                                (%code-code-size ,code-var))))
+                       ,addr-var))
+              ,@body))))
+      ;; Slowness here is bothersome, especially for SB!VM::REMOVE-STATIC-LINKS,
+      ;; so skip right over all fixedobj pages.
+      (ash (+ immobile-space-start immobile-fixedobj-subspace-size)
+           (- n-fixnum-tag-bits))
+      (%make-lisp-obj (sap-int *immobile-space-free-pointer*)))))
+
+(defun sb!vm::statically-link-core (&key callers exclude-callers
+                                         callees exclude-callees
+                                         verbose)
+  (flet ((match-p (name include exclude)
+           (and (not (member name exclude :test 'equal))
+                (or (not include) (member name include :test 'equal)))))
+    (do-immobile-functions (code fun addr)
+      (when (match-p (%simple-fun-name fun) callers exclude-callers)
+        (let ((printed-fun-name nil))
+          ;; Loop over function's assembly code
+          (map-segment-instructions
+           (lambda (chunk inst)
+             (when (or (eq inst jmp) (eq inst call))
+               (let ((fdefn (sb!vm::find-called-object
+                             (+ (near-jump-displacement chunk dstate)
+                                (dstate-next-addr dstate)))))
+                 (when (and (fdefn-p fdefn)
+                            (let ((callee (fdefn-fun fdefn)))
+                              (and (immobile-space-obj-p callee)
+                                   (not (sb!vm::fun-requires-simplifying-trampoline-p callee))
+                                   (match-p (%fun-name callee)
+                                            callees exclude-callees))))
+                   (let ((entry (sb!vm::fdefn-call-target fdefn)))
+                     (when verbose
+                       (let ((*print-pretty* nil))
+                         (unless printed-fun-name
+                           (format t "#x~X ~S~%" (get-lisp-obj-address fun) fun)
+                           (setq printed-fun-name t))
+                         (format t "  @~x -> ~s [~x]~%"
+                                 (dstate-cur-addr dstate) (fdefn-name fdefn) entry)))
+                     ;; Set the statically-linked flag
+                     (setf (sb!vm::fdefn-has-static-callers fdefn) 1)
+                     ;; Change the machine instruction
+                     (setf (signed-sap-ref-32 (int-sap (dstate-cur-addr dstate)) 1)
+                           (- entry (dstate-next-addr dstate))))))))
+           seg dstate))))))
+
+;;; While concurrent use of un-statically-link is unlikely, misuse could easily
+;;; cause heap corruption. It's preventable by ensuring that this is atomic
+;;; with respect to GC and other code attempting to change the same fdefn.
+;;; The issue is that if the fdefn loses the pointer to the underlying code
+;;; via (setf fdefn-fun) before we were done removing the static links,
+;;; then there could be no remaining pointers visible to GC.
+;;; The only way to detect the current set of references is to find uses of the
+;;; current jump address, which means we need to fix them *all* before anyone
+;;; else gets an opportunity to change the fdefn-fun of this same fdefn again.
+(defglobal *static-linker-lock* (sb!thread:make-mutex :name "static linker"))
+(defun sb!vm::remove-static-links (fdefn)
+  ; (warn "undoing static linkage of ~S" (fdefn-name fdefn))
+  (sb!thread::with-system-mutex (*static-linker-lock* :without-gcing t)
+    ;; If the jump is to FUN-ENTRY, change it back to FDEFN-ENTRY
+    (let ((fun-entry (sb!vm::fdefn-call-target fdefn))
+          (fdefn-entry (+ (get-lisp-obj-address fdefn)
+                          (ash fdefn-raw-addr-slot word-shift)
+                          (- other-pointer-lowtag))))
+      ;; Examine only those code components which potentially use FDEFN.
+      (do-immobile-functions
+         (code fun addr :if (loop for i downfrom (1- (sb!kernel:code-header-words code))
+                                  to sb!vm:code-constants-offset
+                                  thereis (eq (sb!kernel:code-header-ref code i)
+                                              fdefn)))
+        (map-segment-instructions
+         (lambda (chunk inst)
+           (when (or (eq inst jmp) (eq inst call))
+             ;; TRULY-THE because near-jump-displacement isn't a known fun.
+             (let ((disp (truly-the (signed-byte 32)
+                                    (near-jump-displacement chunk dstate))))
+               (when (= fun-entry (+ disp (dstate-next-addr dstate)))
+                 (let ((new-disp
+                        (the (signed-byte 32)
+                             (- fdefn-entry (dstate-next-addr dstate)))))
+                   ;; CMPXCHG is atomic even when misaligned, and x86-64 promises
+                   ;; that self-modifying code works correctly, so the fetcher
+                   ;; should never see a torn write.
+                   (%primitive sb!vm::signed-sap-cas-32
+                               (int-sap (dstate-cur-addr dstate))
+                               1 disp new-disp))))))
+         seg dstate)))
+    (setf (sb!vm::fdefn-has-static-callers fdefn) 0))) ; Clear static link flag
+
+(defun sb!disassem::compute-extra-asm-routines (hash)
+  (setf (gethash (+ (gethash 'sb!vm::alloc-tramp sb!fasl:*assembler-routines*)
+                    sb!vm:linkage-table-entry-size)
+                 hash)
+        'sb!vm::alloc-to-r11))
+
+) ; end PROGN

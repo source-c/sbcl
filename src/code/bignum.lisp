@@ -107,9 +107,6 @@
 
 (defconstant digit-size sb!vm:n-word-bits)
 
-(defconstant maximum-bignum-length (1- (ash 1 (- sb!vm:n-word-bits
-                                                 sb!vm:n-widetag-bits))))
-
 (defconstant all-ones-digit (1- (ash 1 sb!vm:n-word-bits)))
 
 ;;;; internal inline routines
@@ -496,7 +493,6 @@
                     (%bignum-set ,n-dest ,i1 (%bignum-ref ,n-src ,i2))))))))))
 
 (sb!xc:defmacro with-bignum-buffers (specs &body body)
-  #!+sb-doc
   "WITH-BIGNUM-BUFFERS ({(var size [init])}*) Form*"
   (sb!int:collect ((binds)
                    (inits))
@@ -1072,7 +1068,7 @@
     (multiple-value-bind (digits n-bits) (truncate x digit-size)
       (let* ((bignum-len (or bignum-len (%bignum-length bignum)))
              (res-len (+ digits bignum-len 1)))
-        (when (> res-len maximum-bignum-length)
+        (when (> res-len sb!kernel::maximum-bignum-length)
           (error "can't represent result of left shift"))
         (if (zerop n-bits)
           (bignum-ashift-left-digits bignum bignum-len digits)

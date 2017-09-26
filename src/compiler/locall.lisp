@@ -37,7 +37,8 @@
   (loop with policy = (lexenv-policy (node-lexenv call))
         for args on (basic-combination-args call)
         and var in (lambda-vars fun)
-        do (assert-lvar-type (car args) (leaf-type var) policy)
+        do (assert-lvar-type (car args) (leaf-type var) policy
+                             (cons :bind (lambda-var-%source-name var)))
         do (unless (leaf-refs var)
              (flush-dest (car args))
              (setf (car args) nil)))
@@ -539,9 +540,10 @@
                         default-name))))
 
 (defun warn-invalid-local-call (node count &rest warn-arguments)
+  (declare (notinline warn)) ; See COMPILER-WARN for rationale
   (aver (combination-p node))
   (aver (typep count 'unsigned-byte))
-  (apply 'warn warn-arguments)
+  (apply 'warn warn-arguments) ; XXX: Should this be COMPILER-WARN?
   (transform-call-with-ir1-environment
    node
    `(lambda (&rest args)
@@ -728,7 +730,7 @@
            call
            `(lambda (&rest args)
               (declare (ignore args))
-              (%unknown-key-arg-error ',(car loser)))
+              (%unknown-key-arg-error ',(car loser) nil))
            '%unknown-key-arg-error)
           (return-from convert-more-call)))
 
@@ -1251,7 +1253,7 @@
   (declare (type cblock block1 block2))
   (or (eq block1 block2)
       (let ((cleanup2 (block-start-cleanup block2)))
-        (do-nested-cleanups (cleanup block1 t)
+        (do-nested-cleanups (cleanup (block-end-lexenv block1) t)
           (when (eq cleanup cleanup2)
             (return t))
           (case (cleanup-kind cleanup)

@@ -69,12 +69,12 @@
     #.(- 62 (floor (log sb!xc:internal-time-units-per-second 2)))))
 
 (sb!xc:deftype bignum-element-type () 'sb!vm:word)
-;;; FIXME: see also DEFCONSTANT MAXIMUM-BIGNUM-LENGTH in
-;;; src/code/bignum.lisp.  -- CSR, 2004-07-19
-(sb!xc:deftype bignum-index ()
-  '(mod #.(1- (ash 1 (- sb!vm:n-word-bits sb!vm:n-widetag-bits)))))
-(sb!xc:deftype bignum-length ()
-  '(unsigned-byte #.(- sb!vm:n-word-bits sb!vm:n-widetag-bits)))
+(def!constant maximum-bignum-length
+  ;; Compute number of bits in the maximum length's representation
+  ;; leaving one bit for a GC mark bit.
+  (ldb (byte (- sb!vm:n-word-bits sb!vm:n-widetag-bits 1) 0) -1))
+(sb!xc:deftype bignum-index () `(mod ,maximum-bignum-length))
+(sb!xc:deftype bignum-length () `(mod ,(1+ maximum-bignum-length)))
 
 ;;; an index into an integer
 (sb!xc:deftype bit-index ()
@@ -125,7 +125,6 @@
          (return stype)))))
 
 (defun sb!xc:upgraded-array-element-type (spec &optional environment)
-  #!+sb-doc
   "Return the element type that will actually be used to implement an array
    with the specifier :ELEMENT-TYPE Spec."
   (declare (type lexenv-designator environment) (ignore environment))
@@ -139,7 +138,6 @@
            (type-specifier (%upgraded-array-element-type type))))))
 
 (defun sb!xc:upgraded-complex-part-type (spec &optional environment)
-  #!+sb-doc
   "Return the element type of the most specialized COMPLEX number type that
    can hold parts of type SPEC."
   (declare (type lexenv-designator environment) (ignore environment))
@@ -337,13 +335,13 @@
                                       (list (sb!vm:saetp-typecode saetp)))))))))
                ((classoid-p x)
                 (case (classoid-name x)
-                  (symbol sb!vm:symbol-header-widetag) ; plus a hack for nil
+                  (symbol sb!vm:symbol-widetag) ; plus a hack for nil
                   (system-area-pointer sb!vm:sap-widetag))))))
         (cond ((not adjunct) (push x remainder))
               ((listp adjunct) (setq widetags (nconc adjunct widetags)))
               (t (push adjunct widetags)))))
     (let ((remainder (nreverse remainder)))
-      (when (member sb!vm:symbol-header-widetag widetags)
+      (when (member sb!vm:symbol-widetag widetags)
         ;; If symbol is the only widetag-testable type, it's better
         ;; to just use symbolp. e.g. (OR SYMBOL CHARACTER) should not
         ;; become (OR (%OTHER-POINTER-SUBTYPE-P ...)

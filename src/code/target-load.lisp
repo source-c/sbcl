@@ -14,15 +14,12 @@
 (in-package "SB!FASL")
 
 (defvar *load-source-default-type* "lisp"
-  #!+sb-doc
   "The source file types which LOAD looks for by default.")
 
 (declaim (type (or pathname null) *load-truename* *load-pathname*))
 (defvar *load-truename* nil
-  #!+sb-doc
   "the TRUENAME of the file that LOAD is currently loading")
 (defvar *load-pathname* nil
-  #!+sb-doc
   "the defaulted pathname that LOAD is currently loading")
 
 ;;;; LOAD-AS-SOURCE
@@ -108,19 +105,7 @@
 ;; LOADing a non-compiled file. Check whether this bug exists in SBCL
 ;; and fix it if so.
 
-(defun load (pathspec &key (verbose *load-verbose*) (print *load-print*)
-             (if-does-not-exist t) (external-format :default))
-  #!+sb-doc
-  "Load the file given by FILESPEC into the Lisp environment, returning
-   T on success."
-  (flet ((load-stream (stream faslp)
-           (when (and (fd-stream-p stream)
-                      (eq (sb!impl::fd-stream-fd-type stream) :directory))
-             (error 'simple-file-error
-                    :pathname (pathname stream)
-                    :format-control
-                    "Can't LOAD a directory: ~s."
-                    :format-arguments (list (pathname stream))))
+(defun call-with-load-bindings (function stream)
            (let* (;; Bindings required by ANSI.
                   (*readtable* *readtable*)
                   (*package* (sane-package))
@@ -138,6 +123,23 @@
                                        (file-error () nil))))
                   ;; Bindings used internally.
                   (*load-depth* (1+ *load-depth*))
+                  )
+             (funcall function)))
+
+(defun load (pathspec &key (verbose *load-verbose*) (print *load-print*)
+             (if-does-not-exist t) (external-format :default))
+  "Load the file given by FILESPEC into the Lisp environment, returning
+   T on success."
+  (flet ((load-stream (stream faslp)
+           (when (and (fd-stream-p stream)
+                      (eq (sb!impl::fd-stream-fd-type stream) :directory))
+             (error 'simple-file-error
+                    :pathname (pathname stream)
+                    :format-control
+                    "Can't LOAD a directory: ~s."
+                    :format-arguments (list (pathname stream))))
+           (dx-flet ((thunk ()
+                       (let (
                   ;; KLUDGE: I can't find in the ANSI spec where it says
                   ;; that DECLAIM/PROCLAIM of optimization policy should
                   ;; have file scope. CMU CL did this, and it seems
@@ -146,19 +148,18 @@
                   ;; scope, and I can't find anything under PROCLAIM or
                   ;; COMPILE-FILE or LOAD or OPTIMIZE which justifies this
                   ;; behavior. Hmm. -- WHN 2001-04-06
-                  (sb!c::*policy* sb!c::*policy*))
-             (return-from load
-               (if faslp
-                   (prog1 (load-as-fasl stream verbose print)
-                     ;; Try to ameliorate immobile heap fragmentation
-                     ;; in case somehow nontoplevel code is garbage.
-                     #!+immobile-code (gc))
-                   (sb!c:with-compiler-error-resignalling
-                     (load-as-source stream :verbose verbose
-                                            :print print)))))))
+                             (sb!c::*policy* sb!c::*policy*))
+                         (if faslp
+                             (load-as-fasl stream verbose print)
+                             (sb!c:with-compiler-error-resignalling
+                                 (load-as-source stream :verbose verbose
+                                                        :print print))))))
+             (call-with-load-bindings #'thunk stream))))
+
     ;; Case 1: stream.
     (when (streamp pathspec)
       (return-from load (load-stream pathspec (fasl-header-p pathspec))))
+
     (let ((pathname (pathname pathspec)))
       ;; Case 2: Open as binary, try to process as a fasl.
       (with-open-stream
@@ -188,6 +189,7 @@
           (when (and (or should-be-fasl-p (not (eql 0 (file-length stream))))
                      (fasl-header-p stream :errorp should-be-fasl-p))
             (return-from load (load-stream stream t)))))
+
       ;; Case 3: Open using the given external format, process as source.
       (with-open-file (stream pathname :external-format external-format
                               :class 'form-tracking-stream)
@@ -267,6 +269,7 @@
 (defvar *!initial-assembler-routines*)
 
 (defun !loader-cold-init ()
-  (/show0 "/!loader-cold-init")
-  (dolist (routine *!initial-assembler-routines*)
-    (setf (gethash (car routine) *assembler-routines*) (cdr routine))))
+  (dovector (routine *!initial-assembler-routines*)
+    (destructuring-bind (name code offset) routine
+      (setf (gethash name *assembler-routines*)
+            (sap-int (sap+ (code-instructions code) offset))))))

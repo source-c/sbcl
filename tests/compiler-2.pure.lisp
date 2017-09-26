@@ -137,3 +137,120 @@
     (try x "X")
     ;; For this I'd accept either Z or X in the message.
     (try (progn (let ((z x)) (identity z))) "X")))
+
+(with-test (:name :princ-to-string-unflushable)
+  ;; Ordinary we'll flush it
+  (let ((f (compile nil '(lambda (x) (princ-to-string x) x))))
+    (assert (not (ctu:find-named-callees f :name 'princ-to-string))))
+  ;; But in high safety it should be called for effect
+  (let ((f (compile nil '(lambda (x)
+                           (declare (optimize safety)) (princ-to-string x) x))))
+    (assert (ctu:find-named-callees f :name 'princ-to-string))))
+
+(with-test (:name :space-bounds-no-consing
+                  :skipped-on :interpreter)
+  ;; Asking for the size of a heap space should not cost anything!
+  (ctu:assert-no-consing (sb-vm::%space-bounds :static))
+  (ctu:assert-no-consing (sb-vm::space-bytes :static)))
+
+(with-test (:name :map-allocated-objects-no-consing
+                  :skipped-on :interpreter
+                  :fails-on :ppc)
+  (let ((n 0))
+    (sb-int:dx-flet ((f (obj type size)
+                       (declare (ignore obj type size))
+                       (incf n)))
+      (ctu:assert-no-consing
+       (sb-vm::map-allocated-objects #'f :dynamic)
+       5))))
+
+(with-test (:name :pack-varints-as-bignum)
+  (dotimes (i 500) ; do some random testing this many times
+    (let* ((random-numbers (loop repeat (+ (random 20) 3)
+                                 collect (1+ (random 4000))))
+           (test-list (sort (delete-duplicates random-numbers) #'<))
+           (packed-int (sb-c::pack-code-fixup-locs test-list))
+           (result (make-array 1 :element-type 'sb-ext:word)))
+      ;; The packer intrinsically self-checks the packing
+      ;; so we don't need to assert anything about that.
+      (sb-sys:with-pinned-objects (packed-int result)
+        ;; Now exercise the C unpacker.
+        ;; This hack of allocating 4 longs is terrible, but whatever.
+        (let ((unpacker (make-alien long 4))
+              (prev-loc 0))
+          (alien-funcall (extern-alien "varint_unpacker_init"
+                                       (function void (* long) unsigned))
+                         unpacker
+                         (sb-kernel:get-lisp-obj-address packed-int))
+          (sb-int:collect ((unpacked))
+            (loop
+             (let ((status
+                    (alien-funcall
+                     (extern-alien "varint_unpack"
+                                   (function int (* long) system-area-pointer))
+                     unpacker (sb-sys:vector-sap result))))
+               (let ((val (aref result 0)))
+                 ;; status of 0 is EOF, val = 0 means a decoded value was 0,
+                 ;; which can't happen, so it's effectively EOF.
+                 (when (or (eql status 0) (eql val 0)) (return))
+                 (let ((loc (+ prev-loc val)))
+                   (unpacked loc)
+                   (setq prev-loc loc)))))
+            (assert (equal (unpacked) test-list))))))))
+
+(with-test (:name :symbol-value-quoted-constant)
+  (let ((f (compile nil '(lambda () (symbol-value 'char-code-limit)))))
+    (assert (not (ctu:find-code-constants f :type 'symbol))))
+  (let ((f (compile nil '(lambda () (symbol-global-value 'char-code-limit)))))
+    (assert (not (ctu:find-code-constants f :type 'symbol)))))
+
+(with-test (:name :set-symbol-value-of-defglobal)
+  (let ((s 'sb-c::*recognized-declarations*))
+    (assert (eq (sb-int:info :variable :kind s) :global)) ; verify precondition
+    (let ((f (compile nil `(lambda () (setf (symbol-value ',s) nil)))))
+      ;; Should not have a call to SET-SYMBOL-GLOBAL-VALUE>
+      (assert (not (ctu:find-code-constants f :type 'sb-kernel:fdefn))))))
+
+(with-test (:name :layout-constants
+                  :skipped-on '(not (and :x86-64 :immobile-space)))
+  (let ((addr-of-pathname-layout
+         (write-to-string
+          (sb-kernel:get-lisp-obj-address (sb-kernel:find-layout 'pathname))
+          :base 16 :radix t))
+        (count 0))
+    ;; The constant should appear in two CMP instructions
+    (dolist (line (split-string
+                   (with-output-to-string (s)
+                     (let ((sb-disassem:*disassem-location-column-width* 0))
+                       (disassemble 'pathnamep :stream s)))
+                   #\newline))
+      (when (and (search "CMP" line) (search addr-of-pathname-layout line))
+        (incf count)))
+    (assert (= count 2))))
+
+(with-test (:name :set-symbol-value-imm :skipped-on '(not :x86-64))
+  (let (success)
+    (dolist (line (split-string
+                   (with-output-to-string (s)
+                     (let ((sb-disassem:*disassem-location-column-width* 0))
+                       (disassemble '(lambda () (setq *print-base* 8)) :stream s)))
+                   #\newline))
+      (when (and #+sb-thread (search "MOV QWORD PTR [R" line)
+                 #-sb-thread (search "MOV QWORD PTR [" line)
+                 (search (format nil ", ~D" (ash 8 sb-vm:n-fixnum-tag-bits)) line))
+        (setq success t)))
+    (assert success)))
+
+(with-test (:name :linkage-table-bogosity :skipped-on '(not :sb-dynamic-core))
+  (let ((strings (map 'list (lambda (x) (if (consp x) (car x) x))
+                      #+sb-dynamic-core sb-vm::+required-foreign-symbols+
+                      #-sb-dynamic-core '())))
+    (assert (= (length (remove-duplicates strings :test 'string=))
+               (length strings)))))
+
+(with-test (:name :no-style-warning-for-inline-cl-fun)
+  (assert (not (nth-value
+                1 (compile nil '(lambda (x)
+                                 (declare (optimize (speed 3)) (inline length)
+                                          (muffle-conditions compiler-note))
+                                 (length x)))))))

@@ -840,3 +840,90 @@ if a restart was invoked."
                              (:lock t)))))
       (assert (equal (package-local-nicknames package2) `((,name3 . ,package1))))
       (assert (package-locked-p package2)))))
+
+;;; Now a possibly useless test on an essentially useless function.
+;;; But we may as well get it right - assert that GENTEMP returns
+;;; a symbol that definitely did not exist in the specified package
+;;; even if multiple threads are calling it simultaneously.
+
+;;; We'll create about 25000 symbols, and mark the ones that were returned
+;;; by GENTEMP. Because *GENTEMP-COUNTER* isn't synchronized, but INTERN is,
+;;; returning an indicator of whether it created a symbol, it's simple enough
+;;; to make GENTEMP not accidentally return a symbol created by someone else.
+
+;;; Use array of fixnums because there're no atomic ops on array of word.
+;;; This is either 58000 useful bits or 126000 bits depending on word size.
+(defglobal *scoreboard* (make-array 2000))
+(defglobal *testpkg* (make-package "A-NICE-PACKAGE"))
+
+(defun hammer-on-gentemp (package n-iter)
+  (dotimes (i n-iter)
+    (let ((index (parse-integer (string (gentemp "T" package)) :start 1)))
+      ;; Mark this index in the scoreboard, failing if already set.
+      (multiple-value-bind (elt-index bit-index)
+          (floor index sb-vm:n-positive-fixnum-bits)
+        (let ((old (svref *scoreboard* elt-index)))
+          (loop
+           (when (logbitp bit-index old) (return-from hammer-on-gentemp :fail))
+           (let ((actual-old
+                  (cas (svref *scoreboard* elt-index)
+                       old (logior old (ash 1 bit-index)))))
+             (if (eq old actual-old) (return))
+             (setq old actual-old))))))))
+
+;; This test would consistently fail when GENTEMP first called FIND-SYMBOL
+;; and then INTERN when FIND-SYMBOL said that it found no symbol.
+(with-test (:name (gentemp :threadsafety) :skipped-on '(not :sb-thread))
+  (let ((n-threads 5)
+        (n-iter 1000)
+        (threads))
+    (dotimes (i n-threads)
+      (push (sb-thread:make-thread #'hammer-on-gentemp
+                                   :arguments (list *testpkg* n-iter))
+            threads))
+    (let ((results (mapcar #'sb-thread:join-thread threads)))
+      (assert (not (find :fail results))))))
+
+;;; This test is a bit weak in that prior to the fix for what it tests,
+;;; it didn't fail often enough to convincingly show that there was a problem.
+;;; Nonetheless it did sometimes fail, and now should never fail.
+(with-test (:name :concurrent-intern-bad-published-symbol-package
+                  ;; No point in wasting time on concurrency bugs otherwise
+                  :skipped-on '(not :sb-thread))
+  ;; Confirm that the compiler does not know that KEYWORDICATE
+  ;; returns a KEYWORD (so the answer isn't constant-folded)
+  (assert (sb-kernel:type= (sb-int:info :function :type 'sb-int:keywordicate)
+                           (sb-kernel:find-classoid 'function)))
+  (let ((sema (sb-thread:make-semaphore))
+        (n-threads 10))
+    (dotimes (i 10) ; number of trials
+      (let ((threads))
+        (dotimes (i n-threads)
+          (push (make-join-thread
+                 (lambda ()
+                   (sb-thread:wait-on-semaphore sema)
+                   (keywordp (sb-int:keywordicate "BLUB"))))
+                threads))
+        (sb-thread:signal-semaphore sema n-threads)
+        (let ((count 0))
+          (dolist (thread threads)
+            (when (sb-thread:join-thread thread) (incf count)))
+          (unintern (sb-int:keywordicate "BLUB") "KEYWORD")
+          (assert (= count n-threads)))))))
+
+(with-test (:name :name-conflict-non-pretty-message)
+  (make-package "SILLYPACKAGE1")
+  (export (intern "ASILLYSYM" 'sillypackage1) 'sillypackage1)
+  (make-package "SILLYPACKAGE2")
+  (export (intern "ASILLYSYM" 'sillypackage2) 'sillypackage2)
+  (use-package 'sillypackage1)
+  (handler-case (use-package 'sillypackage2)
+    (name-conflict (c) ; No silly string in the result
+      (assert (not (search "symbols:SILLY"
+                           (write-to-string c :pretty nil :escape nil)))))
+    (condition () (error "Should not get here"))
+    (:no-error () (error "Should not get here"))))
+
+;; git revision f7d1550c0e16262f28213c9e3c048f42e3f0b476 broke find-all-symbols
+(with-test (:name :find-all-symbols)
+  (find-all-symbols "FIXNUM"))

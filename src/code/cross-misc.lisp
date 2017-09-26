@@ -49,6 +49,8 @@
            ,value)
        ,@doc)))
 
+(defmacro define-load-time-global (&rest args) `(defvar ,@args))
+
 ;;; The GENESIS function works with fasl code which would, in the
 ;;; target SBCL, work on ANSI-STREAMs (streams which aren't extended
 ;;; Gray streams). In ANSI Common Lisp, an ANSI-STREAM is just a
@@ -203,3 +205,12 @@
 ;;; hosts.  It doesn't really matter what this function does: we don't
 ;;; have FDEFN objects on the host anyway.
 (defun fdefn-p (x) (declare (ignore x)) nil)
+
+;;; Needed for constant-folding
+(defun system-area-pointer-p (x) x nil) ; nothing is a SAP
+;;; Needed for DEFINE-MOVE-FUN LOAD-SYSTEM-AREA-POINTER
+(defun sap-int (x) (error "can't take SAP-INT ~S" x))
+;;; Needed for FIXUP-CODE-OBJECT
+(defmacro without-gcing (&body body) `(progn ,@body))
+
+(defun logically-readonlyize (x) x)

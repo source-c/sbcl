@@ -31,7 +31,9 @@
   (:generator 1
     (storew value object offset lowtag)))
 
-(define-vop (init-slot set-slot))
+(define-vop (init-slot set-slot)
+  (:info name dx-p offset lowtag)
+  (:ignore name dx-p))
 
 ;;;; Symbol hacking VOPs:
 
@@ -54,7 +56,7 @@
 ;;; Symbol-Value of NIL is NIL.
 ;;;
 (define-vop (symbol-value checked-cell-ref)
-  (:translate symbol-value)
+  (:translate symeval)
   (:generator 9
     (move obj-temp object)
     (loadw value obj-temp symbol-value-slot other-pointer-lowtag)
@@ -80,7 +82,7 @@
 (define-vop (fast-symbol-value cell-ref)
   (:variant symbol-value-slot other-pointer-lowtag)
   (:policy :fast)
-  (:translate symbol-value))
+  (:translate symeval))
 
 (define-vop (symbol-hash)
   (:policy :fast-safe)
@@ -100,9 +102,9 @@
 ;;; On unithreaded builds these are just copies of the non-global versions.
 (define-vop (%set-symbol-global-value set))
 (define-vop (symbol-global-value symbol-value)
-  (:translate symbol-global-value))
+  (:translate sym-global-val))
 (define-vop (fast-symbol-global-value fast-symbol-value)
-  (:translate symbol-global-value))
+  (:translate sym-global-val))
 
 ;;;; Fdefinition (fdefn) objects.
 
@@ -138,7 +140,7 @@
         (emit-label closure-tramp-fixup)
         (inst word (make-fixup 'closure-tramp :assembly-routine)))
       (load-type type function (- fun-pointer-lowtag))
-      (inst cmp type simple-fun-header-widetag)
+      (inst cmp type simple-fun-widetag)
       (inst mov :eq lip function)
       (inst load-from-label :ne lip lip closure-tramp-fixup)
       (storew lip fdefn fdefn-raw-addr-slot other-pointer-lowtag)

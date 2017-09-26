@@ -255,7 +255,7 @@
                         ;; Many components have no escapes, so we
                         ;; allocate it lazily.
                         (setf *functional-escape-info*
-                              (make-hash-table))))
+                              (make-hash-table :test #'eq))))
              ((bool ok) (gethash functional table)))
     (if ok
         bool
@@ -264,26 +264,29 @@
           (setf (gethash functional table) nil)
           ;; Then compute the real value.
           (setf (gethash functional table)
-                (or
-                 ;; If the functional has a XEP, it's kind is :EXTERNAL --
-                 ;; which means it may escape. ...but if it
-                 ;; HAS-EXTERNAL-REFERENCES-P, then that XEP is actually a
-                 ;; TL-XEP, which means it's a toplevel function -- which in
-                 ;; turn means our search has bottomed out without an escape
-                 ;; path. AVER just to make sure, though.
-                 (and (eq :external (functional-kind functional))
-                      (if (functional-has-external-references-p functional)
-                          (aver (eq 'tl-xep (car (functional-debug-name functional))))
-                          t))
-                 ;; If it has an entry point that may escape, that just as bad.
-                 (and entry (functional-may-escape-p entry))
-                 ;; If it has references to it in functions that may escape, that's bad
-                 ;; too.
-                 (dolist (ref (functional-refs functional) nil)
-                   (binding* ((lvar (ref-lvar ref) :exit-if-null)
-                              (dest (lvar-dest lvar) :exit-if-null))
-                     (when (functional-may-escape-p (node-home-lambda dest))
-                       (return t))))))))))
+                (and
+                 ;; ESCAPE functionals would never escape from their target
+                 (neq (functional-kind functional) :escape)
+                 (or
+                  ;; If the functional has a XEP, it's kind is :EXTERNAL --
+                  ;; which means it may escape. ...but if it
+                  ;; HAS-EXTERNAL-REFERENCES-P, then that XEP is actually a
+                  ;; TL-XEP, which means it's a toplevel function -- which in
+                  ;; turn means our search has bottomed out without an escape
+                  ;; path. AVER just to make sure, though.
+                  (and (eq :external (functional-kind functional))
+                       (if (functional-has-external-references-p functional)
+                           (aver (eq 'tl-xep (car (functional-debug-name functional))))
+                           t))
+                  ;; If it has an entry point that may escape, that just as bad.
+                  (and entry (functional-may-escape-p entry))
+                  ;; If it has references to it in functions that may escape, that's bad
+                  ;; too.
+                  (dolist (ref (functional-refs functional) nil)
+                    (binding* ((lvar (ref-lvar ref) :exit-if-null)
+                               (dest (lvar-dest lvar) :exit-if-null))
+                      (when (functional-may-escape-p (node-home-lambda dest))
+                        (return t)))))))))))
 
 (defun exit-should-check-tag-p (exit)
   (declare (type exit exit))
@@ -420,51 +423,52 @@
 ;;;; final decision on stack allocation of dynamic-extent structures
 (defun recheck-dynamic-extent-lvars (component)
   (declare (type component component))
-  (dolist (lambda (component-lambdas component))
-    (loop for entry in (lambda-entries lambda)
-          for cleanup = (entry-cleanup entry)
-          do (when (eq (cleanup-kind cleanup) :dynamic-extent)
-               (collect ((real-dx-lvars))
-                 (loop for what in (cleanup-info cleanup)
-                       do (etypecase what
-                            (cons
-                             (let ((dx (car what))
-                                   (lvar (cdr what)))
-                               (cond ((lvar-good-for-dx-p lvar dx component)
-                                      ;; Since the above check does deep
-                                      ;; checks. we need to deal with the deep
-                                      ;; results in here as well.
-                                      (dolist (cell (handle-nested-dynamic-extent-lvars
-                                                     dx lvar component))
-                                        (let ((real (principal-lvar (cdr cell))))
-                                          (setf (lvar-dynamic-extent real) cleanup)
-                                          (real-dx-lvars real))))
-                                     (t
-                                      (note-no-stack-allocation lvar)
-                                      (setf (lvar-dynamic-extent lvar) nil)))))
-                            (node       ; DX closure
-                             (let* ((call what)
-                                    (arg (first (basic-combination-args call)))
-                                    (funs (lvar-value arg))
-                                    (dx nil))
-                               (dolist (fun funs)
-                                 (binding* ((() (leaf-dynamic-extent fun)
-                                             :exit-if-null)
-                                            (xep (functional-entry-fun fun)
-                                                 :exit-if-null)
-                                            (closure (physenv-closure
-                                                      (get-lambda-physenv xep))))
-                                   (cond (closure
-                                          (setq dx t))
-                                         (t
-                                          (setf (leaf-extent fun) nil)))))
-                               (when dx
-                                 (setf (lvar-dynamic-extent arg) cleanup)
-                                 (real-dx-lvars arg))))))
-                 (let ((real-dx-lvars (delete-duplicates (real-dx-lvars))))
-                   (setf (cleanup-info cleanup) real-dx-lvars)
-                   (setf (component-dx-lvars component)
-                         (append real-dx-lvars (component-dx-lvars component))))))))
+  (let (*dx-combination-p-check-local*) ;; catch unconverted combinations
+    (dolist (lambda (component-lambdas component))
+      (loop for entry in (lambda-entries lambda)
+            for cleanup = (entry-cleanup entry)
+            do (when (eq (cleanup-kind cleanup) :dynamic-extent)
+                 (collect ((real-dx-lvars))
+                   (loop for what in (cleanup-info cleanup)
+                         do (etypecase what
+                              (cons
+                               (let ((dx (car what))
+                                     (lvar (cdr what)))
+                                 (cond ((lvar-good-for-dx-p lvar dx component)
+                                        ;; Since the above check does deep
+                                        ;; checks. we need to deal with the deep
+                                        ;; results in here as well.
+                                        (dolist (cell (handle-nested-dynamic-extent-lvars
+                                                       dx lvar component))
+                                          (let ((real (principal-lvar (cdr cell))))
+                                            (setf (lvar-dynamic-extent real) cleanup)
+                                            (real-dx-lvars real))))
+                                       (t
+                                        (note-no-stack-allocation lvar)
+                                        (setf (lvar-dynamic-extent lvar) nil)))))
+                              (node     ; DX closure
+                               (let* ((call what)
+                                      (arg (first (basic-combination-args call)))
+                                      (funs (lvar-value arg))
+                                      (dx nil))
+                                 (dolist (fun funs)
+                                   (binding* ((() (leaf-dynamic-extent fun)
+                                               :exit-if-null)
+                                              (xep (functional-entry-fun fun)
+                                                   :exit-if-null)
+                                              (closure (physenv-closure
+                                                        (get-lambda-physenv xep))))
+                                     (cond (closure
+                                            (setq dx t))
+                                           (t
+                                            (setf (leaf-extent fun) nil)))))
+                                 (when dx
+                                   (setf (lvar-dynamic-extent arg) cleanup)
+                                   (real-dx-lvars arg))))))
+                   (let ((real-dx-lvars (delete-duplicates (real-dx-lvars))))
+                     (setf (cleanup-info cleanup) real-dx-lvars)
+                     (setf (component-dx-lvars component)
+                           (append real-dx-lvars (component-dx-lvars component)))))))))
   (values))
 
 ;;;; cleanup emission
@@ -490,7 +494,7 @@
   (collect ((code)
             (reanalyze-funs))
     (let ((cleanup2 (block-start-cleanup block2)))
-      (do-nested-cleanups (cleanup block1)
+      (do-nested-cleanups (cleanup (block-end-lexenv block1))
         (when (eq cleanup cleanup2)
           (return))
         (let* ((node (cleanup-mess-up cleanup))

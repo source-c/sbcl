@@ -31,7 +31,7 @@
 ;;;   because they're hard to express portably and because the LOAD
 ;;;   code might reasonably use READ-LINE to get the value to compare
 ;;;   against.
-(defparameter *fasl-header-string-start-string* "# FASL")
+(defglobal *fasl-header-string-start-string* "# FASL")
 
 (macrolet ((define-fasl-format-features ()
              (let (;; master value for *F-P-A-F-F*
@@ -46,7 +46,7 @@
                   ;; abstract, not of this particular SBCL executable,
                   ;; so any flag in this list may or may not be present
                   ;; in the *FEATURES* list of this particular build.
-                  (defparameter *features-potentially-affecting-fasl-format*
+                  (defglobal *features-potentially-affecting-fasl-format*
                     ',fpaff)
                   ;; a string representing flags of *F-P-A-F-F* which
                   ;; are in this particular build
@@ -57,7 +57,7 @@
                   ;; reading from fasl files, and because we don't
                   ;; need to do anything sophisticated with its
                   ;; logical structure, just test it for equality.)
-                  (defparameter *features-affecting-fasl-format*
+                  (defglobal *features-affecting-fasl-format*
                     ,(let ((*print-pretty* nil))
                        (prin1-to-string
                         (sort
@@ -127,20 +127,17 @@
 ;;;     with them. We can compare them with EQ.
 (declaim (type hash-table *assembler-routines*))
 (defglobal *assembler-routines* (make-hash-table :test 'eq))
+(defglobal *assembler-objects* nil)
 
 
 ;;;; the FOP database
-
-(declaim (simple-vector **fop-names** **fop-funs**))
-
-;;; a vector indexed by a FaslOP that yields the FOP's name
-(defglobal **fop-names** (make-array 256 :initial-element nil))
 
 ;;; a vector indexed by a FaslOP that yields a function which performs
 ;;; the operation. Most functions take 0 arguments - they only manipulate
 ;;; the fop stack. But if the fop is defined to receive an argument (or two)
 ;;; then loader's main loop is responsible for supplying it.
 (defglobal **fop-funs** (make-array 256 :initial-element 0))
+(declaim (simple-vector **fop-funs**))
 
 ;;; Two arrays indicate fop function signature.
 ;;; The first array indicates how many integer operands follow the opcode.
@@ -154,7 +151,6 @@
 ;;;; variables
 
 (defvar *load-depth* 0
-  #!+sb-doc
   "the current number of recursive LOADs")
 (declaim (type index *load-depth*))
 

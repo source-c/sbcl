@@ -35,11 +35,16 @@
 ;;; constructors only.
 #!+(or sb-eval sb-fasteval)
 (defun %make-structure-instance (dd slot-specs &rest slot-values)
-  (let ((instance (%make-instance (dd-length dd)))) ; length = sans header word
+  (let ((instance (%make-instance (dd-length dd))) ; length = sans header word
+        (value-index 0))
+    (declare (index value-index))
     (setf (%instance-layout instance) (dd-layout-or-lose dd))
-    (mapc (lambda (spec value)
-            (destructuring-bind (raw-type . index) (cdr spec)
-              (macrolet ((make-case ()
+    (dolist (spec slot-specs instance)
+      (destructuring-bind (kind raw-type . index) spec
+        (if (eq kind :unbound)
+            (setf (%instance-ref instance index)
+                  (sb!sys:%primitive make-unbound-marker))
+            (macrolet ((make-case ()
                            `(ecase raw-type
                               ((t)
                                (setf (%instance-ref instance index) value))
@@ -50,9 +55,9 @@
                                               instance index)
                                             value)))
                                  *raw-slot-data*))))
-                (make-case))))
-          slot-specs slot-values)
-    instance))
+                (let ((value (fast-&rest-nth value-index slot-values)))
+                  (incf value-index)
+                  (make-case))))))))
 
 (defun %instance-layout (instance)
   (%instance-layout instance))
@@ -89,7 +94,7 @@
 (defun %target-defstruct (dd)
   (declare (type defstruct-description dd))
 
-  #!+(and sb-show (host-feature sb-xc) (not win32))
+  #!+(and sb-show (host-feature sb-xc))
   (progn (write `(%target-defstruct ,(dd-name dd))) (terpri))
 
   (when (dd-doc dd)
@@ -98,8 +103,6 @@
 
   (let* ((classoid (find-classoid (dd-name dd)))
          (layout (classoid-layout classoid)))
-    (when (eq (dd-pure dd) t)
-      (setf (layout-pure layout) t))
     ;; Make a vector of EQUALP slots comparators, indexed by (- word-index data-start).
     ;; This has to be assigned to something regardless of whether there are
     ;; raw slots just in case someone mutates a layout which had raw
@@ -137,7 +140,6 @@
 
 ;;; Copy any old kind of structure.
 (defun copy-structure (structure)
-  #!+sb-doc
   "Return a copy of STRUCTURE with the same (EQL) slot values."
   (declare (type structure-object structure))
   (let ((layout (%instance-layout structure)))
@@ -199,7 +201,7 @@
         (pprint-newline :linear stream)
         (loop (pprint-pop)
               (let ((slot (pop remaining-slots)))
-                (output-symbol* (dsd-name slot) *keyword-package* stream)
+                (output-symbol (dsd-name slot) *keyword-package* stream)
                 (write-char #\space stream)
                 (pprint-newline :miser stream)
                 (output-object (funcall (access-fn slot) structure (dsd-index slot))
@@ -222,7 +224,7 @@
       (declare (type index index))
       (write-char #\space stream)
       (let ((slot (first remaining-slots)))
-        (output-symbol* (dsd-name slot) *keyword-package* stream)
+        (output-symbol (dsd-name slot) *keyword-package* stream)
         (write-char #\space stream)
         (output-object (funcall (access-fn slot) structure (dsd-index slot))
                        stream)))))

@@ -459,6 +459,8 @@
 
 ;;; SBCL-only special forms
 (define-walker-template truly-the (nil quote eval))
+(define-walker-template callable-cast (nil quote quote eval))
+(define-walker-template sb!kernel:the* (nil quote eval))
 ;;; FIXME: maybe we don't need this one any more, given that
 ;;; NAMED-LAMBDA now expands into (FUNCTION (NAMED-LAMBDA ...))?
 (define-walker-template named-lambda walk-named-lambda)
@@ -635,12 +637,6 @@
                (walk-form-internal (car form) :eval env)
                (walk-repeat-eval (cdr form) env))))
 
-(defun recons (x car cdr)
-  (if (or (not (eq (car x) car))
-          (not (eq (cdr x) cdr)))
-      (cons car cdr)
-      x))
-
 (defun relist (x &rest args)
   (if (null args)
       nil
@@ -760,7 +756,7 @@
       'no-init
       (cadr binding)))
 
-(defun let*-bindings (bindings &aux names inits (seen (make-hash-table)))
+(defun let*-bindings (bindings &aux names inits (seen (make-hash-table :test #'eq)))
   (dolist (binding (reverse bindings) (values names inits))
     (let ((name (let*-binding-name binding)))
       (push (cons name (gethash name seen)) names)

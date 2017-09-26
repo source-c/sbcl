@@ -32,11 +32,11 @@
              (flet ((coerce-it (array)
                       (!coerce-to-specialized array '(unsigned-byte 8)))
                     (file (name type)
-                      (merge-pathnames (make-pathname
-                                        :directory
-                                        '(:relative :up :up "output")
-                                        :name name :type type)
-                                       sb!xc:*compile-file-truename*))
+                      ;; FIXME: this fails on a certain build system,
+                      ;; as does the more obvious :directory '(:relative "output").
+                      ;; Why???
+                      (make-pathname :directory (pathname-directory (merge-pathnames "output/"))
+                                     :name name :type type))
                     (read-ub8-vector (pathname)
                       (with-open-file (stream pathname
                                               :element-type '(unsigned-byte 8))
@@ -195,7 +195,7 @@
                                           (incf index))
                                         (setf (gethash
                                                (apply #'pack-3-codepoints codepoints)
-                                               table) key)))
+                                               table) (logically-readonlyize key))))
                                 table))))
 
                     ,(with-open-file
@@ -284,7 +284,7 @@
   (frob))
 #+sb-xc-host (!character-name-database-cold-init)
 
-(defparameter *base-char-name-alist*
+(defglobal *base-char-name-alist*
   ;; Note: The *** markers here indicate character names which are
   ;; required by the ANSI specification of #'CHAR-NAME. For the others,
   ;; we prefer the ASCII standard name.
@@ -454,23 +454,19 @@
       (ldb (byte 4 0) digit))))
 
 (defun char-code (char)
-  #!+sb-doc
   "Return the integer code of CHAR."
   (char-code char))
 
 (defun char-int (char)
-  #!+sb-doc
   "Return the integer code of CHAR. (In SBCL this is the same as CHAR-CODE, as
 there are no character bits or fonts.)"
   (char-code char))
 
 (defun code-char (code)
-  #!+sb-doc
   "Return the character with the code CODE."
   (code-char code))
 
 (defun character (object)
-  #!+sb-doc
   "Coerce OBJECT into a CHARACTER if possible. Legal inputs are characters,
 strings and symbols of length 1."
   (flet ((do-error (control args)
@@ -494,7 +490,6 @@ strings and symbols of length 1."
       (t (do-error "~S cannot be coerced to a character." (list object))))))
 
 (defun char-name (char)
-  #!+sb-doc
   "Return the name (a STRING) for a CHARACTER object."
   (let ((char-code (char-code char)))
     (or (second (assoc char-code *base-char-name-alist*))
@@ -507,7 +502,6 @@ strings and symbols of length 1."
              (format nil "U~X" char-code)))))))
 
 (defun name-char (name)
-  #!+sb-doc
   "Given an argument acceptable to STRING, NAME-CHAR returns a character whose
 name is that string, if one exists. Otherwise, NIL is returned."
   (let ((char-code (car (rassoc-if (lambda (names)
@@ -540,7 +534,6 @@ name is that string, if one exists. Otherwise, NIL is returned."
 ;;;; predicates
 
 (defun standard-char-p (char)
-  #!+sb-doc
   "The argument must be a character object. STANDARD-CHAR-P returns T if the
 argument is a standard character -- one of the 95 ASCII printing characters or
 <return>."
@@ -550,13 +543,11 @@ argument is a standard character -- one of the 95 ASCII printing characters or
              (= n 10)))))
 
 (defun %standard-char-p (thing)
-  #!+sb-doc
   "Return T if and only if THING is a standard-char. Differs from
 STANDARD-CHAR-P in that THING doesn't have to be a character."
   (and (characterp thing) (standard-char-p thing)))
 
 (defun graphic-char-p (char)
-  #!+sb-doc
   "The argument must be a character object. GRAPHIC-CHAR-P returns T if the
 argument is a printing character (space through ~ in ASCII), otherwise returns
 NIL."
@@ -565,7 +556,6 @@ NIL."
         (< 159 n))))
 
 (defun alpha-char-p (char)
-  #!+sb-doc
   "The argument must be a character object. ALPHA-CHAR-P returns T if the
 argument is an alphabetic character, A-Z or a-z; otherwise NIL."
   (< (ucd-general-category char) 5))
@@ -593,7 +583,6 @@ argument is an alphabetic character, A-Z or a-z; otherwise NIL."
                    ,@body))))))))
 
 (defun both-case-p (char)
-  #!+sb-doc
   "The argument must be a character object. BOTH-CASE-P returns T if the
 argument is an alphabetic character and if the character exists in both upper
 and lower case. For ASCII, this is the same as ALPHA-CHAR-P."
@@ -601,7 +590,6 @@ and lower case. For ASCII, this is the same as ALPHA-CHAR-P."
     (plusp (aref cases index))))
 
 (defun upper-case-p (char)
-  #!+sb-doc
   "The argument must be a character object; UPPER-CASE-P returns T if the
 argument is an upper-case character, NIL otherwise."
   (with-case-info (char index cases)
@@ -609,7 +597,6 @@ argument is an upper-case character, NIL otherwise."
        (char-code char))))
 
 (defun lower-case-p (char)
-  #!+sb-doc
   "The argument must be a character object; LOWER-CASE-P returns T if the
 argument is a lower-case character, NIL otherwise."
   (with-case-info (char index cases)
@@ -617,7 +604,6 @@ argument is a lower-case character, NIL otherwise."
        (char-code char))))
 
 (defun char-upcase (char)
-  #!+sb-doc
   "Return CHAR converted to upper-case if that is possible. Don't convert
 lowercase eszet (U+DF)."
   (with-case-info (char index cases
@@ -628,7 +614,6 @@ lowercase eszet (U+DF)."
           (code-char code)))))
 
 (defun char-downcase (char)
-  #!+sb-doc
   "Return CHAR converted to lower-case if that is possible."
   (with-case-info (char index cases
                    :miss-value char)
@@ -638,7 +623,6 @@ lowercase eszet (U+DF)."
           (code-char code)))))
 
 (defun alphanumericp (char)
-  #!+sb-doc
   "Given a character-object argument, ALPHANUMERICP returns T if the argument
 is either numeric or alphabetic."
   (let ((gc (ucd-general-category char)))
@@ -718,9 +702,8 @@ is either numeric or alphabetic."
   (not (two-arg-char-equal c1 c2)))
 
 (macrolet ((def (name test doc)
-             (declare (ignorable doc))
              `(defun ,name (character &rest more-characters)
-                #!+sb-doc ,doc
+                ,doc
                 (if more-characters
                     (do ((c character (nth i more-characters))
                          (i 0 (1+ i)))
@@ -749,9 +732,8 @@ Case is ignored."))
   (>= (equal-char-code c1) (equal-char-code c2)))
 
 (macrolet ((def (op test doc &optional explicit-check)
-             (declare (ignorable doc))
              `(defun ,op (character &rest more-characters)
-                #!+sb-doc ,doc
+                ,doc
                 ,@(when explicit-check `((declare (explicit-check))))
                 (let ((c1 character))
                   (declare (character c1))
@@ -791,7 +773,6 @@ Case is ignored." t))
 
 
 (defun digit-char-p (char &optional (radix 10.))
-  #!+sb-doc
   "If char is a digit in the specified radix, returns the fixnum for which
 that digit stands, else returns NIL."
   (if (<= (char-code char) 127)
@@ -811,7 +792,6 @@ that digit stands, else returns NIL."
           number))))
 
 (defun digit-char (weight &optional (radix 10))
-  #!+sb-doc
   "All arguments must be integers. Returns a character object that represents
 a digit of the given weight in the specified radix. Returns NIL if no such
 character exists."

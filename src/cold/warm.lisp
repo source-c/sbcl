@@ -20,44 +20,16 @@
                      (space 1)
                      (speed 2)))
 
-
-;;;; package hacking
-
-;;; Assert that genesis preserves shadowing symbols.
+;;; Assert that genesis preserved shadowing symbols.
 (let ((p sb-assem::*backend-instruction-set-package*))
   (unless (eq p (find-package "SB-VM"))
     (dolist (expect '("SEGMENT" "MAKE-SEGMENT"))
       (assert (find expect (package-shadowing-symbols p) :test 'string=)))))
 
-;;; FIXME: This nickname is a deprecated hack for backwards
-;;; compatibility with code which assumed the CMU-CL-style
-;;; SB-ALIEN/SB-C-CALL split. That split went away and was deprecated
-;;; in 0.7.0, so we should get rid of this nickname after a while.
-(let ((package (find-package "SB-ALIEN")))
-  (rename-package package
-                  (package-name package)
-                  (cons "SB-C-CALL" (package-nicknames package))))
-
-(let ((package (find-package "SB-SEQUENCE")))
-  (rename-package package (package-name package) (list "SEQUENCE")))
 
 ;;;; compiling and loading more of the system
 
 (load "src/cold/muffler.lisp")
-
-(unless (member sb-int:+empty-ht-slot+ sb-vm::*static-symbols*)
-  ;; It doesn't "just work" to unintern the marker symbol, because then
-  ;; then compiler thinks that equivalence-as-constant for such symbol permits
-  ;; creation of new uninterned symbol at load-time, never mind that it was
-  ;; accessed by way of a named global constant. Changing +EMPTY-HT-SLOT+
-  ;; into a macro that explicitly calls LOAD-TIME-VALUE makes it work out.
-  ;; I didn't want to think about getting this right in cold-init though.
-  (setf (sb-int:info :variable :macro-expansion 'sb-int:+empty-ht-slot+)
-        '(load-time-value (symbol-global-value 'sb-int:+empty-ht-slot+) t))
-  ;; Sneaky! Now it's both a constant and a macro
-  (setf (sb-int:info :variable :kind 'sb-int:+empty-ht-slot+) :macro))
-
-(unintern sb-int:+empty-ht-slot+ (symbol-package sb-int:+empty-ht-slot+))
 
 ;;; FIXME: CMU CL's pclcom.lisp had extra optional stuff wrapped around
 ;;; COMPILE-PCL, at least some of which we should probably have too:
@@ -89,7 +61,15 @@
 ;;; into build-order.lisp-expr with some new flag (perhaps :WARM) to
 ;;; indicate that the files should be handled not in cold load but
 ;;; afterwards.
-(let ((interpreter-srcs
+(let ((early-srcs
+              '("SRC;CODE;WARM-ERROR"
+                "SRC;CODE;ROOM" ; for MAP-ALLOCATED-OBJECTS
+                ;; We re-nickname SB-SEQUENCE as SEQUENCE now.
+                ;; It could be done in genesis, but not earlier,
+                ;; since the host has a package of that name.
+                "SRC;CODE;DEFPACKAGE"))
+
+      (interpreter-srcs
               #+sb-fasteval
               '("SRC;INTERPRETER;MACROS"
                 "SRC;INTERPRETER;CHECKFUNS"
@@ -142,6 +122,7 @@
                 "SRC;PCL;PRECOM2"))
       (other-srcs
               '("SRC;CODE;SETF-FUNS"
+                "SRC;CODE;STUBS"
                 ;; miscellaneous functionality which depends on CLOS
                 "SRC;CODE;LATE-CONDITION"
 
@@ -167,9 +148,11 @@
                 "SRC;CODE;WARM-LIB"
                 #+win32 "SRC;CODE;WARM-MSWIN"
                 "SRC;CODE;RUN-PROGRAM"
+                #+sb-traceroot "SRC;CODE;TRACEROOT"
 
-                #+immobile-code "SRC;CODE;IMMOBILE-CODE"
-                "SRC;CODE;REPACK-XREF"))
+                #+immobile-code "SRC;CODE;IMMOBILE-SPACE"
+                "SRC;CODE;REPACK-XREF"
+                "SRC;CODE;SAVE"))
       (sb-c::*handled-conditions* sb-c::*handled-conditions*))
  (declare (special *compile-files-p*))
  (proclaim '(sb-ext:muffle-conditions
@@ -189,9 +172,9 @@
              (tagbody
               retry-compile-file
                 (multiple-value-bind (output-truename warnings-p failure-p)
-                    (if *compile-files-p*
-                        (compile-file fullname)
-                        (compile-file-pathname fullname))
+                    (ecase (if (boundp '*compile-files-p*) *compile-files-p* t)
+                     ((t)   (compile-file fullname))
+                     ((nil) (compile-file-pathname fullname)))
                   (declare (ignore warnings-p))
                   (sb-int:/show "done compiling" fullname)
                   (cond ((not output-truename)
@@ -220,27 +203,11 @@
                     (error "LOAD of ~S failed." output-truename))
                   (sb-int:/show "done loading" output-truename))))))))
 
-  (with-compilation-unit ()
-    (let ((*compile-print* nil))
-      (do-srcs interpreter-srcs)))
-  (with-compilation-unit ()
-    (let ((*compile-print* nil))
-      (do-srcs pcl-srcs)))
-  (when *compile-files-p*
-    (format t "~&; Done with PCL compilation~2%"))
-  (do-srcs other-srcs)))
-
-;;;; setting package documentation
-
-;;; While we were running on the cross-compilation host, we tried to
-;;; be portable and not overwrite the doc strings for the standard
-;;; packages. But now the cross-compilation host is only a receding
-;;; memory, and we can have our way with the doc strings.
-(sb-int:/show "setting package documentation")
-#+sb-doc (setf (documentation (find-package "COMMON-LISP") t)
-"public: home of symbols defined by the ANSI language specification")
-#+sb-doc (setf (documentation (find-package "COMMON-LISP-USER") t)
-               "public: the default package for user code and data")
-#+sb-doc (setf (documentation (find-package "KEYWORD") t)
-               "public: home of keywords")
-
+  (let ((*print-length* 10)
+        (*print-level* 5)
+        (*print-circle* t)
+        (*compile-print* nil))
+    (do-srcs early-srcs)
+    (with-compilation-unit () (do-srcs interpreter-srcs))
+    (with-compilation-unit () (do-srcs pcl-srcs))
+    (do-srcs other-srcs))))

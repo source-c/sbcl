@@ -38,8 +38,7 @@
                              temp))))
                      (storew reg ,list ,slot list-pointer-lowtag))))
              (let ((cons-cells (if star (1- num) num))
-                   (stack-allocate-p (awhen (sb!c::node-lvar node)
-                                       (sb!c::lvar-dynamic-extent it))))
+                   (stack-allocate-p (node-stack-allocate-p node)))
                (maybe-pseudo-atomic stack-allocate-p
                 (allocation res (* (pad-data-block cons-size) cons-cells) node
                             stack-allocate-p list-pointer-lowtag)
@@ -178,7 +177,6 @@
                    (move rcx words)
                    (inst shr rcx n-fixnum-tag-bits)))
             (inst lea rdi data-addr)
-            (inst cld)
             (zeroize rax)
             (inst rep)
             (inst stos rax)))))))
@@ -283,19 +281,28 @@
               result fdefn-raw-addr-slot other-pointer-lowtag))))
 
 (define-vop (make-closure)
-  (:args (function :to :save :scs (descriptor-reg)))
-  (:info length stack-allocate-p)
+  ; (:args (function :to :save :scs (descriptor-reg)))
+  (:info label length stack-allocate-p)
   (:temporary (:sc any-reg) temp)
   (:results (result :scs (descriptor-reg)))
   (:node-var node)
   (:generator 10
    (maybe-pseudo-atomic stack-allocate-p
-    (let ((size (+ length closure-info-offset)))
+    (let* ((size (+ length closure-info-offset))
+           (header (logior (ash (1- size) n-widetag-bits) closure-widetag)))
       (allocation result (pad-data-block size) node stack-allocate-p
                   fun-pointer-lowtag)
-      (storew* (logior (ash (1- size) n-widetag-bits) closure-header-widetag)
+      (storew* #!-immobile-space header ; write the widetag and size
+               #!+immobile-space        ; ... plus the layout pointer
+               (progn (inst mov temp header)
+                      (inst or temp (static-symbol-value-ea 'function-layout))
+                      temp)
                result 0 fun-pointer-lowtag (not stack-allocate-p)))
-    (loadw temp function closure-fun-slot fun-pointer-lowtag)
+    ;; These two instructions are within the scope of PSEUDO-ATOMIC.
+    ;; This is due to scav_closure() assuming that it can always subtract
+    ;; FUN_RAW_ADDR_OFFSET from closure->fun to obtain a Lisp object,
+    ;; without any precheck for whether that word is currently 0.
+    (inst lea temp (make-fixup nil :closure label))
     (storew temp result closure-fun-slot fun-pointer-lowtag))))
 
 ;;; The compiler likes to be able to directly make value cells.
@@ -306,7 +313,7 @@
   (:node-var node)
   (:generator 10
     (with-fixed-allocation
-        (result value-cell-header-widetag value-cell-size node stack-allocate-p)
+        (result value-cell-widetag value-cell-size node stack-allocate-p)
       (storew value result value-cell-value-slot other-pointer-lowtag))))
 
 ;;;; automatic allocators for primitive objects
@@ -321,20 +328,33 @@
   (:args)
   (:results (result :scs (any-reg)))
   (:generator 1
+    ;; TODO: if in immobile space, use LEA to make position-independent
     (inst mov result (make-fixup 'funcallable-instance-tramp :assembly-routine))))
 
 (define-vop (fixed-alloc)
   (:args)
   (:info name words type lowtag stack-allocate-p)
-  (:ignore name)
   (:results (result :scs (descriptor-reg)))
   (:node-var node)
   (:generator 50
+    (progn name) ; possibly not used
     (maybe-pseudo-atomic stack-allocate-p
      (allocation result (pad-data-block words) node stack-allocate-p lowtag)
      (when type
-       (storew* (logior (ash (1- words) n-widetag-bits) type)
-                result 0 lowtag (not stack-allocate-p))))))
+       (let* ((widetag (if (typep type 'layout) instance-widetag type))
+              (header (logior (ash (1- words) n-widetag-bits) widetag)))
+         (if (or #!+compact-instance-header
+                 (and (eq name '%make-structure-instance) stack-allocate-p))
+             ;; Write a :DWORD, not a :QWORD, because the high half will be
+             ;; filled in when the layout is stored. Can't use STOREW* though,
+             ;; because it tries to store as few bytes as possible,
+             ;; where this instruction must write exactly 4 bytes.
+             (inst mov (make-ea :dword :base result :disp (- lowtag)) header)
+             (storew* header result 0 lowtag (not stack-allocate-p)))
+         (unless (eq type widetag) ; TYPE is actually a LAYOUT
+           (inst mov (make-ea :dword :base result :disp (+ 4 (- lowtag)))
+                 ;; XXX: should layout fixups use a name, not a layout object?
+                 (make-fixup type :layout))))))))
 
 (define-vop (var-alloc)
   (:args (extra :scs (any-reg)))
@@ -387,9 +407,12 @@
   ;; These VOPs are each used in one place only, and deliberately not
   ;; specified as transforming the function after which they are named.
   (def alloc-immobile-layout "alloc_layout" ; MAKE-LAYOUT
-       ((descriptor-reg) (descriptor-reg)))
+       ((descriptor-reg)))
   (def alloc-immobile-symbol "alloc_sym"    ; MAKE-SYMBOL
-       ((descriptor-reg) (any-reg)))
+       ((descriptor-reg)))
   (def alloc-immobile-fdefn  "alloc_fdefn"  ; MAKE-FDEFN
+       ((descriptor-reg)))
+  #!+(and immobile-code compact-instance-header)
+  (def alloc-generic-function  "alloc_generic_function"
        ((descriptor-reg)))
   )

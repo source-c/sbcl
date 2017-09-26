@@ -225,6 +225,9 @@
 ;; These are also random numbers, but not lazily computed.
 (declaim (inline fsc-instance-hash))
 (defun fsc-instance-hash (fin)
+  #!+compact-instance-header
+  (sb!vm::get-header-data-high (%funcallable-instance-info fin 0))
+  #!-compact-instance-header
   (%funcallable-instance-info fin sb!pcl::fsc-instance-hash-slot-index))
 
 (defun sxhash (x)
@@ -291,9 +294,8 @@
                    ;; we hash all of the components of a pathname together.
                    (let ((hash (sxhash-recurse (pathname-host x) depthoid)))
                      (mixf hash (sxhash-recurse (pathname-device x) depthoid))
-                     (mixf hash (sxhash-recurse (pathname-directory x) depthoid))
-                     (mixf hash (sxhash-recurse (pathname-name x) depthoid))
-                     (mixf hash (sxhash-recurse (pathname-type x) depthoid))
+                     (mixf hash (%pathname-dir-hash x))
+                     (mixf hash (%pathname-stem-hash x))
                      ;; Hash :NEWEST the same as NIL because EQUAL for
                      ;; pathnames assumes that :newest and nil are equal.
                      (let ((version (%pathname-version x)))
@@ -337,7 +339,7 @@
                         (sxhash (char-code x)))) ; through DEFTRANSFORM
                ;; general, inefficient case of NUMBER
                (number (sxhash-number x))
-               (generic-function (fsc-instance-hash x))
+               (funcallable-instance (fsc-instance-hash x))
                (t 42))))
     (sxhash-recurse x +max-hash-depthoid+)))
 
@@ -361,6 +363,7 @@
   (typecase key
     (array (array-psxhash key depthoid))
     (hash-table (hash-table-psxhash key))
+    (pathname (sxhash key))
     (structure-object (structure-object-psxhash key depthoid))
     (cons (list-psxhash key depthoid))
     (number (number-psxhash key))
@@ -484,6 +487,15 @@
                                    (sxhash q)
                                    (sxhash-double-float
                                     (coerce key 'double-float)))))
+                            ((float-infinity-p key)
+                             ;; {single,double}-float infinities are EQUALP
+                             (if (minusp key)
+                                 (load-time-value
+                                  (sxhash (symbol-value 'sb!ext:single-float-negative-infinity))
+                                  t)
+                                 (load-time-value
+                                  (sxhash (symbol-value 'sb!ext:single-float-positive-infinity))
+                                  t)))
                             (t
                              (multiple-value-bind (q r) (floor key)
                                (if (zerop (the ,type r))
@@ -524,7 +536,7 @@
 ;;; More work here equates to less work in the global hashtable.
 ;;; To wit: (eq (sxhash '(foo a b c bar)) (sxhash '(foo a b c d))) => T
 ;;; but the corresponding globaldb-sxhashoids differ.
-(defun sb!c::globaldb-sxhashoid (name)
+(defun globaldb-sxhashoid (name)
   (locally
       (declare (optimize (safety 0))) ; after the argc check
     ;; TRAVERSE will walk across more cons cells than RECURSE will descend.

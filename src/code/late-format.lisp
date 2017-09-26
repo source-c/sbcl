@@ -78,7 +78,7 @@
          :second-relative (- (max pprint-offset justification-offset)
                              (min pprint-offset justification-offset)
                              1)
-         :references (list '(:ansi-cl :section (22 3 5 2))))))
+         :references '((:ansi-cl :section (22 3 5 2))))))
     (nreverse result)))
 
 (defun parse-directive (string start)
@@ -94,7 +94,7 @@
                (format-error-at*
                 string posn
                 "Parameters found after #\\: or #\\@ modifier" '()
-                :references (list '(:ansi-cl :section (22 3)))))))
+                :references '((:ansi-cl :section (22 3)))))))
       (loop
         (let ((char (get-char)))
           (cond ((or (char<= #\0 char #\9) (char= char #\+) (char= char #\-))
@@ -144,13 +144,13 @@
                  (if colonp
                      (format-error-at*
                       string posn "Too many colons supplied" '()
-                      :references (list '(:ansi-cl :section (22 3))))
+                      :references '((:ansi-cl :section (22 3))))
                      (setf colonp t)))
                 ((char= char #\@)
                  (if atsignp
                      (format-error-at*
                       string posn "Too many #\\@ characters supplied" '()
-                      :references (list '(:ansi-cl :section (22 3))))
+                      :references '((:ansi-cl :section (22 3))))
                      (setf atsignp t)))
                 (t
                  (when (and (char= (schar string (1- posn)) #\,)
@@ -199,7 +199,8 @@
                  (push `(,(car arg)
                          (args-exhausted ,control-string ,(cdr arg)))
                        optional))))
-        (return `(lambda (stream ,@required
+        (return `(named-lambda ,control-string
+                         (stream ,@required
                                  ,@(if optional '(&optional)) ,@optional
                                  &rest args)
                    (declare (ignorable stream args))
@@ -216,6 +217,7 @@
 (defun args-exhausted (control-string offset)
   (format-error-at control-string offset "No more arguments"))
 
+(defvar *format-gensym-counter*)
 (defun expand-control-string (string)
   (let* ((string (etypecase string
                    (simple-string
@@ -223,22 +225,43 @@
                    (string
                     (coerce string 'simple-string))))
          (*default-format-error-control-string* string)
+         (*format-gensym-counter* 0)
          (directives (tokenize-control-string string)))
     `(block nil
        ,@(expand-directive-list directives))))
 
 (defun expand-directive-list (directives)
   (let ((results nil)
+        previous
         (remaining-directives directives))
     (loop
-      (unless remaining-directives
-        (return))
-      (multiple-value-bind (form new-directives)
-          (expand-directive (car remaining-directives)
-                            (cdr remaining-directives))
-        (push form results)
-        (setf remaining-directives new-directives)))
-    (reverse results)))
+     (unless remaining-directives
+       (return))
+     (multiple-value-bind (form new-directives)
+         (expand-directive (car remaining-directives)
+                           (cdr remaining-directives))
+       (flet ((merge-string (string)
+                (cond (previous
+                       (let ((concat (concatenate 'string
+                                                  (string previous)
+                                                  (string string))))
+                         (setf previous concat)
+                         (setf (car results)
+                               `(write-string ,concat stream))))
+                      (t
+                       (setf previous string)
+                       (push form results)))))
+         (cond ((not form))
+               ((typep form '(cons (member write-string write-char)
+                              (cons (or string character))))
+                (merge-string (second form)))
+               ((typep form '(cons (eql terpri)))
+                (merge-string #\Newline))
+               (t
+                (push form results)
+                (setf previous nil))))
+       (setf remaining-directives new-directives)))
+    (nreverse results)))
 
 (defun expand-directive (directive more-directives)
   (etypecase directive
@@ -255,6 +278,11 @@
            (funcall expander directive more-directives)
            (format-error "Unknown directive ~@[(character: ~A)~]"
                          (char-name (format-directive-character directive))))))
+    ((simple-string 1)
+     (values `(write-char ,(schar directive 0) stream)
+             more-directives))
+    ((simple-string 0)
+     (values nil more-directives))
     (simple-string
      (values `(write-string ,directive stream)
              more-directives))))
@@ -269,7 +297,13 @@
       `(,*expander-next-arg-macro*
         ,*default-format-error-control-string*
         ,(or offset *default-format-error-offset*))
-      (let ((symbol (sb!xc:gensym "FORMAT-ARG")))
+      (let ((symbol
+             (without-package-locks
+                 (package-symbolicate
+                  (load-time-value (find-package "SB!FORMAT") t)
+                  "FORMAT-ARG"
+                  (write-to-string (incf *format-gensym-counter*)
+                                   :pretty nil :base 10 :radix nil)))))
         (push (cons symbol (or offset *default-format-error-offset*))
               *simple-args*)
         symbol)))
@@ -544,11 +578,14 @@
 (def-format-directive #\% (colonp atsignp params)
   (check-modifier "colon" colonp)
   (check-modifier "at-sign" atsignp)
-  (if params
-      (expand-bind-defaults ((count 1)) params
-        `(dotimes (i ,count)
-           (terpri stream)))
-      '(terpri stream)))
+  (cond ((not params)
+         '(terpri stream))
+        ((typep params '(cons (cons * (mod 65536)) null))
+         `(write-string ,(make-string (cdar params) :initial-element #\Newline) stream))
+        (t
+         (expand-bind-defaults ((count 1)) params
+           `(dotimes (i ,count)
+              (terpri stream))))))
 
 (def-format-directive #\& (colonp atsignp params)
   (check-modifier "colon" colonp)
@@ -929,7 +966,7 @@
               (nthcdr (1+ posn) directives)))))
 
 (def-complex-format-directive #\} ()
-  (format-error "no corresponding open brace"))
+  (format-error "No corresponding open brace"))
 
 ;;;; format directives and support functions for justification
 
@@ -967,7 +1004,7 @@
              (format-error*
               "~D illegal directive~:P found inside justification block"
               (list count)
-              :references (list '(:ansi-cl :section (22 3 5 2)))))
+              :references '((:ansi-cl :section (22 3 5 2)))))
            ;; ANSI does not explicitly say that an error should be
            ;; signalled, but the @ modifier is not explicitly allowed
            ;; for ~> either.
@@ -977,13 +1014,13 @@
               "@ modifier not allowed in close directive of ~
                justification block (i.e. ~~<...~~@>."
               '()
-              :references (list '(:ansi-cl :section (22 3 6 2)))))
+              :references '((:ansi-cl :section (22 3 6 2)))))
            (expand-format-justification segments colonp atsignp
                                         first-semi params)))
      remaining)))
 
 (def-complex-format-directive #\> ()
-  (format-error "no corresponding open bracket"))
+  (format-error "No corresponding open bracket"))
 
 (defun parse-format-logical-block
        (segments colonp first-semi close params string end)
@@ -1001,7 +1038,7 @@
                         "Cannot include format directives inside the ~
                          ~:[suffix~;prefix~] segment of ~~<...~~:>"
                         (list prefix-p)
-                        :references (list '(:ansi-cl :section (22 3 5 2))))
+                        :references '((:ansi-cl :section (22 3 5 2))))
                        (apply #'concatenate 'string list)))))
         (case (length segments)
           (0 (values prefix-default nil suffix-default))
@@ -1190,13 +1227,14 @@
                                 (subseq foo (1+ slash) (1- end)))))
          (first-colon (position #\: name))
          (second-colon (if first-colon (position #\: name :start (1+ first-colon))))
-         (package-name (if first-colon
-                           (subseq name 0 first-colon)
-                           "COMMON-LISP-USER"))
-         (package (or (find-package package-name)
+         (package
+            (if (not first-colon)
+                (load-time-value (find-package "COMMON-LISP-USER") t)
+                (let ((package-name (subseq name 0 first-colon)))
+                  (or (find-package package-name)
                       ;; FIXME: should be PACKAGE-ERROR? Could we just
                       ;; use FIND-UNDELETED-PACKAGE-OR-LOSE?
-                      (format-error "No package named ~S" package-name))))
+                      (format-error "No package named ~S" package-name))))))
     (intern (cond
               ((and second-colon (= second-colon (1+ first-colon)))
                (subseq name (1+ second-colon)))

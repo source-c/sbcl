@@ -96,18 +96,16 @@
 
 (with-test (:name :bug-936304)
   (gc :full t)
-  (time
-   (assert (eq :ok (handler-case
+  (assert (eq :ok (handler-case
                        (progn
                          (loop repeat 50 do (stress-gc))
                          :ok)
                      (storage-condition ()
-                       :oom))))))
+                       :oom)))))
 
 (with-test (:name :bug-981106)
   (gc :full t)
-  (time
-   (assert (eq :ok
+  (assert (eq :ok
                (handler-case
                    (dotimes (runs 100 :ok)
                      (let* ((n (truncate (dynamic-space-size) 1200))
@@ -117,7 +115,7 @@
                                       (write-sequence "hi there!" string))))))
                        (assert (eql len (* n (length "hi there!"))))))
                  (storage-condition ()
-                   :oom))))))
+                   :oom)))))
 
 (with-test (:name :gc-logfile :skipped-on '(not :gencgc))
   (assert (not (gc-logfile)))
@@ -142,3 +140,30 @@
          (g (eval `(defun ,(gensym) ()))))
     (eval `(defun h () (,f) (,g))))
   (sb-kernel::order-by-in-degree))
+
+(defparameter *pin-test-object* nil)
+(defparameter *pin-test-object-address* nil)
+
+(with-test (:name (sb-sys:with-pinned-objects :actually-pins-objects)
+                  :skipped-on ':cheneygc)
+  ;; The interpreters (both sb-eval and sb-fasteval) special-case
+  ;; WITH-PINNED-OBJECTS as a "special form", because the x86oid
+  ;; version of WITH-PINNED-OBJECTS uses black magic that isn't
+  ;; supportable outside of the compiler.  The non-x86oid versions of
+  ;; WITH-PINNED-OBJECTS don't use black magic, but are overridden
+  ;; anyway.  But the special-case logic was, historically broken, and
+  ;; this affects all gencgc targets (cheneygc isn't affected because
+  ;; cheneygc WITH-PINNED-OBJECTS devolves to WITHOUT-GCING).
+  ;;
+  ;; Our basic approach is to allocate some kind of object and stuff
+  ;; it where it doesn't need to be on the control stack.  We then pin
+  ;; the object, take its address and store that somewhere as well,
+  ;; force a full GC, re-take the address, and see if it moved.
+  (locally (declare (notinline make-string)) ;; force full call
+    (setf *pin-test-object* (make-string 100)))
+  (sb-sys:with-pinned-objects (*pin-test-object*)
+    (setf *pin-test-object-address*
+          (sb-kernel:get-lisp-obj-address *pin-test-object*))
+    (gc :full t)
+    (assert (= (sb-kernel:get-lisp-obj-address *pin-test-object*)
+               *pin-test-object-address*))))

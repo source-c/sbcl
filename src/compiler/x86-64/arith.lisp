@@ -18,10 +18,8 @@
 (defun immediate32-p (x)
   (typecase x
     ((signed-byte 32) x)
-    ((unsigned-byte 64)
-     (let ((chopped (sb!c::mask-signed-field 32 x)))
-       (and (= x (ldb (byte 64 0) chopped))
-            chopped)))
+    ((integer #.(- (expt 2 64) (expt 2 31)) #.most-positive-word)
+     (sb!c::mask-signed-field 32 x))
     (t nil)))
 
 ;; If 'immediate32-p' is true, use it; otherwise use a RIP-relative constant.
@@ -34,9 +32,7 @@
 ;;;; unary operations
 
 (define-vop (fast-safe-arith-op)
-  (:policy :fast-safe)
-  (:effects)
-  (:affected))
+  (:policy :fast-safe))
 
 (define-vop (fixnum-unop fast-safe-arith-op)
   (:args (x :scs (any-reg) :target res))
@@ -247,10 +243,10 @@
            (inst xor r y))))))
 
 (define-vop (fast-logior-unsigned-signed=>signed fast-safe-arith-op)
-  (:args (x :scs (unsigned-reg))
+  (:args (x :scs (unsigned-reg) :to (:result 1))
          (y :target r :scs (signed-reg)))
   (:arg-types unsigned-num signed-num)
-  (:results (r :scs (signed-reg) :from (:argument 1)))
+  (:results (r :scs (signed-reg)))
   (:result-types signed-num)
   (:note "inline (unsigned-byte 64) arithmetic")
   (:translate logior)
@@ -1202,8 +1198,6 @@ constant shift greater than word length")))
 (define-vop (fast-conditional)
   (:conditional :e)
   (:info)
-  (:effects)
-  (:affected)
   (:policy :fast-safe))
 
 (define-vop (fast-conditional/fixnum fast-conditional)
@@ -1260,12 +1254,10 @@ constant shift greater than word length")))
                          (:generator ,cost
                           (emit-optimized-test-inst x
                            ,(case suffix
-                             (-c/fixnum
-                              `(constantize (fixnumize y)))
-                             ((-c/signed -c/unsigned)
-                              `(constantize y))
-                             (t
-                              'y)))))))))
+                             (-c/fixnum `(constantize (fixnumize y)))
+                             ((-c/signed -c/unsigned) `(constantize y))
+                             (t 'y))
+                           nil)))))))
   (define-logtest-vops))
 
 (defknown %logbitp (integer unsigned-byte) boolean
@@ -1281,7 +1273,8 @@ constant shift greater than word length")))
   (:conditional :c)
   (:arg-types tagged-num (:constant (integer 0 #.(- 63 n-fixnum-tag-bits))))
   (:generator 4
-    (inst bt x (+ y n-fixnum-tag-bits))))
+    (let ((bit (+ y n-fixnum-tag-bits)))
+      (inst bt (if (<= bit 31) (reg-in-size x :dword) x) bit))))
 
 (define-vop (fast-logbitp/signed fast-conditional/signed)
   (:args (x :scs (signed-reg signed-stack))
@@ -2000,37 +1993,31 @@ constant shift greater than word length")))
   (:translate logand)
   (:policy :fast-safe)
   (:args (x :scs (descriptor-reg)))
-  (:arg-types t (:constant (member #.most-positive-word
-                                   #.(ash most-positive-word -1))))
+  (:arg-types t (:constant word))
   (:results (r :scs (unsigned-reg)))
   (:info mask)
   (:result-types unsigned-num)
   (:generator 10
-    (move r x)
-    (generate-fixnum-test r)
-    (inst jmp :nz BIGNUM)
-    (if (= mask most-positive-word)
-        (inst sar r n-fixnum-tag-bits)
-        (inst shr r n-fixnum-tag-bits))
-    (inst jmp DONE)
-    BIGNUM
-    (loadw r x bignum-digits-offset other-pointer-lowtag)
-    (unless (= mask most-positive-word)
-      (inst btr r (1- n-word-bits)))
-    DONE))
+    (let ((fixnum-mask-p (and (= n-fixnum-tag-bits 1)
+                              (= mask (ash most-positive-word -1)))))
+      (assemble ()
+        (move r x)
+        (generate-fixnum-test r)
+        (inst jmp :nz BIGNUM)
+        (if fixnum-mask-p
+            (inst shr r n-fixnum-tag-bits)
+            (inst sar r n-fixnum-tag-bits))
+        (inst jmp DONE)
+        BIGNUM
+        (loadw r x bignum-digits-offset other-pointer-lowtag)
+        (when fixnum-mask-p
+          (inst btr r (1- n-word-bits)))
+        DONE
+        (unless (or fixnum-mask-p
+                    (= mask most-positive-word))
+          (inst and r (or (immediate32-p mask)
+                          (constantize mask))))))))
 
-;;;; static functions
-
-(define-static-fun two-arg-/ (x y) :translate /)
-
-(define-static-fun two-arg-gcd (x y) :translate gcd)
-(define-static-fun two-arg-lcm (x y) :translate lcm)
-
-(define-static-fun two-arg-and (x y) :translate logand)
-(define-static-fun two-arg-ior (x y) :translate logior)
-(define-static-fun two-arg-xor (x y) :translate logxor)
-
-
 (in-package "SB!C")
 
 (defun *-transformer (y)

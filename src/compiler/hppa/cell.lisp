@@ -31,7 +31,9 @@
   (:generator 1
     (storew value object offset lowtag)))
 
-(define-vop (init-slot set-slot))
+(define-vop (init-slot set-slot)
+  (:info name dx-p offset lowtag)
+  (:ignore name dx-p))
 
 ;;;; Symbol hacking VOPs:
 
@@ -52,7 +54,7 @@
 ;;; With Symbol-Value, we check that the value isn't the trap object.  So
 ;;; Symbol-Value of NIL is NIL.
 (define-vop (symbol-value checked-cell-ref)
-  (:translate symbol-value)
+  (:translate symeval)
   (:generator 9
     (move object obj-temp)
     (loadw value obj-temp symbol-value-slot other-pointer-lowtag)
@@ -79,7 +81,7 @@
 (define-vop (fast-symbol-value cell-ref)
   (:variant symbol-value-slot other-pointer-lowtag)
   (:policy :fast)
-  (:translate symbol-value))
+  (:translate symeval))
 
 (define-vop (symbol-hash)
   (:policy :fast-safe)
@@ -97,9 +99,9 @@
 ;;; On unithreaded builds these are just copies of the non-global versions.
 (define-vop (%set-symbol-global-value set))
 (define-vop (symbol-global-value symbol-value)
-  (:translate symbol-global-value))
+  (:translate sym-global-val))
 (define-vop (fast-symbol-global-value fast-symbol-value)
-  (:translate symbol-global-value))
+  (:translate sym-global-val))
 
 ;;;; Fdefinition (fdefn) objects.
 
@@ -131,7 +133,7 @@
   (:generator 38
     (let ((normal-fn (gen-label)))
       (load-type type function (- fun-pointer-lowtag))
-      (inst addi (- simple-fun-header-widetag) type type)
+      (inst addi (- simple-fun-widetag) type type)
       (inst comb := type zero-tn normal-fn)
       (inst addi (- (ash simple-fun-code-offset word-shift) fun-pointer-lowtag)
             function lip)

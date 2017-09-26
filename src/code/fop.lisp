@@ -70,8 +70,9 @@
     (unless (zerop (mod base-opcode n-slots))
       (error "Opcode for fop ~S must be a multiple of ~D" name n-slots))
     (loop for opcode from base-opcode below (+ base-opcode n-slots)
-          when (functionp (svref **fop-funs** opcode))
-          do (let ((oname (svref **fop-names** opcode)))
+          for function = (svref **fop-funs** opcode)
+          when (functionp function)
+          do (let ((oname (nth-value 2 (function-lambda-expression function))))
                (when (and oname (not (eq oname name)))
                  (error "fop ~S with opcode ~D conflicts with fop ~S."
                         name opcode oname))))
@@ -85,8 +86,7 @@
     ;; If there is more than 1, they follow, using varint encoding.
     (dotimes (j n-slots)
       (let ((opcode (+ base-opcode j)))
-        (setf (svref **fop-names** opcode) name
-              (svref **fop-funs** opcode) (symbol-function name)
+        (setf (svref **fop-funs** opcode) (symbol-function name)
               (aref (car **fop-signatures**) opcode) n-operands
               (sbit (cdr **fop-signatures**) opcode) pushp))))
   name)
@@ -157,7 +157,7 @@
   x)
 
 (!define-fop 66 :not-host (fop-misc-trap)
-  (%primitive sb!c:make-unbound-marker))
+  (make-unbound-marker))
 
 (!define-fop 76 (fop-character ((:operands char-code)))
   (code-char char-code))
@@ -182,8 +182,15 @@
             (incf ptr)))))
     res))
 
-(!define-fop 45 (fop-layout (name inherits depthoid length bitmap))
-  (find-and-init-or-check-layout name length inherits depthoid bitmap))
+(!define-fop 45 :not-host (fop-layout (name inherits depthoid length bitmap))
+  (let ((flags
+         (case (and (>= (length (the simple-vector inherits)) 2)
+                    (elt inherits 1))
+           (#.(find-layout 'structure-object) +structure-layout-flag+)
+           (#.(find-layout 'condition) +condition-layout-flag+)
+           ;; DUMP-LAYOUT avers that +pcl-object-flag+ layouts are never dumped
+           (t 0))))
+    (find-and-init-or-check-layout name length flags inherits depthoid bitmap)))
 
 ;; Allocate a CLOS object. This is used when the compiler detects that
 ;; MAKE-LOAD-FORM returned a simple use of MAKE-LOAD-FORM-SAVING-SLOTS,
@@ -204,7 +211,7 @@
       (dotimes (i n-slots)
         (let ((val (svref stack (+ ptr i)))
               (slot-name (pop slot-names)))
-          (if (eq val sb!pcl:+slot-unbound+)
+          (if (unbound-marker-p val)
               ;; SLOT-MAKUNBOUND-USING-CLASS might do something nonstandard.
               (slot-makunbound obj slot-name)
               (setf (slot-value obj slot-name) val))))))
@@ -419,25 +426,28 @@
 
 ;;;; fops for loading arrays
 
-(!define-fop 100 (fop-base-string ((:operands length)))
-  (read-base-string-as-bytes (fasl-input-stream)
-                             (make-string length :element-type 'base-char)))
+(!define-fop 100 :not-host (fop-base-string ((:operands length)))
+  (logically-readonlyize
+   (read-base-string-as-bytes (fasl-input-stream)
+                              (make-string length :element-type 'base-char))))
 
 ;; FIXME: can save space by UTF-8 encoding, or use 1 bit to indicate pure ASCII
 ;; in the fasl even though the result will be a non-base string.
 #!+sb-unicode
 (!define-fop 160 :not-host (fop-character-string ((:operands length)))
-  (read-string-as-unsigned-byte-32 (fasl-input-stream)
-                                   (make-string length)))
+  (logically-readonlyize
+   (read-string-as-unsigned-byte-32 (fasl-input-stream)
+                                    (make-string length))))
 
 (!define-fop 92 (fop-vector ((:operands size)))
-  (let ((res (make-array size))
-        (stack (operand-stack)))
-    (declare (fixnum size))
-    (unless (zerop size)
-      (let ((ptr (fop-stack-pop-n stack size)))
-        (replace res stack :start2 ptr)))
-    res))
+  (if (zerop size)
+      #()
+      (let ((res (make-array size))
+            (stack (operand-stack)))
+        (declare (fixnum size))
+        (let ((ptr (fop-stack-pop-n stack size)))
+          (replace res stack :start2 ptr))
+        (logically-readonlyize res))))
 
 ;; No MAKE-ARRAY-HEADER on host
 (!define-fop 89 :not-host (fop-array (vec))
@@ -460,7 +470,6 @@
             (setf (aref array (sb!vm:saetp-typecode saetp))
                   (sb!vm:saetp-n-bits saetp)))
       array)
-    #!+sb-doc
     "255 means bad entry.")
 (declaim (type (simple-array (unsigned-byte 8) (#.(1+ sb!vm:widetag-mask)))
                **saetp-bits-per-length**))
@@ -474,7 +483,11 @@
                       (* length bits-per-length)))
          (bytes (ceiling bits sb!vm:n-byte-bits))
          (words (ceiling bytes sb!vm:n-word-bytes))
-         (vector (allocate-vector widetag length words)))
+         (vector (if (and (= widetag sb!vm:simple-vector-widetag)
+                          (= words 0))
+                     #()
+                     (logically-readonlyize
+                      (allocate-vector widetag length words)))))
     (declare (type index length bytes words)
              (type word bits))
     (read-n-bytes (fasl-input-stream) vector 0 bytes)
@@ -506,6 +519,10 @@
   (fop-funcall* (fasl-input-stream) (operand-stack) (skip-until)))
 (!define-fop 56 (fop-funcall-for-effect () nil)
   (fop-funcall* (fasl-input-stream) (operand-stack) (skip-until)))
+
+;;; For LOAD-TIME-VALUE which is used for MAKE-LOAD-FORM
+(!define-fop 57 (fop-funcall-no-skip)
+  (fop-funcall* (fasl-input-stream) (operand-stack) nil))
 
 ;;;; fops for fixing up circularities
 
@@ -565,19 +582,10 @@
 (!define-fop 65 :not-host (fop-known-fun (name))
   (%coerce-name-to-fun name))
 
-#!-(or x86 x86-64)
+#!-(or x86 (and x86-64 (not immobile-space)))
 (!define-fop 61 :not-host (fop-sanctify-for-execution (component))
   (sb!vm:sanctify-for-execution component)
   component)
-
-(!define-fop 174 (fop-note-debug-source (debug-source) nil)
-  (warn "~@<FOP-NOTE-DEBUG-SOURCE seen in ordinary load (not cold load) -- ~
-very strange!  If you didn't do something to cause this, please report it as ~
-a bug.~@:>")
-  ;; we are going to be lenient with coming across this fop in a warm SBCL.
-  (setf (sb!c::debug-source-compiled debug-source) (get-universal-time)
-        (sb!c::debug-source-created debug-source)
-        (file-write-date (sb!c::debug-source-namestring debug-source))))
 
 ;;; Modify a slot in a CONSTANTS object.
 (!define-fop 140 :not-host (fop-alter-code ((:operands index) code value) nil)
@@ -620,13 +628,36 @@ a bug.~@:>")
                            kind)
   code-object)
 
+#!+immobile-space
+(progn
+  (!define-fop 133 :not-host (fop-layout-fixup (code-object kind obj))
+    (sb!vm:fixup-code-object code-object
+                             (read-word-arg (fasl-input-stream))
+                             (get-lisp-obj-address (find-layout obj))
+                             kind :immobile-object)
+    code-object)
+  (!define-fop 134 :not-host (fop-immobile-obj-fixup (code-object kind obj))
+    (sb!vm:fixup-code-object code-object
+                             (read-word-arg (fasl-input-stream))
+                             (get-lisp-obj-address obj) ; OBJ can't move
+                             kind :immobile-object)
+    code-object))
+
 #!+immobile-code
-(!define-fop 135 :not-host (fop-static-call-fixup (code-object kind name))
-  (sb!vm:fixup-code-object code-object
-                           (read-word-arg (fasl-input-stream))
-                           (sb!vm::function-raw-address name)
-                           kind)
-  code-object)
+(progn
+  (!define-fop 135 :not-host (fop-named-call-fixup (code-object kind name))
+    (sb!vm:fixup-code-object code-object
+                             (read-word-arg (fasl-input-stream))
+                             (sb!vm::fdefn-entry-address name)
+                             kind :named-call)
+    code-object)
+
+  (!define-fop 136 :not-host (fop-static-call-fixup (code-object kind name))
+    (sb!vm:fixup-code-object code-object
+                             (read-word-arg (fasl-input-stream))
+                             (sb!vm::function-raw-address name)
+                             kind :static-call)
+    code-object))
 
 (!define-fop 147 :not-host (fop-foreign-fixup (code-object kind))
   (let* ((len (read-byte-arg (fasl-input-stream)))
@@ -643,7 +674,7 @@ a bug.~@:>")
     (unless found
       (error "undefined assembler routine: ~S" routine))
     (sb!vm:fixup-code-object code-object (read-word-arg (fasl-input-stream))
-                             value kind))
+                             value kind :assembly-routine))
   code-object)
 
 (!define-fop 149 :not-host (fop-code-object-fixup (code-object kind))
@@ -718,6 +749,7 @@ a bug.~@:>")
                           specs))))
   (frob (#x6c t)
         (#x6d structure-object)
+        (#x6e condition)
         (#x6f definition-source-location)
         (#x70 sb!c::debug-fun)
         (#x71 sb!c::compiled-debug-fun)

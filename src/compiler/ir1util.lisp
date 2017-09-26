@@ -14,20 +14,24 @@
 
 ;;;; cleanup hackery
 
+(defun lexenv-enclosing-cleanup (lexenv)
+  (declare (type lexenv lexenv))
+  (do ((lexenv2 lexenv
+               (lambda-call-lexenv (lexenv-lambda lexenv2))))
+      ((null lexenv2) nil)
+    (awhen (lexenv-cleanup lexenv2)
+      (return it))))
+
 ;;; Return the innermost cleanup enclosing NODE, or NIL if there is
 ;;; none in its function. If NODE has no cleanup, but is in a LET,
 ;;; then we must still check the environment that the call is in.
 (defun node-enclosing-cleanup (node)
   (declare (type node node))
-  (do ((lexenv (node-lexenv node)
-               (lambda-call-lexenv (lexenv-lambda lexenv))))
-      ((null lexenv) nil)
-    (awhen (lexenv-cleanup lexenv)
-      (return it))))
+  (lexenv-enclosing-cleanup (node-lexenv node)))
 
-(defun map-nested-cleanups (function block &optional return-value)
-  (declare (type cblock block))
-  (do ((cleanup (block-end-cleanup block)
+(defun map-nested-cleanups (function lexenv &optional return-value)
+  (declare (type lexenv lexenv))
+  (do ((cleanup (lexenv-enclosing-cleanup lexenv)
                 (node-enclosing-cleanup (cleanup-mess-up cleanup))))
       ((not cleanup) return-value)
     (funcall function cleanup)))
@@ -406,11 +410,11 @@
            (unlink-node node))))
 
 ;;; Make a CAST and insert it into IR1 before node NEXT.
-(defun insert-cast-before (next lvar type policy)
+(defun insert-cast-before (next lvar type policy &optional context)
   (declare (type node next) (type lvar lvar) (type ctype type))
   (with-ir1-environment-from-node next
     (let* ((ctran (node-prev next))
-           (cast (make-cast lvar type policy))
+           (cast (make-cast lvar type policy context))
            (internal-ctran (make-ctran)))
       (setf (ctran-next ctran) cast
             (node-prev cast) ctran)
@@ -522,13 +526,16 @@
                  (lvar-good-for-dx-p (trivial-lambda-var-ref-lvar use) dx component))))))
 
 (defun lvar-good-for-dx-p (lvar dx &optional component)
-  (let ((uses (lvar-uses lvar))) ; TODO use ENSURE-LIST? or is it too slow?
-    (if (listp uses)
-        (when uses
-          (every (lambda (use)
-                   (use-good-for-dx-p use dx component))
-                 uses))
-        (use-good-for-dx-p uses dx component))))
+  (let ((uses (lvar-uses lvar)))
+    (cond
+      ((null uses)
+       nil)
+      ((consp uses)
+       (every (lambda (use)
+                (use-good-for-dx-p use dx component))
+              uses))
+      (t
+       (use-good-for-dx-p uses dx component)))))
 
 (defun known-dx-combination-p (use dx)
   (and (eq (combination-kind use) :known)
@@ -536,11 +543,12 @@
          (or (awhen (fun-info-stack-allocate-result info)
                (funcall it use dx))
              (awhen (fun-info-result-arg info)
-               (let ((args (combination-args use)))
-                 (lvar-good-for-dx-p (if (zerop it)
-                                         (car args)
-                                         (nth it args))
-                                     dx)))))))
+               (lvar-good-for-dx-p (nth it (combination-args use))
+                                   dx))))))
+
+;;; Bound to NIL in RECHECK-DYNAMIC-EXTENT-LVARS, so that the
+;;; combinations that didn't get converted are not treated as dx-safe.
+(defvar *dx-combination-p-check-local* t)
 
 (defun dx-combination-p (use dx)
   (and (combination-p use)
@@ -549,17 +557,18 @@
         (known-dx-combination-p use dx)
         ;; Possibly a not-yet-eliminated lambda which ends up returning the
         ;; results of an actual known DX combination.
-        (let* ((fun (combination-fun use))
-               (ref (principal-lvar-use fun))
-               (clambda (when (ref-p ref)
-                          (ref-leaf ref)))
-               (creturn (when (lambda-p clambda)
-                          (lambda-return clambda)))
-               (result-use (when (return-p creturn)
-                             (principal-lvar-use (return-result creturn)))))
-          ;; FIXME: We should be able to deal with multiple uses here as well.
-          (and (dx-combination-p result-use dx)
-               (combination-args-flow-cleanly-p use result-use dx))))))
+        (and *dx-combination-p-check-local*
+             (let* ((fun (combination-fun use))
+                    (ref (principal-lvar-use fun))
+                    (clambda (when (ref-p ref)
+                               (ref-leaf ref)))
+                    (creturn (when (lambda-p clambda)
+                               (lambda-return clambda)))
+                    (result-use (when (return-p creturn)
+                                  (principal-lvar-use (return-result creturn)))))
+               ;; FIXME: We should be able to deal with multiple uses here as well.
+               (and (dx-combination-p result-use dx)
+                    (combination-args-flow-cleanly-p use result-use dx)))))))
 
 (defun combination-args-flow-cleanly-p (combination1 combination2 dx)
   (labels ((recurse (combination)
@@ -574,8 +583,10 @@
                        (when (lambda-p clambda1)
                          (dolist (var (lambda-vars clambda1) t)
                            (dolist (var-ref (lambda-var-refs var))
-                             (let ((dest (principal-lvar-dest (ref-lvar var-ref))))
-                               (unless (and (combination-p dest) (recurse dest))
+                             (let* ((lvar (ref-lvar var-ref))
+                                    (dest (and lvar (principal-lvar-dest lvar))))
+                               (unless (or (not dest)
+                                           (and (combination-p dest) (recurse dest)))
                                  (return-from combination-args-flow-cleanly-p nil)))))))))))
     (recurse combination1)))
 
@@ -653,7 +664,7 @@
                     (handle-nested-dynamic-extent-lvars
                      dx other recheck-component)))))))
       (cons (cons dx lvar)
-            (if (listp uses) ; TODO use ENSURE-LIST? or is it too slow?
+            (if (listp uses)
                 (loop for use in uses
                       when (use-good-for-dx-p use dx recheck-component)
                       nconc (recurse use))
@@ -689,6 +700,10 @@
   (node-enclosing-cleanup (block-start-node block)))
 (defun block-end-cleanup (block)
   (node-enclosing-cleanup (block-last block)))
+
+;;; Return the lexenv of the last node in BLOCK.
+(defun block-end-lexenv (block)
+  (node-lexenv (block-last block)))
 
 ;;; Return the non-LET LAMBDA that holds BLOCK's code, or NIL
 ;;; if there is none.
@@ -746,6 +761,7 @@
 
 ;;; Return the (reversed) list for the PATH in the original source
 ;;; (with the Top Level Form number last).
+(declaim (ftype (sfunction (list) list) source-path-original-source))
 (defun source-path-original-source (path)
   (declare (list path) (inline member))
   (cddr (member 'original-source-start path :test #'eq)))
@@ -753,8 +769,9 @@
 ;;; Return the Form Number of PATH's original source inside the Top
 ;;; Level Form that contains it. This is determined by the order that
 ;;; we walk the subforms of the top level source form.
+(declaim (ftype (sfunction (list) (or null index)) source-path-form-number))
 (defun source-path-form-number (path)
-  (declare (list path) (inline member))
+  (declare (inline member))
   (cadr (member 'original-source-start path :test #'eq)))
 
 ;;; Return a list of all the enclosing forms not in the original
@@ -1053,7 +1070,7 @@
 ;;; have the same cleanup info, corresponding to the start, so the
 ;;; same approach returns safe result.
 (defun map-block-nlxes (fun block &optional dx-cleanup-fun)
-  (do-nested-cleanups (cleanup block)
+  (do-nested-cleanups (cleanup (block-end-lexenv block))
     (let ((mess-up (cleanup-mess-up cleanup)))
       (case (cleanup-kind cleanup)
         ((:block :tagbody)
@@ -1335,22 +1352,24 @@
 
   (values))
 
+;;; This is called by locall-analyze-fun-1 after it convers a call to
+;;; FUN into a local call.
+;;; Presumably, the function can be no longer reused by new calls to
+;;; FUN, so the whole thing has to be removed from *FREE-FUNS*
 (defun note-local-functional (fun)
   (declare (type functional fun))
   (when (and (leaf-has-source-name-p fun)
              (eq (leaf-source-name fun) (functional-debug-name fun)))
-    (let ((name (leaf-source-name fun)))
-      (let ((defined-fun (gethash name *free-funs*)))
-        (when (and defined-fun
-                   (defined-fun-p defined-fun)
-                   (eq (defined-fun-functional defined-fun) fun))
-          (remhash name *free-funs*))))))
+    (let* ((name (leaf-source-name fun))
+           (defined-fun (gethash name *free-funs*)))
+      (when (defined-fun-p defined-fun)
+        (remhash name *free-funs*)))))
 
 ;;; Return functional for DEFINED-FUN which has been converted in policy
 ;;; corresponding to the current one, or NIL if no such functional exists.
 ;;;
 ;;; Also check that the parent of the functional is visible in the current
-;;; environment.
+;;; environment and is in the current component.
 (defun defined-fun-functional (defined-fun)
   (let ((functionals (defined-fun-functionals defined-fun)))
     (when functionals
@@ -1372,7 +1391,14 @@
       ;; have one.
       (let ((policy (lexenv-%policy *lexenv*)))
         (dolist (functional functionals)
-          (when (policy= policy (lexenv-%policy (functional-lexenv functional)))
+          (when (and (neq (functional-kind functional) :deleted)
+                     (policy= policy (lexenv-%policy (functional-lexenv functional)))
+                     (eq (lambda-component
+                          (lambda-home
+                           (if (lambda-p functional)
+                               functional
+                               (optional-dispatch-main-entry functional))))
+                         *current-component*))
             (return functional)))))))
 
 ;;; Do stuff to delete the semantic attachments of a REF node. When
@@ -1591,8 +1617,6 @@
                             *compiler-error-context*))
   (values))
 
-(defvar *deletion-ignored-objects* '(t nil))
-
 ;;; Return true if we can find OBJ in FORM, NIL otherwise. We bound
 ;;; our recursion so that we don't get lost in circular structures. We
 ;;; ignore the car of forms if they are a symbol (to prevent confusing
@@ -1648,7 +1672,7 @@
                              (let ((pkg (symbol-package first)))
                                (and pkg
                                     (not (eq pkg (symbol-package :end))))))
-                         (not (member first *deletion-ignored-objects*))
+                         (not (member first '(t nil)))
                          (not (typep first '(or fixnum character)))
                          (every (lambda (x)
                                   (present-in-form first x 0))
@@ -1787,7 +1811,6 @@
 ;;; lambda with a new lambda-list with the correct number of
 ;;; arguments.
 (defun splice-fun-args (lvar fun num-args)
-  #!+sb-doc
   "If LVAR is a call to FUN with NUM-ARGS args, change those arguments to feed
 directly to the LVAR-DEST of LVAR, which must be a combination. If FUN
 is :ANY, the function name is not checked."
@@ -1948,46 +1971,69 @@ is :ANY, the function name is not checked."
                    ;; No point in stuffing them in the hash-table.
                    (and (typep x 'instance)
                         (not (or (leaf-p x) (node-p x))))))
+             (cons-coalesce-p (x)
+               (if (eq +code-coverage-unmarked+ (cdr x))
+                   ;; These are already coalesced, and the CAR should
+                   ;; always be OK, so no need to check.
+                   t
+                   (when (coalesce-tree-p x)
+                     (labels ((descend (x)
+                                (do ((y x (cdr y)))
+                                    ((atom y) (atom-colesce-p y))
+                                  ;; Don't just call file-coalesce-p, because it'll
+                                  ;; invoke COALESCE-TREE-P repeatedly
+                                  (let ((car (car y)))
+                                    (unless (if (consp car)
+                                                (descend car)
+                                                (atom-colesce-p car))
+                                      (return nil))))))
+                       (descend x)))))
+             (atom-colesce-p (x)
+               (or (core-coalesce-p x)
+                   ;; We *could* coalesce base-strings as well,
+                   ;; but we'd need a separate hash-table for
+                   ;; that, since we are not allowed to coalesce
+                   ;; base-strings with non-base-strings.
+                   (typep x
+                          '(or bit-vector
+                            ;; in the cross-compiler, we coalesce
+                            ;; all strings with the same contents,
+                            ;; because we will end up dumping them
+                            ;; as base-strings anyway.  In the
+                            ;; real compiler, we're not allowed to
+                            ;; coalesce regardless of string
+                            ;; specialized element type, so we
+                            ;; KLUDGE by coalescing only character
+                            ;; strings (the common case) and
+                            ;; punting on the other types.
+                            #+sb-xc-host
+                            string
+                            #-sb-xc-host
+                            (vector character)))))
              (file-coalesce-p (x)
                ;; CLHS 3.2.4.2.2: We are also allowed to coalesce various
                ;; other things when file-compiling.
-               (or (core-coalesce-p x)
-                   (if (consp x)
-                       (if (eq +code-coverage-unmarked+ (cdr x))
-                           ;; These are already coalesced, and the CAR should
-                           ;; always be OK, so no need to check.
-                           t
-                           (unless (maybe-cyclic-p x) ; safe for EQUAL?
-                             (do ((y x (cdr y)))
-                                 ((atom y) (file-coalesce-p y))
-                               (unless (file-coalesce-p (car y))
-                                 (return nil)))))
-                       ;; We *could* coalesce base-strings as well,
-                       ;; but we'd need a separate hash-table for
-                       ;; that, since we are not allowed to coalesce
-                       ;; base-strings with non-base-strings.
-                       (typep x
-                              '(or bit-vector
-                                ;; in the cross-compiler, we coalesce
-                                ;; all strings with the same contents,
-                                ;; because we will end up dumping them
-                                ;; as base-strings anyway.  In the
-                                ;; real compiler, we're not allowed to
-                                ;; coalesce regardless of string
-                                ;; specialized element type, so we
-                                ;; KLUDGE by coalescing only character
-                                ;; strings (the common case) and
-                                ;; punting on the other types.
-                                #+sb-xc-host
-                                string
-                                #-sb-xc-host
-                                (vector character))))))
+               (if (consp x)
+                   (cons-coalesce-p x)
+                   (atom-colesce-p x)))
              (coalescep (x)
                (if faslp (file-coalesce-p x) (core-coalesce-p x))))
+      ;; When compiling to core we don't coalesce strings, because
+      ;;  "The functions eval and compile are required to ensure that literal objects
+      ;;   referenced within the resulting interpreted or compiled code objects are
+      ;;   the _same_ as the corresponding objects in the source code."
+      ;; but in a dumped image, if gc_coalesce_string_literals is 1 then GC will
+      ;; coalesce similar immutable strings to save memory,
+      ;; even if not technically permitted. According to CLHS 3.7.1
+      ;;  "The consequences are undefined if literal objects are destructively modified
+      ;;   For this purpose, the following operations are considered destructive:
+      ;;   array - Storing a new value into some element of the array ..."
+      ;; so a string, once used as a literal in source, becomes logically immutable.
+      #-sb-xc-host
+      (when (and (not faslp) (simple-string-p object))
+        (logically-readonlyize object nil))
       (if (and (boundp '*constants*) (coalescep object))
-          (or (gethash object *constants*)
-              (setf (gethash object *constants*)
-                    (make-it)))
+          (ensure-gethash object *constants* (make-it))
           (make-it)))))
 
 ;;; Return true if VAR would have to be closed over if environment
@@ -2134,7 +2180,6 @@ is :ANY, the function name is not checked."
   (ref-leaf (lvar-uses (basic-combination-fun call))))
 
 (defvar *inline-expansion-limit* 200
-  #!+sb-doc
   "an upper limit on the number of inline function calls that will be expanded
    in any given code object (single function or block compilation)")
 
@@ -2302,14 +2347,15 @@ is :ANY, the function name is not checked."
     (when action (funcall action node))))
 
 ;;;
-(defun make-cast (value type policy)
+(defun make-cast (value type policy &optional context)
   (declare (type lvar value)
            (type ctype type)
            (type policy policy))
   (%make-cast :asserted-type type
               :type-to-check (maybe-weaken-check type policy)
               :value value
-              :derived-type (coerce-to-values type)))
+              :derived-type (coerce-to-values type)
+              :context context))
 
 (defun cast-type-check (cast)
   (declare (type cast cast))
@@ -2375,6 +2421,16 @@ is :ANY, the function name is not checked."
          (or (not arg-count)
              (= arg-count (length (combination-args use)))))))
 
+;;; In (a (b lvar)) (lvar-matches-calls lvar '(b a)) would return T
+(defun lvar-matches-calls (lvar dest-fun-names)
+  (loop for fun in dest-fun-names
+        for dest = (principal-lvar-dest lvar)
+        when (or (not (combination-p dest))
+                 (neq fun (combination-fun-source-name dest nil)))
+        return nil
+        do (setf lvar (combination-lvar dest))
+        finally (return t)))
+
 ;;; True if the optional has a rest-argument.
 (defun optional-rest-p (opt)
   (dolist (var (optional-dispatch-arglist opt) nil)
@@ -2392,3 +2448,22 @@ is :ANY, the function name is not checked."
   (and (policy call (eql preserve-single-use-debug-variables 3))
        (or (not (lambda-var-p var))
            (not (lambda-system-lambda-p (lambda-var-home var))))))
+
+;;; The function should accept
+;;; (lvar &key (arg-count (or null unsigned-byte)) (no-function-conversion boolean)
+;;;            (args argument-description*) (arg-lvars list-of-lvars))
+;;; where argument-description is either a position into arg-lvars or
+;;; (sequence position-into-arg-lvars)
+(defun map-callable-arguments (function combination)
+  (let* ((comination-name (lvar-fun-name (combination-fun combination) t))
+         (type (info :function :type comination-name))
+         (info (info :function :info comination-name)))
+    (when (fun-info-callable-map info)
+      (multiple-value-bind (args unknown) (resolve-key-args (combination-args combination) type)
+        (apply (fun-info-callable-map info)
+               (lambda (lvar &rest rest)
+                 (when lvar
+                   (apply function lvar :arg-lvars args
+                                        :unknown-keys unknown
+                                        rest)))
+               args)))))

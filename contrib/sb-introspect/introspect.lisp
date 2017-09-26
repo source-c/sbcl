@@ -94,16 +94,8 @@ include the pathname of the file and the position of the definition."
 
 (declaim (ftype (sb-int:sfunction (t debug-info) debug-function) debug-info-debug-function))
 (defun debug-info-debug-function (function debug-info)
-  (let ((map (sb-c::compiled-debug-info-fun-map debug-info))
-        (name (sb-kernel:%simple-fun-name (sb-kernel:%fun-fun function))))
-    (or
-     (find-if
-      (lambda (x)
-        (and
-         (sb-c::compiled-debug-fun-p x)
-         (eq (sb-c::compiled-debug-fun-name x) name)))
-      map)
-     (elt map 0))))
+  (sb-di::compiled-debug-fun-from-pc debug-info
+                                     (sb-di::function-start-pc-offset function)))
 
 (defun valid-function-name-p (name)
   "True if NAME denotes a valid function name, ie. one that can be passed to
@@ -125,12 +117,11 @@ FBOUNDP."
   "Call FN for each allocated code component in one of SPACES.  FN
 receives the object and its size as arguments.  SPACES should be a
 list of the symbols :dynamic, :static, or :read-only."
-  (dolist (space spaces)
-    (sb-vm::map-allocated-objects
+  (apply #'sb-vm::map-allocated-objects
      (lambda (obj header size)
        (when (= sb-vm:code-header-widetag header)
          (funcall fn obj size)))
-     space)))
+     spaces))
 
 (declaim (inline map-caller-code-components))
 (defun map-caller-code-components (function spaces fn)
@@ -481,14 +472,13 @@ If an unsupported TYPE is requested, the function will return NIL.
   (let* ((debug-info (function-debug-info function))
          (debug-source (debug-info-source debug-info))
          (debug-fun (debug-info-debug-function function debug-info))
-         (tlf (if debug-fun (sb-c::compiled-debug-fun-tlf-number debug-fun))))
+         (tlf (sb-c::compiled-debug-info-tlf-number debug-info)))
     (make-definition-source
      :pathname
      (when (stringp (sb-c::debug-source-namestring debug-source))
        (parse-namestring (sb-c::debug-source-namestring debug-source)))
      :character-offset
-     (if tlf
-         (elt (sb-c::debug-source-start-positions debug-source) tlf))
+     (sb-c::compiled-debug-info-char-offset debug-info)
      :form-path (if tlf (list tlf))
      :form-number (sb-c::compiled-debug-fun-form-number debug-fun)
      :file-write-date (sb-c::debug-source-created debug-source)
@@ -815,13 +805,15 @@ Experimental: interface subject to change."
                (let* ((addr (sb-kernel:get-lisp-obj-address object))
                       (space
                        (cond ((< sb-vm:read-only-space-start addr
-                                 (ash sb-vm:*read-only-space-free-pointer*
-                                      sb-vm:n-fixnum-tag-bits))
+                                 (sb-sys:sap-int sb-vm:*read-only-space-free-pointer*))
                               :read-only)
                              ((< sb-vm:static-space-start addr
-                                 (ash sb-vm:*static-space-free-pointer*
-                                      sb-vm:n-fixnum-tag-bits))
+                                 (sb-sys:sap-int sb-vm:*static-space-free-pointer*))
                               :static)
+                             #+immobile-space
+                             ((< sb-vm:immobile-space-start addr
+                                 (sb-sys:sap-int sb-vm:*immobile-space-free-pointer*))
+                              :immobile)
                              ((< (sb-kernel:current-dynamic-space-start) addr
                                  (sb-sys:sap-int (sb-kernel:dynamic-space-free-pointer)))
                               :dynamic))))
@@ -830,13 +822,14 @@ Experimental: interface subject to change."
                    (if (eq :dynamic space)
                        (let ((index (sb-vm::find-page-index addr)))
                          (symbol-macrolet ((page (sb-alien:deref sb-vm::page-table index)))
-                           (let ((flags (sb-alien:slot page 'sb-vm::flags)))
+                           (let* ((flags (sb-alien:slot page 'sb-vm::flags))
+                                  (allocated (ldb (byte 3 0) flags)))
                              (list :space space
                                    :generation (sb-alien:slot page 'sb-vm::gen)
-                                   :write-protected (logbitp 0 flags)
-                                   :boxed (logbitp 2 flags)
+                                   :write-protected (logbitp 3 flags)
+                                   :boxed (logbitp 0 allocated)
                                    :pinned (logbitp 5 flags)
-                                   :large (logbitp 6 flags)
+                                   :large (logbitp 7 flags)
                                    :page index))))
                        (list :space space))
                    #-gencgc
@@ -848,11 +841,11 @@ Experimental: interface subject to change."
                  ;; FIXME: Check other stacks as well.
                  #+sb-thread
                  (dolist (thread (sb-thread:list-all-threads))
-                   (let ((c-start (sb-di::descriptor-sap
+                   (let ((c-start (sb-int:descriptor-sap
                                    (sb-thread::%symbol-value-in-thread
                                     'sb-vm:*control-stack-start*
                                     thread)))
-                         (c-end (sb-di::descriptor-sap
+                         (c-end (sb-int:descriptor-sap
                                  (sb-thread::%symbol-value-in-thread
                                   'sb-vm:*control-stack-end*
                                   thread))))
@@ -887,15 +880,14 @@ conservative roots from the thread registers and interrupt contexts.
 Experimental: interface subject to change."
   (let ((fun (coerce function 'function))
         (seen (sb-int:alloc-xset)))
-    (flet ((call (part)
-             (when (and (member (sb-kernel:lowtag-of part)
-                                `(,sb-vm:instance-pointer-lowtag
-                                  ,sb-vm:list-pointer-lowtag
-                                  ,sb-vm:fun-pointer-lowtag
-                                  ,sb-vm:other-pointer-lowtag))
-                        (not (sb-int:xset-member-p part seen)))
-               (sb-int:add-to-xset part seen)
-               (funcall fun part))))
+    (labels ((call (part)
+               (when (and (is-lisp-pointer part)
+                          (not (sb-int:xset-member-p part seen)))
+                 (sb-int:add-to-xset part seen)
+                 (funcall fun part)))
+             (is-lisp-pointer (obj)
+               #+64-bit (= (logand (sb-kernel:get-lisp-obj-address obj) 3) 3)
+               #-64-bit (oddp (sb-kernel:get-lisp-obj-address obj))))
       (when ext
         (let ((table sb-pcl::*eql-specializer-table*))
           (call (sb-int:with-locked-system-table (table)
@@ -947,7 +939,7 @@ Experimental: interface subject to change."
              (dotimes (i (length object))
                (call (aref object i)))
              (when (sb-kernel:array-header-p object)
-               (call (sb-kernel::%array-data-vector object))
+               (call (sb-kernel:%array-data object))
                (call (sb-kernel::%array-displaced-p object))
                (unless simple
                  (call (sb-kernel::%array-displaced-from object))))))
@@ -1001,8 +993,8 @@ Experimental: interface subject to change."
            (call (symbol-package object))))
         (sb-kernel::random-class
          (case (sb-kernel:widetag-of object)
-           (#.sb-vm::value-cell-header-widetag
-            (call (sb-kernel::value-cell-ref object)))
+           (#.sb-vm:value-cell-widetag
+            (call (sb-kernel:value-cell-ref object)))
            (t
             (warn "~&MAP-ROOT: Unknown widetag ~S: ~S~%"
                   (sb-kernel:widetag-of object) object)))))))

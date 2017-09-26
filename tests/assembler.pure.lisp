@@ -19,7 +19,8 @@
 ;; this is architecture-agnostic
 (defun test-assemble (inst expect)
   (let ((segment (sb-assem:make-segment :type :regular)))
-    (apply (sb-assem::inst-emitter-symbol (car inst)) segment nil (cdr inst))
+    (sb-assem:assemble (segment)
+      (apply (sb-assem::op-encoder-name (car inst)) (cdr inst)))
     (let* ((buf (sb-assem::segment-buffer segment))
            (string
             (with-output-to-string (stream)
@@ -121,3 +122,31 @@
     #+x86-64
     (try `(add ,rcx-tn ,(memref :qword)) "48034D00         ADD RCX, [$fp]")
     ))
+
+(with-test (:name :disassemble-fs-prefix :skipped-on '(not (or :x86-64)))
+  (let ((bytes (coerce '(#x64 #xF0 #x44 #x08 #x04 #x25 #x00 #x04 #x10 #x20)
+                       '(array (unsigned-byte 8) 1)))
+        (s (make-string-output-stream)))
+    (sb-sys:with-pinned-objects (bytes)
+      (sb-disassem::disassemble-memory (sb-sys:sap-int (sb-sys:vector-sap bytes))
+                                       (length bytes)
+                                       :stream s))
+    (assert (search "FS LOCK OR [#x20100400], R8B"
+                    (get-output-stream-string s)))))
+
+(with-test (:name :disassemble-static-fdefn :skipped-on '(not :x86-64))
+  (assert (< (get-lisp-obj-address (sb-kernel::find-fdefn 'sb-impl::sub-gc))
+             sb-vm:static-space-end))
+  ;; Cause SUB-GC to become un-statically-linked
+  (progn (trace sb-impl::sub-gc) (untrace))
+  (let ((lines
+         (split-string (with-output-to-string (s)
+                         (disassemble 'sb-impl::gc :stream s))
+                       #\Newline))
+        (found))
+    ;; Check that find-called-object looked in static space for FDEFNs
+    (dolist (line lines)
+      (when (and (search "CALL" line)
+                 (search " SUB-GC>" line))
+        (setq found t)))
+    (assert found)))

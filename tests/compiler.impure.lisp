@@ -58,6 +58,24 @@
                               :k 'x :k 'y))))
                  'x)))
 
+;;; Lexically binding a name that is 1) bound to a global symbol macro
+;;; 2) at home in a locked package
+
+(defpackage #:package-for-global-symbol-macro (:lock t))
+(cl:in-package #:package-for-global-symbol-macro)
+(cl:define-symbol-macro global-symbol-macro 1)
+(cl:in-package #:cl-user)
+
+(with-test (:name (let define-symbol-macro :locked package))
+  (multiple-value-bind (fun failure-p warnings)
+      (checked-compile
+       '(lambda () (let ((package-for-global-symbol-macro::global-symbol-macro 1))
+                     package-for-global-symbol-macro::global-symbol-macro))
+       :allow-failure t :allow-warnings t)
+    (declare (ignore fun))
+    (assert failure-p)
+    (assert warnings)))
+
 ;;; As reported by Alexey Dejneka (sbcl-devel 2002-01-30), in
 ;;; sbcl-0.7.1 plus his patch (i.e. essentially sbcl-0.7.1.2), the
 ;;; compiler barfed on this, blowing up in FIND-IN-PHYSENV looking for
@@ -76,8 +94,13 @@
 ;;; catch tags are still a bad idea because EQ is used to compare
 ;;; tags, and EQ comparison on INTEGERs is unportable; but now it's a
 ;;; compiler warning instead of a failure to compile.)
-(defun foo ()
-  (catch 0 (print 1331)))
+(with-test (:name (compile catch :integer-valued-tag :bug-132))
+  (multiple-value-bind (fun failure-p warnings style-warnings)
+      (checked-compile '(lambda () (catch 0 (print 1331 (make-broadcast-stream))))
+                       :allow-style-warnings t)
+    (declare (ignore failure-p warnings))
+    (funcall fun)
+    (assert style-warnings)))
 
 ;;; Bug 150: In sbcl-0.7.1.15, compiling this code caused a failure in
 ;;; SB-C::ADD-TEST-CONSTRAINTS:
@@ -497,7 +520,7 @@
     (unwind-protect
          (progn
            (setq *bug204-test-status* nil)
-           (compile-file src)
+           (compile-file src :verbose nil :print nil)
            (assert (equal *bug204-test-status* '((:expanded :load-toplevel)
                                                  (:called :compile-toplevel)
                                                  (:expanded :compile-toplevel))))
@@ -516,7 +539,7 @@
     (unwind-protect
          (progn
            (setq *symbol-macrolet-test-status* nil)
-           (compile-file src)
+           (compile-file src :verbose nil :print nil)
            (assert (equal *symbol-macrolet-test-status*
                           '(2 1)))
            (setq *symbol-macrolet-test-status* nil)
@@ -929,6 +952,7 @@
                                 1 (make-instance 'broken-input-stream))
                        :test-broken)
                    (type-error (c)
+                     c
                      (return-from return :good))))
                :good)))
 
@@ -962,6 +986,7 @@
 
 ;;; No bogus warnings for calls to functions with complex lambda-lists.
 (defun complex-function-signature (&optional x &rest y &key z1 z2)
+  (declare (ignore z1 z2))
   (cons x y))
 (with-test (:name :complex-call-doesnt-warn)
   (checked-compile '(lambda (x) (complex-function-signature x :z1 1 :z2 2))))
@@ -1257,20 +1282,21 @@
                   (sb-kernel:specifier-type
                    (sb-kernel:%simple-fun-type fun))))))
              (test (type1 type2 form value-cell-p)
-             (let* ((lambda-form `(lambda ()
-                                    (load-time-value ,form)))
-                    (core-fun (checked-compile lambda-form))
-                    (core-type (funtype core-fun))
-                    (defun-form `(defun ,name ()
-                                   (load-time-value ,form)))
-                    (file-fun (progn
-                                (ctu:file-compile (list defun-form) :load t)
-                                (symbol-function name)))
-                    (file-type (funtype file-fun)))
-               (unless (subtypep core-type type1)
-                 (error "core: wanted ~S, got ~S" type1 core-type))
-               (unless (subtypep file-type type2)
-                 (error "file: wanted ~S, got ~S" type2 file-type)))))
+               (declare (ignore value-cell-p))
+               (let* ((lambda-form `(lambda ()
+                                      (load-time-value ,form)))
+                      (core-fun (checked-compile lambda-form))
+                      (core-type (funtype core-fun))
+                      (defun-form `(defun ,name ()
+                                     (load-time-value ,form)))
+                      (file-fun (let ((*error-output* (make-broadcast-stream)))
+                                  (ctu:file-compile (list defun-form) :load t)
+                                  (symbol-function name)))
+                      (file-type (funtype file-fun)))
+                 (unless (subtypep core-type type1)
+                   (error "core: wanted ~S, got ~S" type1 core-type))
+                 (unless (subtypep file-type type2)
+                   (error "file: wanted ~S, got ~S" type2 file-type)))))
       (let ((* 10))
         (test '(integer 11 11) 'number
               '(+ * 1) nil))
@@ -1319,6 +1345,7 @@
   (flet ((test (forms)
            (catch 'debug
              (let ((*debugger-hook* (lambda (condition if)
+                                      (declare (ignore if))
                                       (throw 'debug
                                         (if (typep condition 'serious-condition)
                                             :debug
@@ -1469,10 +1496,12 @@
     (sb-ext:restrict-compiler-policy 'debug 0)))
 
 (with-test (:name :restrict-compiler-policy-result)
-  (let ((sb-c::*policy-restrictions* sb-c::*policy-restrictions*))
+  (let ((sb-c::*policy-min* sb-c::*policy-min*)
+        (sb-c::*policy-max* sb-c::*policy-max*))
     (sb-ext:restrict-compiler-policy 'safety 2)
     (checked-compile '(lambda () (declare (optimize (safety 0))))))
-  (let ((sb-c::*policy-restrictions* sb-c::*policy-restrictions*))
+  (let ((sb-c::*policy-min* sb-c::*policy-min*)
+        (sb-c::*policy-max* sb-c::*policy-max*))
     ;; Passing no arguments returns the current quality/value pairs.
     (assert (null (sb-ext:restrict-compiler-policy)))
     (let ((res (sb-ext:restrict-compiler-policy 'safety 2)))
@@ -1521,12 +1550,14 @@
               (types types (rest types)))
              ((null ltypes)
               (unless (null types)
+                #+nil
                 (format t "~&More types than ltypes in ~A, translating ~A.~%"
                         (template-name template)
                         function)
                 (return nil)))
            (when (null types)
              (unless (null ltypes)
+               #+nil
                (format t "~&More ltypes than types in ~A, translating ~A.~%"
                        (template-name template)
                        function)
@@ -1544,7 +1575,7 @@
          (return nil))
         (t t)))))
 (test-util:with-test (:name :identify-suspect-vops)
-  (sb-c::call-with-each-globaldb-name
+  (sb-int:call-with-each-globaldb-name
    (lambda (name)
      ;; LEGAL-FUN-NAME-P test is necessary, since (INFO :FUNCTION :TYPE)
      ;; has a defaulting expression that involves calling FDEFINITION.
@@ -1617,6 +1648,7 @@
       (assert (= e-count 4)))))
 
 ;;; bug #389 (Rick Taube sbcl-devel)
+(declaim (ftype function bes-j0 bes-j1))
 (defun bes-jn (unn ux)
    (let ((nn unn) (x ux))
      (let* ((n (floor (abs nn)))
@@ -2078,7 +2110,8 @@
 
 ;;; bug 417: toplevel NIL confusing source path logic
 (handler-case
-    (delete-file (compile-file "bug-417.lisp"))
+    (delete-file (let ((*error-output* (make-broadcast-stream)))
+                   (compile-file "bug-417.lisp" :verbose nil :print nil)))
   (sb-ext:code-deletion-note (e)
     (error e)))
 
@@ -2135,7 +2168,8 @@
          (progn
            (with-open-file (f lisp :direction :output)
              (prin1 `(setf *lambda* ,lambda) f))
-           (multiple-value-bind (fasl warn fail) (compile-file lisp)
+           (multiple-value-bind (fasl warn fail)
+               (compile-file lisp :verbose nil :print nil)
              (declare (ignore warn))
              (when fail
                (error "File-compiling ~S failed." lambda))
@@ -2364,26 +2398,25 @@
 (defglobal **global-symbol-value-test-var** 0)
 
 (test-util:with-test (:name :symbol-value-type-derivation)
-  (let ((fun (compile
-              nil
-              `(lambda ()
-                 *symbol-value-test-var*))))
+  (let ((fun (compile nil `(lambda () *symbol-value-test-var*))))
     (assert (equal '(function () (values unsigned-byte &optional))
                    (%simple-fun-type fun))))
-  (let ((fun (compile
-              nil
-              `(lambda ()
-                 **global-symbol-value-test-var**))))
+  (let ((fun (compile nil `(lambda () **global-symbol-value-test-var**))))
     (assert (equal '(function () (values unsigned-byte &optional))
                    (%simple-fun-type fun))))
-  (let ((fun (compile
-              nil
-              `(lambda (*symbol-value-test-var*)
-                 (declare (fixnum *symbol-value-test-var*))
-                 (symbol-value '*symbol-value-test-var*))))
-        (ufix (type-specifier (specifier-type `(and unsigned-byte fixnum)))))
-    (assert (equal `(function (,ufix) (values ,ufix &optional))
-                   (%simple-fun-type fun))))
+  (let ((ufix (type-specifier (specifier-type `(and unsigned-byte fixnum)))))
+    ;; Test a free type decl
+    (let ((fun (compile nil `(lambda ()
+                               (declare (fixnum *symbol-value-test-var*))
+                               (symbol-value '*symbol-value-test-var*)))))
+      (assert (equal `(function () (values ,ufix &optional))
+                     (%simple-fun-type fun))))
+    ;; Test a bound type decl
+    (let ((fun (compile nil `(lambda (*symbol-value-test-var*)
+                               (declare (fixnum *symbol-value-test-var*))
+                               (symbol-value '*symbol-value-test-var*)))))
+      (assert (equal `(function (,ufix) (values ,ufix &optional))
+                     (%simple-fun-type fun)))))
   (let ((fun (compile
               nil
               `(lambda ()
@@ -2484,7 +2517,8 @@
   ;; as source forms.
   (let* ((src "bug-943953.lisp")
          (obj (compile-file-pathname src)))
-    (unwind-protect (compile-file src)
+    (unwind-protect (let ((*error-output* (make-broadcast-stream)))
+                      (compile-file src :verbose nil :print nil))
       (ignore-errors (delete-file obj)))))
 
 (declaim (inline vec-1177703))
@@ -2612,8 +2646,9 @@
 (in-package :cl-user)
 
 (with-test (:name :merge-lambdas-dead-return)
-  (let ((fasl (compile-file "merge-lambdas.lisp"
-                            :print nil :verbose nil)))
+  (let ((fasl (let ((*error-output* (make-broadcast-stream)))
+                (compile-file "merge-lambdas.lisp"
+                              :print nil :verbose nil))))
     (ignore-errors (delete-file fasl))))
 
 (declaim (inline ensure-a-fun))
@@ -2756,3 +2791,11 @@
                                  (setf (cdr x) 10d0))))
         (list (list nil)))
     (ctu:assert-no-consing (funcall fun list))))
+
+
+(with-test (:name :ftype-return-type-conflict)
+  (declaim (ftype (function () fixnum) ftype-return-type-conflict))
+  (assert-error (funcall (checked-compile `(sb-int:named-lambda ftype-return-type-conflict () nil)
+                                          :allow-warnings t
+                                          :allow-failure t))
+                type-error))

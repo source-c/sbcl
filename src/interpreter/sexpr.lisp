@@ -242,11 +242,11 @@
                              collect
                              `(list ,@(loop for j below n-cells
                                             collect `(access ,depth ,j))))))))
-  (defparameter *fast-lexvar-reffers*
+  (define-load-time-global *fast-lexvar-reffers*
     (macrolet ((access (up across)
                  `(hlambda GET-VAR () (env) (ref ,up ,across))))
       (array-of 4 10))) ; for 4 scopes and 10 names per scope you can go fast
-  (defparameter *fast-lexvar-setters* ; These are lambdas, not handlers
+  (define-load-time-global *fast-lexvar-setters* ; These are lambdas, not handlers
     (macrolet ((access (up across)
                  `(named-lambda (eval SET-VAR) (form env sexpr)
                     (declare #.+handler-optimize+ (ignore sexpr))
@@ -1202,7 +1202,9 @@ Test case.
                (digest-local-call frame-ptr (cdr args))))))))
 
   (let ((n-args 0)
-        (fun (fdefinition fname)))
+        (fun (if (typep fname '(cons (eql sb-pcl::slot-accessor)))
+                 (funcall 'sb-pcl::ensure-accessor fname)
+                 (fdefinition fname))))
     (multiple-value-setq (args n-args) (arglist-to-sexprs args))
 
     ;; Fold if every arg when trivially constant and the function is foldable.

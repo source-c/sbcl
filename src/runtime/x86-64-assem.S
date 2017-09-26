@@ -13,6 +13,11 @@
  * files for more information.
  */
 
+#ifdef __ELF__
+// Mark the object as not requiring an executable stack.
+.section .note.GNU-stack,"",%progbits
+#endif
+
 #define LANGUAGE_ASSEMBLY
 #include "genesis/config.h"
 #include "validate.h"
@@ -26,6 +31,14 @@
 #define GNAME(var) var
 #else
 #define GNAME(var) _##var
+#endif
+
+#if POSITION_INDEPENDENT_ASM
+#define PIC_CALL(x) x@PLT
+#define PIC_VAR(x) x(%rip)
+#else
+#define PIC_CALL(x) x
+#define PIC_VAR(x) x
 #endif
 
 /* Get the right type of alignment. Linux, FreeBSD and OpenBSD
@@ -102,7 +115,7 @@ GNAME(call_into_lisp_first_time):
 #if defined(LISP_FEATURE_DARWIN)
 	movq    GSYM(GNAME(all_threads)),%rax
 #else
-        movq    GNAME(all_threads),%rax
+        movq    PIC_VAR(GNAME(all_threads)),%rax
 #endif
 	mov     THREAD_CONTROL_STACK_END_OFFSET(%rax) ,%rsp
 	jmp     Lstack
@@ -162,9 +175,9 @@ Lstack:
 #ifdef LISP_FEATURE_DARWIN
 	mov	GSYM(GNAME(specials)),%rdi
 #else
-	mov	specials,%rdi
+	mov	PIC_VAR(specials),%rdi
 #endif
-	call    GNAME(pthread_getspecific)
+	call    PIC_CALL(GNAME(pthread_getspecific))
 	mov	%rax,%r12
 #endif
 #endif
@@ -201,8 +214,8 @@ Ldone:
 Lcall:
 	call	*CLOSURE_FUN_OFFSET(%rax)
 	
-	/* If the function returned multiple values, it will return to
-	   this point.  Lose them */
+	/* If the function returned multiple values, the carry flag will be set.
+           Lose them */
 	jnc	LsingleValue	
 	mov	%rbx, %rsp
 LsingleValue:	
@@ -249,6 +262,11 @@ LsingleValue:
 	op(0);op(1);op(2);op(3);op(4);op(5);op(6);op(7); \
     op(8);op(9);op(10);op(11);op(12);op(13);op(14);op(15);
 
+#define push_regs_a_c_d_si_di_8_9_10 \
+ push %rax; push %rcx; push %rdx; push %rsi; push %rdi; push %r8; push %r9; push %r10
+#define pop_regs_10_9_8_di_si_d_c_a \
+ pop %r10; pop %r9; pop %r8; pop %rdi; pop %rsi; pop %rdx; pop %rcx; pop %rax
+        
 	.text
 	.align	align_16byte,0x90
 	.globl  GNAME(alloc_tramp)
@@ -262,34 +280,43 @@ GNAME(alloc_tramp):
 	map_all_xmm(stkxmmsave)
 	# Doing rax twice is to maintain 16-byte stack alignment.
 	push    %rax
-	push	%rax
-	push	%rcx
-	push	%rdx
-	push	%rsi
-	push	%rdi
-	push	%r8
-	push	%r9
-	push	%r10
+	push_regs_a_c_d_si_di_8_9_10
 	push	%r11
 	# r12 through r15 are callee-saved
 	mov	16(%rbp),%rdi
 	call	GNAME(alloc)
 	mov	%rax,16(%rbp)
 	pop	%r11
-	pop	%r10
-	pop	%r9
-	pop	%r8
-	pop	%rdi
-	pop	%rsi
-	pop	%rdx
-	pop	%rcx
-	pop	%rax
+	pop_regs_10_9_8_di_si_d_c_a
 	pop	%rax # corresponds to "extra" push
 	map_all_xmm(stkxmmload)
 	mov	%rbp,%rsp
 	pop	%rbp
 	ret
 	SIZE(GNAME(alloc_tramp))
+
+
+	.align	align_16byte,0x90
+	.globl  GNAME(alloc_to_r11)
+	TYPE(GNAME(alloc_to_r11))
+GNAME(alloc_to_r11):
+	cld
+	push	%rbp		# Save old frame pointer.
+	mov	%rsp,%rbp	# Establish new frame.
+	and	$-32,%rsp
+	sub	$16*16,%rsp
+	map_all_xmm(stkxmmsave)
+	push_regs_a_c_d_si_di_8_9_10
+	# r12 through r15 are callee-saved
+	mov	16(%rbp),%rdi
+	call	GNAME(alloc)
+	mov	%rax,%r11       # move to result register
+	pop_regs_10_9_8_di_si_d_c_a
+	map_all_xmm(stkxmmload)
+	mov	%rbp,%rsp
+	pop	%rbp
+	retq    $8              # remove 8 bytes from the stack
+	SIZE(GNAME(alloc_to_r11))
 
 /*
  * fun-end breakpoint magic
@@ -388,7 +415,7 @@ GNAME(arch_scrub_control_stack):
 #ifdef LISP_FEATURE_DARWIN
 	mov	GSYM(GNAME(os_vm_page_size)),%r9
 #else
-	mov	os_vm_page_size,%r9
+	mov	PIC_VAR(os_vm_page_size),%r9
 #endif
 	lea	(%rsi,%r9), %r8
 	lea	(%rdx,%r9), %r9

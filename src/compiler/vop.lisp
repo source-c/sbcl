@@ -488,6 +488,7 @@
 ;;; A TEMPLATE object represents a particular IR2 coding strategy for
 ;;; a known function.
 (def!struct (template (:constructor nil)
+                      (:copier nil)
                       #-sb-xc-host (:pure t))
   ;; the symbol name of this VOP. This is used when printing the VOP
   ;; and is also used to provide a handle for definition and
@@ -560,11 +561,7 @@
 ;;; A VOP-INFO object holds the constant information for a given
 ;;; virtual operation. We include TEMPLATE so that functions with a
 ;;; direct VOP equivalent can be translated easily.
-(def!struct (vop-info (:include template))
-  ;; side effects of this VOP and side effects that affect the value
-  ;; of this VOP
-  (effects (missing-arg) :type attributes)
-  (affected (missing-arg) :type attributes)
+(def!struct (vop-info (:include template) (:copier nil))
   ;; If true, causes special casing of TNs live after this VOP that
   ;; aren't results:
   ;; -- If T, all such TNs that are allocated in a SC with a defined
@@ -695,29 +692,31 @@
 
 ;;; The SB structure represents the global information associated with
 ;;; a storage base.
-(def!struct (sb)
+(defstruct (sb (:copier nil))
+  ;; for indirecting access of read/write slots of this SB into an
+  ;; identically indexed SB object local to the particular compilation
+  (%index 0 :type (mod 8) :read-only t) ; arbitrary limit
   ;; name, for printing and reference
-  (name nil :type symbol)
+  (name nil :type symbol :read-only t)
   ;; the kind of storage base (which determines the packing
   ;; algorithm)
-  (kind :non-packed :type (member :finite :unbounded :non-packed))
+  (kind :non-packed :type (member :finite :unbounded :non-packed) :read-only t)
   ;; the number of elements in the SB. If finite, this is the total
   ;; size. If unbounded, this is the size that the SB is initially
   ;; allocated at.
-  (size 0 :type index))
-(!set-load-form-method sb (:host :xc))
+  (size 0 :type index :read-only t))
 (defprinter (sb)
   name)
 
 ;;; A FINITE-SB holds information needed by the packing algorithm for
 ;;; finite SBs.
-(def!struct (finite-sb (:include sb))
+(defstruct (finite-sb (:include sb) (:copier nil) (:conc-name fsb-))
   ;; the minimum number of location by which to grow this SB
   ;; if it is :unbounded
-  (size-increment 1 :type index)
+  (size-increment 1 :type index :read-only t)
   ;; current-size must always be a multiple of this. It is assumed
   ;; to be a power of two.
-  (size-alignment 1 :type index)
+  (size-alignment 1 :type index :read-only t)
   ;; the number of locations currently allocated in this SB
   (current-size 0 :type index)
   ;; the last location packed in, used by pack to scatter TNs to
@@ -744,6 +743,43 @@
   ;; starts. Less then the length of those vectors when not all of the
   ;; length was used on the previously packed component.
   (last-block-count 0 :type index))
+(proclaim '(freeze-type sb finite-sb))
+
+;;; During make-host-1 the length of *FINITE-SBS* is unknown.
+#+sb-xc-host
+(defmacro finite-sb-index (sb) `(fsb-%index ,sb))
+;;; The target compiler can be more efficient by eliding the bounds check.
+#-sb-xc-host
+(defmacro finite-sb-index (sb)
+  ;; Using #. instead of ",(length *backend-sbs*)" because the cross-compiler
+  ;; has not seen *BACKEND-SBS* yet, but the host compiler has!
+  `(truly-the (mod #.(length *backend-sbs*)) (fsb-%index ,sb)))
+
+;;; Give this a toplevel value so that it can be declaimed ALWAYS-BOUND.
+;;; The compiler will never look at the toplevel value though.
+(defvar *finite-sbs* #-sb-xc-host (make-array #.(length *backend-sbs*)))
+#-sb-xc-host (declaim (type (simple-vector #.(length *backend-sbs*))
+                            *finite-sbs*)
+                      (always-bound *finite-sbs*))
+;;; These two are not SETFable
+(declaim (inline finite-sb-size-increment finite-sb-size-alignment))
+(defun finite-sb-size-increment (sb) (fsb-size-increment sb))
+(defun finite-sb-size-alignment (sb) (fsb-size-alignment sb))
+;;; All these are SETFable
+(defmacro finite-sb-current-size (sb)
+  `(fsb-current-size (svref *finite-sbs* (finite-sb-index ,sb))))
+(defmacro finite-sb-last-offset (sb)
+  `(fsb-last-offset (svref *finite-sbs* (finite-sb-index ,sb))))
+(defmacro finite-sb-conflicts (sb)
+  `(fsb-conflicts (svref *finite-sbs* (finite-sb-index ,sb))))
+(defmacro finite-sb-always-live (sb)
+  `(fsb-always-live (svref *finite-sbs* (finite-sb-index ,sb))))
+(defmacro finite-sb-always-live-count (sb)
+  `(fsb-always-live-count (svref *finite-sbs* (finite-sb-index ,sb))))
+(defmacro finite-sb-live-tns (sb)
+  `(fsb-live-tns (svref *finite-sbs* (finite-sb-index ,sb))))
+(defmacro finite-sb-last-block-count (sb)
+  `(fsb-last-block-count (svref *finite-sbs* (finite-sb-index ,sb))))
 
 ;;; the SC structure holds the storage base that storage is allocated
 ;;; in and information used to select locations within the SB
@@ -944,10 +980,13 @@
   (loop-depth 0 :type fixnum))
 (declaim (freeze-type tn))
 (defmethod print-object ((tn tn) stream)
-  (print-unreadable-object (tn stream :type t)
+  (cond ((not (boundp 'sb!c::*compiler-ir-obj-map*))
+         (print-unreadable-object (tn stream :type t :identity t)))
+        (t
+         (print-unreadable-object (tn stream :type t)
     ;; KLUDGE: The distinction between PRINT-TN and PRINT-OBJECT on TN is
     ;; not very mnemonic. -- WHN 20000124
-    (print-tn-guts tn stream)))
+           (print-tn-guts tn stream)))))
 
 ;;; The GLOBAL-CONFLICTS structure represents the conflicts for global
 ;;; TNs. Each global TN has a list of these structures, one for each

@@ -87,10 +87,11 @@
                (unless (defined-ftype-matches-declared-ftype-p
                          defined-ftype declared-ftype)
                  (compiler-style-warn
-                  "~@<The previously declared FTYPE~2I ~_~S~I ~_~
-                   conflicts with the definition type ~2I~_~S~:>"
-                  (type-specifier declared-ftype)
-                  (type-specifier defined-ftype)))))
+                  "~@<The previously declared FTYPE~
+                   ~2I ~_~/sb!impl:print-type/~I ~_~
+                   conflicts with the definition type ~
+                   ~2I~_~/sb!impl:print-type/~:>"
+                  declared-ftype defined-ftype))))
             (:defined
              (setf (info :function :type source-name) defined-ftype)))))))
   (values))
@@ -197,49 +198,48 @@
     (do-nodes (node nil block)
       (when (and (combination-p node)
                  (eq (combination-kind node) :known))
-        (let* ((comination-name (lvar-fun-name (combination-fun node) t))
-               (type (info :function :type comination-name))
-               (info (info :function :info comination-name))
-               (args (combination-args node)))
-          (when (and info
-                     (fun-info-functional-args info))
-            (let ((fun-lvars (apply (fun-info-functional-args info)
-                                    (resolve-key-args args type))))
-              (loop for (fun . arg-count) in fun-lvars
-                    ;; TODO: handle CASTS.
-                    ;; principal-lvar-use will return the REF but the
-                    ;; CAST itself needs to be replaced.
-                    for ref = (lvar-uses fun)
-                    when (ref-p ref)
-                    do
-                    (flet ((translate-two-args (name)
-                             (and (eql arg-count 2)
-                                  (neq comination-name 'reduce)
-                                  (cadr (assoc name *two-arg-functions*)))))
-                      (let* ((leaf (ref-leaf ref))
-                             (fun-name (and (constant-p leaf)
-                                            (constant-value leaf)))
-                             (replacement
-                               (cond ((and fun-name
-                                           (symbolp fun-name))
-                                      (or (translate-two-args fun-name)
-                                          fun-name))
-                                     ((and (global-var-p leaf)
-                                           (eq (global-var-kind leaf) :global-function))
-                                      (translate-two-args (global-var-%source-name leaf))))))
-                        (when replacement
-                          (change-ref-leaf
-                           ref
-                           (let ((*compiler-error-context* node))
-                             (find-free-fun replacement "ir1-finalize")))))))))
-          (let ((two-arg (cadr (assoc comination-name *two-arg-functions*)))
-                (ref (lvar-uses (combination-fun node))))
-            (when (and two-arg
-                       (ref-p ref)
-                       (= (length args) 2))
-              (change-ref-leaf
-               ref
-               (find-free-fun two-arg "ir1-finalize")))))))))
+        (let ((comination-name (lvar-fun-name (combination-fun node) t)))
+          (map-callable-arguments
+           (lambda (lvar &key arg-count no-function-conversion &allow-other-keys)
+             ;; TODO: handle CASTS.
+             ;; principal-lvar-use will return the REF but the
+             ;; CAST itself needs to be replaced.
+             (unless no-function-conversion
+               (let ((ref (lvar-uses lvar)))
+                 (when (ref-p ref)
+                   (flet ((translate-two-args (name)
+                            (and (eql arg-count 2)
+                                 (neq comination-name 'reduce)
+                                 (cadr (assoc name *two-arg-functions*)))))
+                     (let* ((leaf (ref-leaf ref))
+                            (fun-name (and (constant-p leaf)
+                                           (constant-value leaf)))
+                            (replacement
+                              (cond ((and fun-name
+                                          (symbolp fun-name))
+                                     (or (translate-two-args fun-name)
+                                         fun-name))
+                                    ((and (global-var-p leaf)
+                                          (eq (global-var-kind leaf) :global-function))
+                                     (translate-two-args (global-var-%source-name leaf))))))
+                       (when replacement
+                         (change-ref-leaf
+                          ref
+                          (let ((*compiler-error-context* node))
+                            (find-free-fun replacement "ir1-finalize"))))))))))
+           node))))))
+
+(defun rewrite-full-call (combination)
+  (let ((comination-name (lvar-fun-name (combination-fun combination) t))
+        (args (combination-args combination)))
+    (let ((two-arg (cadr (assoc comination-name *two-arg-functions*)))
+          (ref (lvar-uses (combination-fun combination))))
+      (when (and two-arg
+                 (ref-p ref)
+                 (= (length args) 2))
+        (change-ref-leaf
+         ref
+         (find-free-fun two-arg "rewrite-full-call"))))))
 
 ;;; Do miscellaneous things that we want to do once all optimization
 ;;; has been done:

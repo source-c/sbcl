@@ -13,24 +13,30 @@
 
 ;;;; register specs
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defvar *byte-register-names* (make-array 32 :initial-element nil))
-  (defvar *word-register-names* (make-array 32 :initial-element nil))
-  (defvar *dword-register-names* (make-array 32 :initial-element nil))
-  (defvar *qword-register-names* (make-array 32 :initial-element nil))
-  (defvar *float-register-names* (make-array 16 :initial-element nil)))
+(defconstant-eqx +byte-register-names+
+    #("AL"  "CL"  "DL"   "BL"   "SPL"  "BPL"  "SIL"  "DIL"
+      "R8B" "R9B" "R10B" "R11B" "R12B" "R13B" "R14B" "R15B")
+  #'equalp)
+(defconstant-eqx +word-register-names+
+    #("AX"  "CX"  "DX"   "BX"   "SP"   "BP"   "SI"   "DI"
+      "R8W" "R9W" "R10W" "R11W" "R12W" "R13W" "R14W" "R15W")
+  #'equalp)
+(defconstant-eqx +dword-register-names+
+    #("EAX" "ECX" "EDX"  "EBX"  "ESP"  "EBP"  "ESI"  "EDI"
+      "R8D" "R9D" "R10D" "R11D" "R12D" "R13D" "R14D" "R15D")
+  #'equalp)
+(defconstant-eqx +qword-register-names+
+    #("RAX" "RCX" "RDX" "RBX" "RSP" "RBP" "RSI" "RDI"
+      "R8"  "R9"  "R10" "R11" "R12" "R13" "R14" "R15")
+  #'equalp)
 
 (macrolet ((defreg (name offset size)
-             (let ((offset-sym (symbolicate name "-OFFSET"))
-                   (names-vector (symbolicate "*" size "-REGISTER-NAMES*")))
-               `(progn
-                  (eval-when (:compile-toplevel :load-toplevel :execute)
+             (declare (ignore size))
+             `(eval-when (:compile-toplevel :load-toplevel :execute)
                     ;; EVAL-WHEN is necessary because stuff like #.EAX-OFFSET
                     ;; (in the same file) depends on compile-time evaluation
                     ;; of the DEFCONSTANT. -- AL 20010224
-                    (defconstant ,offset-sym ,offset))
-                  (setf (svref ,names-vector ,offset-sym)
-                        ,(symbol-name name)))))
+                (defconstant ,(symbolicate name "-OFFSET") ,offset)))
            ;; FIXME: It looks to me as though DEFREGSET should also
            ;; define the related *FOO-REGISTER-NAMES* variable.
            (defregset (name &rest regs)
@@ -183,7 +189,8 @@
 
 (define-storage-base float-registers :finite :size 16)
 
-(define-storage-base stack :unbounded :size 3 :size-increment 1)
+;;; Start from 2, for the old RBP (aka OCFP) and return address
+(define-storage-base stack :unbounded :size 2 :size-increment 1)
 (define-storage-base constant :non-packed)
 (define-storage-base immediate-constant :non-packed)
 (define-storage-base noise :unbounded :size 2)
@@ -404,7 +411,7 @@
                           ;; FIXME: It'd be good to have the special
                           ;; variables here be named with the *FOO*
                           ;; convention.
-                          (forms `(defparameter ,tn-name
+                          (forms `(defglobal ,tn-name
                                     (make-random-tn :kind :normal
                                                     :sc (sc-or-lose ',sc-name)
                                                     :offset
@@ -436,7 +443,7 @@
 ;; A register that's never used by the code generator, and can therefore
 ;; be used as an assembly temporary in cases where a VOP :TEMPORARY can't
 ;; be used.
-(defparameter temp-reg-tn r11-tn)
+(defglobal temp-reg-tn r11-tn)
 
 ;;; TNs for registers used to pass arguments
 (defparameter *register-arg-tns*
@@ -444,8 +451,8 @@
             (symbol-value (symbolicate register-arg-name "-TN")))
           *register-arg-names*))
 
-(defparameter thread-base-tn
-  (make-random-tn :kind :normal :sc (sc-or-lose 'unsigned-reg )
+(defglobal thread-base-tn
+  (make-random-tn :kind :normal :sc (sc-or-lose 'unsigned-reg)
                   :offset r12-offset))
 
 ;;; If value can be represented as an immediate constant, then return
@@ -455,9 +462,29 @@
     ((or (integer #.sb!xc:most-negative-fixnum #.sb!xc:most-positive-fixnum)
          character)
      (sc-number-or-lose 'immediate))
-    (symbol
-     (when (static-symbol-p value)
+    (symbol ; Symbols in static and immobile space are immediate
+     (when (or ;; With #!+immobile-symbols, all symbols are in immobile-space.
+               ;; And the cross-compiler always uses immobile-space if enabled.
+               #!+(or immobile-symbols (and immobile-space (host-feature sb-xc-host))) t
+
+               ;; Otherwise, if #!-immobile-symbols, and the symbol was present
+               ;; in the initial core image as indicated by the symbol header, then
+               ;; it's in immobile-space. There is a way in which the bit can be wrong,
+               ;; but it's highly unlikely - the symbol would have to be uninterned from
+               ;; the loading SBCL, reallocated in dynamic space and re-interned into its
+               ;; initial package. All without breaking anything. Hence, unlikely.
+               ;; Also note that if compiling to memory, the symbol's current address
+               ;; is used to determine whether it's immediate.
+               #!+(and (not (host-feature sb-xc-host)) immobile-space (not immobile-symbols))
+               (or (logbitp +initial-core-symbol-bit+ (get-header-data value))
+                   (and (sb!c::core-object-p sb!c::*compile-object*)
+                        (immobile-space-obj-p value)))
+
+               (static-symbol-p value))
        (sc-number-or-lose 'immediate)))
+    #!+immobile-space
+    (layout
+       (sc-number-or-lose 'immediate))
     (single-float
        (sc-number-or-lose
         (if (eql value 0f0) 'fp-single-zero 'fp-single-immediate)))
@@ -488,10 +515,13 @@
   (if (sc-is tn immediate)
       (let ((val (tn-value tn)))
         (etypecase val
-          (integer (if tag
-                       (fixnumize val)
-                       val))
-          (symbol (+ nil-value (static-symbol-offset val)))
+          (integer  (if tag (fixnumize val) val))
+          (symbol   (if (static-symbol-p val)
+                        (+ nil-value (static-symbol-offset val))
+                        (make-fixup val :immobile-object)))
+          #!+immobile-space
+          (layout
+           (make-fixup val :layout))
           (character (if tag
                          (logior (ash (char-code val) n-widetag-bits)
                                  character-widetag)
@@ -508,7 +538,6 @@
 ;;; RBP-16 on.
 (defconstant return-pc-save-offset 0)
 (defconstant ocfp-save-offset 1)
-(defconstant code-save-offset 2)
 ;;; Let SP be the stack pointer before CALLing, and FP is the frame
 ;;; pointer after the standard prologue. SP +
 ;;; FRAME-WORD-OFFSET(SP->FP-OFFSET + I) = FP + FRAME-WORD-OFFSET(I).
@@ -537,17 +566,19 @@
     (ecase sb
       (registers
        (let* ((sc-name (sc-name sc))
+              (index (ash offset -1))
               (name-vec (cond ((member sc-name *byte-sc-names*)
-                               *byte-register-names*)
+                               +byte-register-names+)
                               ((member sc-name *word-sc-names*)
-                               *word-register-names*)
+                               +word-register-names+)
                               ((member sc-name *dword-sc-names*)
-                               *dword-register-names*)
+                               +dword-register-names+)
                               ((member sc-name *qword-sc-names*)
-                               *qword-register-names*))))
+                               +qword-register-names+))))
          (or (and name-vec
-                  (< -1 offset (length name-vec))
-                  (svref name-vec offset))
+                  (evenp offset)
+                  (< -1 index (length name-vec))
+                  (svref name-vec index))
              ;; FIXME: Shouldn't this be an ERROR?
              (format nil "<unknown reg: off=~W, sc=~A>" offset sc-name))))
       (float-registers (format nil "FLOAT~D" offset))
@@ -555,17 +586,6 @@
       (constant (format nil "Const~D" offset))
       (immediate-constant "Immed")
       (noise (symbol-name (sc-name sc))))))
-;;; FIXME: Could this, and everything that uses it, be made #!+SB-SHOW?
-
-(defun dwords-for-quad (value)
-  (let* ((lo (logand value (1- (ash 1 32))))
-         (hi (ash value -32)))
-    (values lo hi)))
-
-(defun words-for-dword (value)
-  (let* ((lo (logand value (1- (ash 1 16))))
-         (hi (ash value -16)))
-    (values lo hi)))
 
 (defconstant cfp-offset rbp-offset) ; pfw - needed by stuff in /code
 

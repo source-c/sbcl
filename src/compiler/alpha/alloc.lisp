@@ -117,14 +117,15 @@
 
 (define-vop (make-closure)
   (:args (function :to :save :scs (descriptor-reg)))
-  (:info length stack-allocate-p)
+  (:info label length stack-allocate-p)
+  (:ignore label)
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:results (result :scs (descriptor-reg)))
   (:generator 10
     (let* ((size (+ length closure-info-offset))
            (alloc-size (pad-data-block size)))
       (inst li
-            (logior (ash (1- size) n-widetag-bits) closure-header-widetag)
+            (logior (ash (1- size) n-widetag-bits) closure-widetag)
             temp)
       (pseudo-atomic (:extra (if stack-allocate-p 0 alloc-size))
         (cond (stack-allocate-p
@@ -145,7 +146,7 @@
   (:results (result :scs (descriptor-reg)))
   (:generator 10
     (with-fixed-allocation
-        (result temp value-cell-header-widetag value-cell-size)
+        (result temp value-cell-widetag value-cell-size)
       (storew value result value-cell-value-slot other-pointer-lowtag))))
 
 ;;;; automatic allocators for primitive objects

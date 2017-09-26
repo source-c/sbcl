@@ -53,12 +53,6 @@
 (defun callee-return-pc-tn (2env)
   (ir2-physenv-return-pc-pass 2env))
 
-;;;; specials used during code generation
-
-(defvar *code-segment* nil)
-(defvar *elsewhere* nil)
-(defvar *elsewhere-label* nil)
-
 ;;;; noise to emit an instruction trace
 
 (defvar *prev-segment*)
@@ -225,7 +219,7 @@
         (*fixup-notes* nil))
     (let ((label (sb!assem:gen-label)))
       (setf *elsewhere-label* label)
-      (sb!assem:assemble (*elsewhere*)
+      (assemble (*elsewhere*)
         (sb!assem:emit-label label)))
     ;; Leave space for the unboxed words containing simple-fun offsets.
     ;; Each offset is a 32-bit integer. On 64-bit platforms, 1 offset
@@ -243,7 +237,7 @@
       (let ((1block (ir2-block-block block)))
         (when (and (eq (block-info 1block) block)
                    (block-start 1block))
-          (sb!assem:assemble (*code-segment*)
+          (assemble (*code-segment*)
             ;; Align first emitted block of each loop: x86 and x86-64 both
             ;; like 16 byte alignment, however, since x86 aligns code objects
             ;; on 8 byte boundaries we cannot guarantee proper loop alignment
@@ -270,29 +264,30 @@
       (do ((vop (ir2-block-start-vop block) (vop-next vop)))
           ((null vop))
         (let ((gen (vop-info-generator-function (vop-info vop))))
-          (cond ((not gen)
-                 (format t
-                         "missing generator for ~S~%"
-                         (template-name (vop-info vop))))
-                #!+arm64
-                ((and (vop-next vop)
-                      (eq (vop-name vop)
-                          (vop-name (vop-next vop)))
-                      (memq (vop-name vop) '(move move-operand sb!vm::move-arg))
-                      (sb!vm::load-store-two-words vop (vop-next vop)))
-                 (setf vop (vop-next vop)))
-                (t
-                 (funcall gen vop))))))
-    (sb!assem:append-segment *code-segment* *elsewhere*)
+          (assemble (*code-segment* vop)
+            (cond ((not gen)
+                   (format t
+                           "missing generator for ~S~%"
+                           (template-name (vop-info vop))))
+                  #!+arm64
+                  ((and (vop-next vop)
+                        (eq (vop-name vop)
+                            (vop-name (vop-next vop)))
+                        (memq (vop-name vop) '(move move-operand sb!vm::move-arg))
+                        (sb!vm::load-store-two-words vop (vop-next vop)))
+                   (setf vop (vop-next vop)))
+                  (t
+                   (funcall gen vop)))))))
+    (append-segment *code-segment* *elsewhere*)
     (setf *elsewhere* nil)
     #!+inline-constants
     (emit-inline-constants)
-    (values (sb!assem:finalize-segment *code-segment*)
+    (values (finalize-segment *code-segment*)
             *fixup-notes*)))
 
 (defun emit-label-elsewhere (label)
-  (sb!assem:assemble (*elsewhere*)
-    (sb!assem:emit-label label)))
+  (assemble (*elsewhere*)
+    (emit-label label)))
 
 (defun label-elsewhere-p (label-or-posn kind)
   (let ((elsewhere (label-position *elsewhere-label*))
@@ -313,7 +308,8 @@
   (declare (dynamic-extent constant-descriptor))
   (let ((constants *unboxed-constants*)
         (constant (sb!vm:canonicalize-inline-constant constant-descriptor)))
-    (or (gethash constant (constant-table constants))
-        (multiple-value-bind (label value) (sb!vm:inline-constant-value constant)
-          (vector-push-extend (cons constant label) (constant-vector constants))
-          (setf (gethash constant (constant-table constants)) value)))))
+    (ensure-gethash
+     constant (constant-table constants)
+     (multiple-value-bind (label value) (sb!vm:inline-constant-value constant)
+       (vector-push-extend (cons constant label) (constant-vector constants))
+       value))))

@@ -14,8 +14,8 @@
 
 (def!type thread-name () 'simple-string)
 
-(defstruct (thread (:constructor %make-thread))
-  #!+sb-doc
+(defstruct (thread (:constructor %make-thread)
+                   (:copier nil))
   "Thread type. Do not rely on threads being structs as it may change
 in future versions."
   (name          nil :type (or thread-name null))
@@ -34,8 +34,8 @@ in future versions."
    :type mutex)
   waiting-for)
 
-(def!struct (mutex (:constructor make-mutex (&key name)))
-  #!+sb-doc
+(def!struct (mutex (:constructor make-mutex (&key name))
+                   (:copier nil))
   "Mutex type."
   (name   nil :type (or null thread-name))
   (%owner nil :type (or null thread))

@@ -97,7 +97,8 @@
     (when old-method
       (remove-method #'find-method-combination old-method))
     (add-method #'find-method-combination new-method)
-    (setf (random-documentation type-name 'method-combination) doc)
+    (when doc
+      (setf (random-documentation type-name 'method-combination) doc))
     type-name))
 
 (defun short-combine-methods (type-name options operator ioa method doc)
@@ -162,7 +163,7 @@
       `(load-long-defcombin ',type-name ',documentation #',function
                             ',args-option (sb-c:source-location)))))
 
-(defvar *long-method-combination-functions* (make-hash-table :test 'eq))
+(define-load-time-global *long-method-combination-functions* (make-hash-table :test 'eq))
 
 (defun load-long-defcombin
     (type-name doc function args-lambda-list source-location)
@@ -235,7 +236,7 @@
     (reference-condition simple-error)
   ()
   (:default-initargs
-   :references (list '(:ansi-cl :macro define-method-combination))))
+   :references '((:ansi-cl :macro define-method-combination))))
 
 ;;; NOTE:
 ;;;

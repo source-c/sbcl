@@ -21,20 +21,6 @@
 (declaim (type index *current-form-number*))
 (defvar *current-form-number*)
 
-;;; *SOURCE-PATHS* is a hashtable from source code forms to the path
-;;; taken through the source to reach the form. This provides a way to
-;;; keep track of the location of original source forms, even when
-;;; macroexpansions and other arbitary permutations of the code
-;;; happen. This table is initialized by calling FIND-SOURCE-PATHS on
-;;; the original source.
-;;;
-;;; It is fairly useless to store symbols, characters, or fixnums in
-;;; this table, as 42 is EQ to 42 no matter where in the source it
-;;; appears. GET-SOURCE-PATH and NOTE-SOURCE-PATH functions should be
-;;; always used to access this table.
-(declaim (hash-table *source-paths*))
-(defvar *source-paths*)
-
 (declaim (inline source-form-has-path-p))
 (defun source-form-has-path-p (form)
   (not (typep form '(or symbol fixnum character))))
@@ -93,14 +79,11 @@
     (funcall thunk)))
 
 (defvar *derive-function-types* nil
-  #!+sb-doc
   "Should the compiler assume that function types will never change,
   so that it can use type information inferred from current definitions
   to optimize code which uses those definitions? Setting this true
   gives non-ANSI, early-CMU-CL behavior. It can be useful for improving
   the efficiency of stable code.")
-
-(defvar *fun-names-in-this-file* nil)
 
 (defvar *post-binding-variable-lexenv* nil)
 
@@ -140,6 +123,8 @@
     (setf (info :function :where-from name) :assumed))
   (let ((where (info :function :where-from name)))
     (when (and (eq where :assumed)
+               ;; Slot accessors are defined just-in-time, if not already.
+               (not (typep name '(cons (eql sb!pcl::slot-accessor))))
                ;; In the ordinary target Lisp, it's silly to report
                ;; undefinedness when the function is defined in the
                ;; running Lisp. But at cross-compile time, the current
@@ -267,7 +252,9 @@
            (find-free-fun name context)))))
 
 (defun maybe-find-free-var (name)
-  (gethash name *free-vars*))
+  (let ((found (gethash name *free-vars*)))
+    (unless (eq found :deprecated)
+      found)))
 
 ;;; Return the LEAF node for a global variable reference to NAME. If
 ;;; NAME is already entered in *FREE-VARS*, then we just return the
@@ -275,16 +262,24 @@
 ;;; information from the global environment and enter it in
 ;;; *FREE-VARS*. If the variable is unknown, then we emit a warning.
 (declaim (ftype (sfunction (t) (or leaf cons heap-alien-info)) find-free-var))
-(defun find-free-var (name)
+(defun find-free-var (name &aux (existing (gethash name *free-vars*)))
   (unless (symbolp name)
     (compiler-error "Variable name is not a symbol: ~S." name))
-  (or (gethash name *free-vars*)
+  (or (when (and existing (neq existing :deprecated))
+        existing)
       (let ((kind (info :variable :kind name))
             (type (info :variable :type name))
             (where-from (info :variable :where-from name))
             (deprecation-state (deprecated-thing-p 'variable name)))
         (when (and (eq kind :unknown) (not deprecation-state))
           (note-undefined-reference name :variable))
+        ;; For deprecated vars, warn about LET and LAMBDA bindings, SETQ, and ref.
+        ;; Don't warn again if the name was already seen by the transform
+        ;; of SYMBOL[-GLOBAL]-VALUE.
+        (unless (eq existing :deprecated)
+          (case deprecation-state
+            ((:early :late)
+             (check-deprecated-thing 'variable name))))
         (setf (gethash name *free-vars*)
               (case kind
                 (:alien
@@ -603,6 +598,8 @@
                       (reference-leaf start next result form))
                      (t
                       (reference-constant start next result form))))
+              ((not (proper-list-p form))
+               (compiler-error "~@<~S is not a proper list.~@:>" form))
               (t
                (ir1-convert-functoid start next result form)))))
     (values))
@@ -692,14 +689,14 @@
   (declare (type ctran start next) (type (or lvar null) result) (symbol name))
   (let ((var (or (lexenv-find name vars) (find-free-var name))))
     (if (and (global-var-p var) (not (always-boundp name)))
-        ;; KLUDGE: If the variable may be unbound, convert using SYMBOL-VALUE
+        ;; KLUDGE: If the variable may be unbound, convert using SYMEVAL
         ;; which is not flushable, so that unbound dead variables signal an
         ;; error (bug 412, lp#722734): checking for null RESULT is not enough,
         ;; since variables can become dead due to later optimizations.
         (ir1-convert start next result
                      (if (eq (global-var-kind var) :global)
-                         `(symbol-global-value ',name)
-                         `(symbol-value ',name)))
+                         `(sym-global-val ',name)
+                         `(symeval ',name)))
         (etypecase var
           (leaf
            (cond
@@ -715,20 +712,17 @@
                 ;; there's no need for us to accept ANSI's lameness when
                 ;; processing our own code, though.
                 #+sb-xc-host
-                (warn "reading an ignored variable: ~S" name)))
-             (t
-              ;; This case signals {EARLY,LATE}-DEPRECATION-WARNING
-              ;; for CONSTANT nodes in :EARLY and :LATE deprecation
-              ;; (constants in :FINAL deprecation are represented as
-              ;; symbol-macros).
-              (aver (memq (check-deprecated-thing 'variable name)
-                          '(nil :early :late)))))
+                (warn "reading an ignored variable: ~S" name))))
            (reference-leaf start next result var name))
           ((cons (eql macro)) ; symbol-macro
+           ;; FIXME: the following comment is probably wrong now.
+           ;; If we warn here on :early and :late deprecation
+           ;; then we get an extra warning somehow.
            ;; This case signals {EARLY,LATE,FINAL}-DEPRECATION-WARNING
            ;; for symbol-macros. Includes variables, constants,
            ;; etc. in :FINAL deprecation.
-           (check-deprecated-thing 'variable name)
+           (when (eq (deprecated-thing-p 'variable name) :final)
+             (check-deprecated-thing 'variable name))
            ;; FIXME: [Free] type declarations. -- APD, 2002-01-26
            (ir1-convert start next result (cdr var)))
           (heap-alien-info
@@ -985,24 +979,22 @@
                    ;; Get an interned record cons for the path. A cons
                    ;; with the same object identity must be used for
                    ;; each instrument for the same block.
-                   (or (gethash path *code-coverage-records*)
-                       (setf (gethash path *code-coverage-records*)
-                             (cons path +code-coverage-unmarked+))))
+                   (ensure-gethash path *code-coverage-records*
+                                   (cons path +code-coverage-unmarked+)))
                   (next (make-ctran))
                   (*allow-instrumenting* nil))
               (push (ctran-block start)
                     (gethash path *code-coverage-blocks*))
-              (let ((*allow-instrumenting* nil))
-                (ir1-convert start next nil
-                             `(locally
-                                  (declare (optimize speed
-                                                     (safety 0)
-                                                     (debug 0)
-                                                     (check-constant-modification 0)))
-                                ;; We're being naughty here, and
-                                ;; modifying constant data. That's ok,
-                                ;; we know what we're doing.
-                                (%rplacd ',store t))))
+              (ir1-convert start next nil
+                           `(locally
+                                (declare (optimize speed
+                                                   (safety 0)
+                                                   (debug 0)
+                                                   (check-constant-modification 0)))
+                              ;; We're being naughty here, and
+                              ;; modifying constant data. That's ok,
+                              ;; we know what we're doing.
+                              (%rplacd ',store t)))
               next)))
       start))
 
@@ -1047,18 +1039,19 @@
 ;;; instrumentation for?
 (defun step-form-p (form)
   (flet ((step-symbol-p (symbol)
-           (and (not (member (symbol-package symbol)
-                             (load-time-value
+           ;; Consistent treatment of *FOO* vs (SYMBOL-VALUE '*FOO*):
+           ;; we insert calls to SYMEVAL for most non-lexical
+           ;; variable references in order to avoid them being elided
+           ;; if the value is unused.
+           (if (member symbol '(symeval sym-global-val))
+               (not (constantp (second form)))
+               (not (member (symbol-package symbol)
+                            (load-time-value
                               ;; KLUDGE: packages we're not interested in
                               ;; stepping.
                               (mapcar #'find-package '(sb!c sb!int sb!impl
-                                                       sb!kernel sb!pcl)) t)))
-                ;; Consistent treatment of *FOO* vs (SYMBOL-VALUE '*FOO*):
-                ;; we insert calls to SYMBOL-VALUE for most non-lexical
-                ;; variable references in order to avoid them being elided
-                ;; if the value is unused.
-                (or (not (member symbol '(symbol-value symbol-global-value)))
-                    (not (constantp (second form)))))))
+                                                       sb!kernel sb!pcl))
+                             t))))))
     (and *allow-instrumenting*
          (policy *lexenv* (= insert-step-conditions 3))
          (listp form)
@@ -1327,7 +1320,10 @@
         (when (fboundp name)
           (program-assert-symbol-home-package-unlocked
            context name "declaring the ftype of ~A"))
-        (let ((found (find name fvars :key #'leaf-source-name :test #'equal)))
+        (let ((found (find name fvars :key (lambda (x)
+                                             (unless (consp x) ;; macrolet
+                                               (leaf-source-name x)))
+                                      :test #'equal)))
           (cond
            (found
             (setf (leaf-type found) type)
@@ -1419,10 +1415,14 @@
 ;;; Parse an inline/notinline declaration. If it's a local function we're
 ;;; defining, set its INLINEP. If a global function, add a new FENV entry.
 (defun process-inline-decl (spec res fvars)
-  (let ((sense (cdr (assoc (first spec) *inlinep-translations* :test #'eq)))
+  (let ((sense (cdr (assoc (first spec) +inlinep-translations+ :test #'eq)))
         (new-fenv ()))
     (dolist (name (rest spec))
-      (let ((fvar (find name fvars :key #'leaf-source-name :test #'equal)))
+      (let ((fvar (find name fvars
+                        :key (lambda (x)
+                               (unless (consp x) ;; macrolet
+                                 (leaf-source-name x)))
+                        :test #'equal)))
         (if fvar
             (setf (functional-inlinep fvar) sense)
             (let ((found (find-lexically-apparent-fun
@@ -1449,7 +1449,10 @@
     (atom
      (find-in-bindings vars name))
     ((cons (eql function) (cons * null))
-     (find (cadr name) fvars :key #'leaf-source-name :test #'equal))
+     (find (cadr name) fvars :key (lambda (x)
+                                    (if (consp x) ;; MACROLET
+                                        (car x)
+                                        (leaf-source-name x))) :test #'equal))
     (t
      (compiler-error "Malformed function or variable name ~S." name))))
 
@@ -1490,9 +1493,12 @@
                       (t
                        "an unknown function"))
                 (second name)))))
-        ((and (consp var) (eq (car var) 'macro))
+        ((and (consp var)
+              (or (eq (car var) 'macro)
+                  (and (consp (cdr var))
+                       (eq (cadr var) 'macro))))
          ;; Just ignore the IGNORE decl: we don't currently signal style-warnings
-         ;; for unused symbol-macros, so there's no need to do anything.
+         ;; for unused macrolet or symbol-macros, so there's no need to do anything.
          )
         ((functional-p var)
          (setf (leaf-ever-used var) t))
@@ -1548,7 +1554,9 @@
                   (neq :indefinite extent))
              (let* ((fname (cadr name))
                     (bound-fun (find fname fvars
-                                     :key #'leaf-source-name
+                                     :key (lambda (x)
+                                            (unless (consp x) ;; macrolet
+                                              (leaf-source-name x)))
                                      :test #'equal))
                     (fun (or bound-fun (lexenv-find fname funs))))
                (etypecase fun
@@ -1578,7 +1586,6 @@
 ;;; a symbol in the CL package, and then eliminate this switch.
 ;;; It's permissible to have implementation-specific declarations.
 (defvar *suppress-values-declaration* nil
-  #!+sb-doc
   "If true, processing of the VALUES declaration is inhibited.")
 
 ;;; Process a single declaration spec, augmenting the specified LEXENV

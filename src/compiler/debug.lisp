@@ -13,7 +13,6 @@
 (in-package "SB!C")
 
 (defvar *args* ()
-  #!+sb-doc
   "This variable is bound to the format arguments when an error is signalled
 by BARF or BURP.")
 
@@ -34,7 +33,6 @@ by BARF or BURP.")
   (values))
 
 (defvar *burp-action* :warn
-  #!+sb-doc
   "Action taken by the BURP function when a possible compiler bug is detected.
 One of :WARN, :ERROR or :NONE.")
 (declaim (type (member :warn :error :none) *burp-action*))
@@ -43,6 +41,7 @@ One of :WARN, :ERROR or :NONE.")
 ;;; Otherwise similar to BARF.
 (declaim (ftype (function (string &rest t) (values)) burp))
 (defun burp (string &rest *args*)
+  (declare (notinline warn)) ; See COMPILER-WARN for rationale
   (ecase *burp-action*
     (:warn (apply #'warn string *args*))
     (:error (apply #'cerror "press on anyway." string *args*))
@@ -120,13 +119,15 @@ One of :WARN, :ERROR or :NONE.")
 
            (maphash (lambda (k v)
                       (declare (ignore k))
-                      (unless (or (constant-p v)
+                      (unless (or (eq v :deprecated)
+                                  (constant-p v)
                                   (and (global-var-p v)
                                        (member (global-var-kind v)
                                                '(:global :special :unknown))))
                         (barf "strange *FREE-VARS* entry: ~S" v))
-                      (dolist (n (leaf-refs v))
-                        (check-node-reached n))
+                      (when (leaf-p v)
+                        (dolist (n (leaf-refs v))
+                          (check-node-reached n)))
                       (when (basic-var-p v)
                         (dolist (n (basic-var-sets v))
                           (check-node-reached n))))
@@ -1240,7 +1241,6 @@ One of :WARN, :ERROR or :NONE.")
                (res)))))))
 
 (defun nth-vop (thing n)
-  #!+sb-doc
   "Return the Nth VOP in the IR2-BLOCK pointed to by THING."
   (let ((block (block-info (block-or-lose thing))))
     (do ((i 0 (1+ i))

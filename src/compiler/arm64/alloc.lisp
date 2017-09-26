@@ -111,7 +111,8 @@
 
 (define-vop (make-closure)
   (:args (function :to :save :scs (descriptor-reg)))
-  (:info length stack-allocate-p)
+  (:info label length stack-allocate-p)
+  (:ignore label)
   (:temporary (:sc non-descriptor-reg) pa-flag)
   (:temporary (:scs (interior-reg)) lip)
   (:results (result :scs (descriptor-reg)))
@@ -127,7 +128,7 @@
         (load-immediate-word pa-flag
                              (logior
                               (ash (1- size) n-widetag-bits)
-                              closure-header-widetag))
+                              closure-widetag))
         (storew pa-flag result 0 fun-pointer-lowtag)
         (storew function result closure-fun-slot fun-pointer-lowtag)))))
 
@@ -140,7 +141,7 @@
   (:info stack-allocate-p)
   (:results (result :scs (descriptor-reg)))
   (:generator 10
-    (with-fixed-allocation (result pa-flag value-cell-header-widetag
+    (with-fixed-allocation (result pa-flag value-cell-widetag
                             value-cell-size :stack-allocate-p stack-allocate-p
                             :lip lip)
       (storew value result value-cell-value-slot other-pointer-lowtag))))

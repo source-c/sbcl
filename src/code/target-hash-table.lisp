@@ -14,6 +14,15 @@
 
 ;;;; utilities
 
+(defun hash-table-weakness (ht)
+  "Return the WEAKNESS of HASH-TABLE which is one of NIL, :KEY,
+:VALUE, :KEY-AND-VALUE, :KEY-OR-VALUE."
+  (aref weak-hash-table-kinds (hash-table-%weakness ht)))
+
+(declaim (inline hash-table-weak-p))
+(defun hash-table-weak-p (ht)
+  (not (zerop (hash-table-%weakness ht))))
+
 ;;; Code for detecting concurrent accesses to the same table from
 ;;; multiple threads. Only compiled in when the :SB-HASH-TABLE-DEBUG
 ;;; feature is enabled. The main reason for the existence of this code
@@ -126,7 +135,7 @@
 
 ;;;; user-defined hash table tests
 
-(defvar *user-hash-table-tests* nil)
+(defglobal *user-hash-table-tests* nil)
 
 (defun register-hash-table-test (name hash-fun)
   (declare (symbol name) (function hash-fun))
@@ -148,7 +157,6 @@
   name)
 
 (defmacro define-hash-table-test (name hash-function)
-  #!+sb-doc
   "Defines NAME as a new kind of hash table test for use with the :TEST
 argument to MAKE-HASH-TABLE, and associates a default HASH-FUNCTION with it.
 
@@ -226,7 +234,6 @@ Examples:
                         (hash-function nil)
                         (weakness nil)
                         (synchronized))
-  #!+sb-doc
   "Create and return a new hash table. The keywords are as follows:
 
   :TEST
@@ -383,7 +390,7 @@ Examples:
                    rehash-threshold
                    size
                    kv-vector
-                   weakness
+                   (position weakness weak-hash-table-kinds :test #'eq)
                    index-vector
                    next-vector
                    (unless (eq test 'eq)
@@ -403,39 +410,28 @@ Examples:
       table)))
 
 (defun hash-table-count (hash-table)
-  #!+sb-doc
   "Return the number of entries in the given HASH-TABLE."
   (declare (type hash-table hash-table)
            (values index))
   (hash-table-number-entries hash-table))
 
-#!+sb-doc
 (setf (fdocumentation 'hash-table-rehash-size 'function)
       "Return the rehash-size HASH-TABLE was created with.")
 
-#!+sb-doc
 (setf (fdocumentation 'hash-table-rehash-threshold 'function)
       "Return the rehash-threshold HASH-TABLE was created with.")
 
-#!+sb-doc
 (setf (fdocumentation 'hash-table-synchronized-p 'function)
       "Returns T if HASH-TABLE is synchronized.")
 
 (defun hash-table-size (hash-table)
-  #!+sb-doc
   "Return a size that can be used with MAKE-HASH-TABLE to create a hash
    table that can hold however many entries HASH-TABLE can hold without
    having to be grown."
   (hash-table-rehash-trigger hash-table))
 
-#!+sb-doc
 (setf (fdocumentation 'hash-table-test 'function)
       "Return the test HASH-TABLE was created with.")
-
-#!+sb-doc
-(setf (fdocumentation 'hash-table-weakness 'function)
-      "Return the WEAKNESS of HASH-TABLE which is one of NIL, :KEY,
-:VALUE, :KEY-AND-VALUE, :KEY-OR-VALUE.")
 
 ;;; Called when we detect circular chains in a hash-table.
 (defun signal-corrupt-hash-table (hash-table)
@@ -485,7 +481,7 @@ multiple threads accessing the same hash-table without locking."
     (set-header-data old-kv-vector sb!vm:vector-normal-subtype)
 
     ;; Non-empty weak hash tables always need GC support.
-    (when (and (hash-table-weakness table) (plusp (hash-table-count table)))
+    (when (and (hash-table-weak-p table) (plusp (hash-table-count table)))
       (set-header-data new-kv-vector sb!vm:vector-valid-hashing-subtype))
 
     ;; FIXME: here and in several other places in the hash table code,
@@ -512,8 +508,7 @@ multiple threads accessing the same hash-table without locking."
       (declare (type index/2 i))
       (let ((key (aref new-kv-vector (* 2 i)))
             (value (aref new-kv-vector (1+ (* 2 i)))))
-        (cond ((and (eq key +empty-ht-slot+)
-                    (eq value +empty-ht-slot+))
+        (cond ((and (empty-ht-slot-p key) (empty-ht-slot-p value))
                ;; Slot is empty, push it onto the free list.
                (setf (aref new-next-vector i)
                      (hash-table-next-free-kv table))
@@ -568,7 +563,7 @@ multiple threads accessing the same hash-table without locking."
     (declare (type index size length))
 
     ;; Non-empty weak hash tables always need GC support.
-    (unless (and (hash-table-weakness table) (plusp (hash-table-count table)))
+    (unless (and (hash-table-weak-p table) (plusp (hash-table-count table)))
       ;; Disable GC tricks, they will be re-enabled during the re-hash
       ;; if necessary.
       (set-header-data kv-vector sb!vm:vector-normal-subtype))
@@ -584,8 +579,7 @@ multiple threads accessing the same hash-table without locking."
       (declare (type index/2 i))
       (let ((key (aref kv-vector (* 2 i)))
             (value (aref kv-vector (1+ (* 2 i)))))
-        (cond ((and (eq key +empty-ht-slot+)
-                    (eq value +empty-ht-slot+))
+        (cond ((and (empty-ht-slot-p key) (empty-ht-slot-p value))
                ;; Slot is empty, push it onto free list.
                (setf (aref next-vector i) (hash-table-next-free-kv table))
                (setf (hash-table-next-free-kv table) i))
@@ -618,7 +612,7 @@ multiple threads accessing the same hash-table without locking."
 
 (declaim (inline maybe-rehash))
 (defun maybe-rehash (hash-table ensure-free-slot-p)
-  (when (hash-table-weakness hash-table)
+  (when (hash-table-weak-p hash-table)
     (aver *gc-inhibit*))
   (flet ((rehash-p ()
            (and ensure-free-slot-p
@@ -645,7 +639,7 @@ multiple threads accessing the same hash-table without locking."
 
 (declaim (inline update-hash-table-cache))
 (defun update-hash-table-cache (hash-table index)
-  (unless (hash-table-weakness hash-table)
+  (unless (hash-table-weak-p hash-table)
     (setf (hash-table-cache hash-table) index)))
 
 (defmacro with-hash-table-locks ((hash-table
@@ -658,7 +652,7 @@ multiple threads accessing the same hash-table without locking."
               (with-concurrent-access-check ,hash-table ,operation
                 (locally (declare (inline ,@inline))
                   ,@body))))
-       (if (hash-table-weakness ,hash-table)
+       (if (hash-table-weak-p ,hash-table)
            (sb!thread::with-recursive-system-lock
                ((hash-table-lock ,hash-table) :without-gcing t)
              (,body-fun))
@@ -673,7 +667,6 @@ multiple threads accessing the same hash-table without locking."
                  (,body-fun)))))))
 
 (defun gethash (key hash-table &optional default)
-  #!+sb-doc
   "Finds the entry in HASH-TABLE whose key is KEY and returns the
 associated value and T as multiple values, or returns DEFAULT and NIL
 if there is no such entry. Entries can be added using SETF."
@@ -789,7 +782,7 @@ if there is no such entry. Entries can be added using SETF."
            (hash-vector (hash-table-hash-vector hash-table))
            (test-fun (hash-table-test-fun hash-table)))
       (declare (type index index next))
-      (when (hash-table-weakness hash-table)
+      (when (hash-table-weak-p hash-table)
         (set-header-data kv-vector sb!vm:vector-valid-hashing-subtype))
       (cond ((or eq-based (not hash-vector))
              (when eq-based
@@ -946,7 +939,6 @@ if there is no such entry. Entries can be added using SETF."
                      (clear-slot next-vector prior next))))))))))
 
 (defun remhash (key hash-table)
-  #!+sb-doc
   "Remove the entry in HASH-TABLE associated with KEY. Return T if
 there was such an entry, or NIL if not."
   (declare (type hash-table hash-table)
@@ -957,7 +949,6 @@ there was such an entry, or NIL if not."
     (%remhash key hash-table)))
 
 (defun clrhash (hash-table)
-  #!+sb-doc
   "This removes all the entries from HASH-TABLE and returns the hash
 table itself."
   (when (plusp (hash-table-number-entries hash-table))

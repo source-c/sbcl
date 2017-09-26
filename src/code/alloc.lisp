@@ -25,7 +25,7 @@
   ;; WITHOUT-GCING implies WITHOUT-INTERRUPTS
   (or
    (without-gcing
-     (let* ((pointer (ash *static-space-free-pointer* n-fixnum-tag-bits))
+     (let* ((pointer (sap-int *static-space-free-pointer*))
             (vector (logior pointer other-pointer-lowtag))
             (nbytes (pad-data-block (+ words vector-data-offset)))
             (new-pointer (+ pointer nbytes)))
@@ -35,8 +35,7 @@
          (store-word (fixnumize length)
                      vector vector-length-slot other-pointer-lowtag)
          (store-word 0 new-pointer)
-         (setf *static-space-free-pointer*
-               (ash new-pointer (- n-fixnum-tag-bits)))
+         (setf *static-space-free-pointer* (int-sap new-pointer))
          (%make-lisp-obj vector))))
    (error 'simple-storage-condition
           :format-control "Not enough memory left in static space to ~
@@ -64,7 +63,7 @@
 ;;; A better structure would be just a sorted array of sizes
 ;;; with each entry pointing to the holes which are threaded through
 ;;; some bytes in the storage itself rather than through cons cells.
-(defglobal *immobile-freelist* nil)
+(!defglobal *immobile-freelist* nil)
 
 ;;; Return the zero-based index within the varyobj subspace of immobile space.
 (defun varyobj-page-index (address)
@@ -170,7 +169,7 @@
 
 (defun set-immobile-space-free-pointer (free-ptr)
   (declare (type (and fixnum unsigned-byte) free-ptr))
-  (setq *immobile-space-free-pointer* (ash free-ptr (- n-fixnum-tag-bits)))
+  (setq *immobile-space-free-pointer* (int-sap free-ptr))
   ;; When the free pointer is not page-aligned - it usually won't be -
   ;; then we create an unboxed array from the pointer to the page end
   ;; so that it appears as one contiguous object when scavenging.
@@ -188,8 +187,7 @@
   #!+immobile-space-debug
   (awhen *in-use-bits* (mark-range it hole (hole-size hole) nil))
   (let* ((hole-end (hole-end-address hole))
-         (end-is-free-ptr (eql (ash hole-end (- n-fixnum-tag-bits))
-                               *immobile-space-free-pointer*)))
+         (end-is-free-ptr (eql hole-end (sap-int *immobile-space-free-pointer*))))
     ;; First, ensure that no page's scan-start points to this hole.
     ;; For smaller-than-page objects, this will do nothing if the hole
     ;; was not the scan-start. For larger-than-page, we have to update
@@ -293,10 +291,12 @@
                              (add-to-freelist found)
                              (+ found remaining)))))) ; Consume the upper piece
               ;; 3. Extend the frontier.
-              (let* ((addr (ash *immobile-space-free-pointer* n-fixnum-tag-bits))
-                     (free-ptr (+ addr n-bytes)))
+              (let* ((addr (sap-int *immobile-space-free-pointer*))
+                     (free-ptr (+ addr n-bytes))
+                      (limit (+ immobile-space-start
+                                (- immobile-space-size immobile-card-bytes))))
                 ;; The last page can't be used, because GC uses it as scratch space.
-                (when (> free-ptr (- immobile-space-end immobile-card-bytes))
+                (when (> free-ptr limit)
                   (format t "~&Immobile space exhausted~%")
                   (sb!impl::%halt))
                 (set-immobile-space-free-pointer free-ptr)
@@ -332,7 +332,9 @@
      (setf (sap-ref-word (int-sap addr) 0) word0
            (sap-ref-word (int-sap addr) n-word-bytes) word1)
      ;; 0-fill the remainder of the object
-     (system-area-ub64-fill 0 (int-sap addr) 2 (- (ash n-bytes (- word-shift)) 2))
+     (#!+64-bit system-area-ub64-fill
+      #!-64-bit system-area-ub32-fill
+      0 (int-sap addr) 2 (- (ash n-bytes (- word-shift)) 2))
      (%make-lisp-obj (logior addr lowtag)))))
 
 (defun allocate-immobile-vector (widetag length words)
@@ -350,8 +352,9 @@
   (allocate-immobile-vector simple-array-unsigned-byte-8-widetag n-elements
                             (ceiling n-elements n-word-bytes)))
 (defun allocate-immobile-word-vector (n-elements)
-  (allocate-immobile-vector simple-array-unsigned-byte-64-widetag n-elements
-                            n-elements))
+  (allocate-immobile-vector #!+64-bit simple-array-unsigned-byte-64-widetag
+                            #!-64-bit simple-array-unsigned-byte-32-widetag
+                            n-elements n-elements))
 
 ;;; This is called when we're already inside WITHOUT-GCing
 (defun allocate-immobile-code (n-boxed-words n-unboxed-bytes)
@@ -366,27 +369,4 @@
                 other-pointer-lowtag)))
     (setf (%code-debug-info code) nil)
     code))
-
-(defun show-fragmentation ()
-  (let ((n-holes 0)
-        (n-hole-bytes 0)
-        (subspace-start
-         (+ immobile-space-start immobile-fixedobj-subspace-size))
-        (free-pointer *immobile-space-free-pointer*))
-    (map-objects-in-range
-     (lambda (obj type size)
-       type
-       (when (hole-p (- (get-lisp-obj-address obj) (lowtag-of obj)))
-         (let ((hole (- (get-lisp-obj-address obj) (lowtag-of obj))))
-           (incf n-holes)
-           (incf n-hole-bytes size)
-           (format t "~X..~X ~6d~%" hole (+ hole size) size))))
-     (ash subspace-start (- n-fixnum-tag-bits))
-     free-pointer)
-    (format t "       ~18d (total ~D holes)~%" n-hole-bytes n-holes)
-    (let ((total-space-used
-           (- (ash free-pointer n-fixnum-tag-bits) subspace-start)))
-      (values n-hole-bytes total-space-used
-              (* 100.0 (/ n-hole-bytes total-space-used))))))
-
 ) ; end PROGN

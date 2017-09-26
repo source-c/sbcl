@@ -13,17 +13,6 @@
 
 ;;;; type frobbing VOPs
 
-(define-vop (lowtag-of)
-  (:translate lowtag-of)
-  (:policy :fast-safe)
-  (:args (object :scs (any-reg descriptor-reg control-stack)
-                 :target result))
-  (:results (result :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 1
-    (move result object)
-    (inst and result lowtag-mask)))
-
 (define-vop (widetag-of)
   (:translate widetag-of)
   (:policy :fast-safe)
@@ -62,6 +51,50 @@
     DONE
     (move result rax)))
 
+#!+compact-instance-header
+;; ~20 instructions vs. 35
+(define-vop (layout-of) ; no translation
+    (:policy :fast-safe)
+    (:args (object :scs (descriptor-reg))
+           (layouts :scs (constant)))
+    (:temporary (:sc unsigned-reg :offset rax-offset) rax)
+    (:results (result :scs (descriptor-reg)))
+    (:generator 6
+      ;; Lowtag: #b0011 instance
+      ;;         #b0111 list
+      ;;         #b1011 fun
+      ;;         #b1111 other
+      (inst mov  rax object)
+      (inst xor  (reg-in-size rax :byte) #b0011)
+      (inst test (reg-in-size rax :byte) #b0111)
+      (inst jmp  :ne try-other)
+      ;; It's an instance or function. Both have the layout in the header.
+      (inst and  (reg-in-size rax :byte) #b11110111)
+      (inst mov  (reg-in-size result :dword) (make-ea :dword :base rax :disp 4))
+      (inst jmp  done)
+      TRY-OTHER
+      (inst xor  (reg-in-size rax :byte) #b1100)
+      (inst test (reg-in-size rax :byte) #b1111)
+      (inst jmp  :ne imm-or-list)
+      ;; It's an other-pointer. Read the widetag.
+      (inst movzx (reg-in-size rax :dword) (make-ea :byte :base rax))
+      (inst jmp  load-from-vector)
+      IMM-OR-LIST
+      (inst cmp  object nil-value)
+      (inst jmp  :eq NULL)
+      (inst movzx (reg-in-size rax :dword) (reg-in-size object :byte))
+      LOAD-FROM-VECTOR
+      (inst mov  result layouts)
+      (inst mov  (reg-in-size result :dword)
+            (make-ea :dword :base result
+                            :index rax :scale 8
+                            :disp (+ (ash vector-data-offset word-shift)
+                                     (- other-pointer-lowtag))))
+      (inst jmp  done)
+      NULL
+      (inst mov  result (make-fixup (find-layout 'null) :layout))
+      DONE))
+
 (define-vop (%other-pointer-widetag)
   (:translate %other-pointer-widetag)
   (:policy :fast-safe)
@@ -97,10 +130,10 @@
   (:results (res :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 6
-    (loadw res x 0 fun-pointer-lowtag)
-    (inst shr res n-widetag-bits)
-    ;; In case there are closures in immobile space.
-    #!+immobile-space (inst and res short-header-max-words)))
+    (let ((res (reg-in-size res :dword)))
+      (inst mov res (make-ea-for-object-slot-half x 0 fun-pointer-lowtag))
+      (inst shr res n-widetag-bits)
+      (inst and res short-header-max-words))))
 
 (define-vop (set-header-data)
   (:translate set-header-data)
@@ -165,14 +198,6 @@
 
 ;;;; allocation
 
-(define-vop (dynamic-space-free-pointer)
-  (:results (int :scs (sap-reg)))
-  (:result-types system-area-pointer)
-  (:translate dynamic-space-free-pointer)
-  (:policy :fast-safe)
-  (:generator 1
-    (load-symbol-value int *allocation-pointer*)))
-
 (define-vop (binding-stack-pointer-sap)
   (:results (int :scs (sap-reg)))
   (:result-types system-area-pointer)
@@ -234,38 +259,22 @@
                    :disp (- fun-pointer-lowtag other-pointer-lowtag)))
     (inst add func code)))
 
-(define-vop (%simple-fun-self)
+;;; This vop is quite magical - because 'closure-fun' is a raw program counter,
+;;; as soon as it's loaded into a register, it prevents the underlying fun from
+;;; being transported by GC. It's even subtler in that sense than COMPUTE-FUN,
+;;; which doesn't pin a *different* object produced from thin air.
+;;; (It's output operand is embedded in the object pointed to by its input)
+(define-vop (%closure-fun)
   (:policy :fast-safe)
-  (:translate %simple-fun-self)
+  (:translate %closure-fun)
   (:args (function :scs (descriptor-reg)))
   (:results (result :scs (descriptor-reg)))
   (:generator 3
-    (loadw result function simple-fun-self-slot fun-pointer-lowtag)
+    (loadw result function closure-fun-slot fun-pointer-lowtag)
     (inst lea result
           (make-ea :byte :base result
                    :disp (- fun-pointer-lowtag
                             (* simple-fun-code-offset n-word-bytes))))))
-
-;;; The closure function slot is a pointer to raw code on X86 instead
-;;; of a pointer to the code function object itself. This VOP is used
-;;; to reference the function object given the closure object.
-(define-source-transform %closure-fun (closure)
-  `(%simple-fun-self ,closure))
-
-(define-vop (%set-fun-self)
-  (:policy :fast-safe)
-  (:translate (setf %simple-fun-self))
-  (:args (new-self :scs (descriptor-reg) :target result :to :result)
-         (function :scs (descriptor-reg) :to :result))
-  (:temporary (:sc any-reg :from (:argument 0) :to :result) temp)
-  (:results (result :scs (descriptor-reg)))
-  (:generator 3
-    (inst lea temp
-          (make-ea :byte :base new-self
-                   :disp (- (ash simple-fun-code-offset word-shift)
-                            fun-pointer-lowtag)))
-    (storew temp function simple-fun-self-slot fun-pointer-lowtag)
-    (move result new-self)))
 
 ;;;; symbol frobbing
 
@@ -418,7 +427,6 @@
      (move hi edx)))
 
 (defmacro with-cycle-counter (&body body)
-  #!+sb-doc
   "Returns the primary value of BODY as the primary value, and the
 number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
   (with-unique-names (hi0 hi1 lo0 lo1)

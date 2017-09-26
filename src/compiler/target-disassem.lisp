@@ -260,26 +260,14 @@
 
 ;;;; function ops
 
-;;; This is a stupid name when we really mean fun->simple-fun.
-;;; And what's the point of ruling out some funcallable instances?
-(defun fun-self (fun)
-  (declare (type compiled-function fun))
-  (%simple-fun-self (%fun-fun fun)))
-
-(defun fun-code (fun)
-  (declare (type compiled-function fun))
-  (fun-code-header (fun-self fun)))
-
-(defun fun-address (fun)
-  (declare (type compiled-function fun))
-  (- (get-lisp-obj-address (%fun-fun fun)) sb!vm:fun-pointer-lowtag))
-
 ;;; the offset of FUNCTION from the start of its code-component's
 ;;; instruction area
-(defun fun-insts-offset (function)
+(defun fun-insts-offset (function) ; FUNCTION *must* be pinned
   (declare (type compiled-function function))
-  (- (fun-address function)
-     (sap-int (code-instructions (fun-code function)))))
+  (let ((simple-fun (%fun-fun function)))
+    (- (get-lisp-obj-address simple-fun)
+       sb!vm:fun-pointer-lowtag
+       (sap-int (code-instructions (fun-code-header simple-fun))))))
 
 ;;; the offset of FUNCTION from the start of its code-component
 (defun fun-offset (function)
@@ -288,11 +276,6 @@
 
 ;;;; operations on code-components (which hold the instructions for
 ;;;; one or more functions)
-
-;;; Return the length of the instruction area in CODE-COMPONENT.
-(defun code-inst-area-length (code-component)
-  (declare (type code-component code-component))
-  (%code-code-size code-component))
 
 (defun segment-offs-to-code-offs (offset segment)
   (without-gcing
@@ -339,7 +322,7 @@
                                       (dstate-cur-offs dstate)
                                       (+ (dstate-cur-offs dstate)
                                          (1- lra-size))))
-                sb!vm:return-pc-header-widetag))
+                sb!vm:return-pc-widetag))
     (unless (null stream)
       (note "possible LRA header" dstate)))
   nil)
@@ -817,7 +800,8 @@
       (awhen (get symbol 'instruction-flavors)
         (setf (get symbol 'instruction-flavors)
               (collect-inst-variants
-               (string-upcase symbol) package it cache))))
+               (logically-readonlyize (string-upcase symbol))
+               package it cache))))
     (apply 'format t
            "~&Disassembler: ~D printers, ~D prefilters, ~D labelers~%"
            (mapcar (lambda (x) (length (cdr x))) cache))))
@@ -1140,7 +1124,7 @@
 ;;; just for fun
 (defun print-fun-headers (function)
   (declare (type compiled-function function))
-  (let* ((self (fun-self function))
+  (let* ((self (%fun-fun function))
          (code (fun-code-header self)))
     (format t "Code-header ~S: size: ~S~%" code (%code-code-size code))
     (loop for i below (code-n-entries code)
@@ -1241,28 +1225,13 @@
                                 debug-var-num))
                          ))))))))
 
-;;; Return a new vector which has the same contents as the old one
-;;; VEC, plus new cells (for a total size of NEW-LEN). The additional
-;;; elements are initialized to INITIAL-ELEMENT.
-(defun grow-vector (vec new-len &optional initial-element)
-  (declare (type vector vec)
-           (type fixnum new-len))
-  (let ((new
-         (make-sequence `(vector ,(array-element-type vec) ,new-len)
-                        new-len
-                        :initial-element initial-element)))
-    (dotimes (i (length vec))
-      (setf (aref new i) (aref vec i)))
-    new))
-
 ;;; Return a STORAGE-INFO struction describing the object-to-source
 ;;; variable mappings from DEBUG-FUN.
 (defun storage-info-for-debug-fun (debug-fun)
   (declare (type sb!di:debug-fun debug-fun))
   (let ((sc-vec sb!c::*backend-sc-numbers*)
         (groups nil)
-        (debug-vars (sb!di::debug-fun-debug-vars
-                     debug-fun)))
+        (debug-vars (sb!di::debug-fun-debug-vars debug-fun)))
     (and debug-vars
          (dotimes (debug-var-offset
                    (length debug-vars)
@@ -1289,13 +1258,9 @@
                           (length (length locations))
                           (offset (sb!c:sc-offset-offset sc-offset)))
                      (when (>= offset length)
-                       (setf locations
-                             (grow-vector locations
-                                          (max (* 2 length)
-                                               (1+ offset))
-                                          nil)
-                             (location-group-locations group)
-                             locations))
+                       (setf locations (adjust-array locations
+                                                     (max (* 2 length) (1+ offset)))
+                             (location-group-locations group) locations))
                      (let ((already-there (aref locations offset)))
                        (cond ((null already-there)
                               (setf (aref locations offset) debug-var-offset))
@@ -1396,8 +1361,7 @@
                   ))))
         (sb!di:no-debug-blocks () nil)))))
 
-(defvar *disassemble-annotate* t
-  #!+sb-doc
+(defvar *disassemble-annotate* nil
   "Annotate DISASSEMBLE output with source code.")
 
 (defun add-debugging-hooks (segment debug-fun &optional sfcache)
@@ -1426,8 +1390,8 @@
 ;;; instructions for FUNCTION.
 (defun get-fun-segments (function)
   (declare (type compiled-function function))
-  (let* ((function (fun-self function))
-         (code (fun-code function))
+  (let* ((function (%fun-fun function))
+         (code (fun-code-header function))
          (fun-map (code-fun-map code))
          (fname (%simple-fun-name function))
          (sfcache (make-source-form-cache)))
@@ -1461,7 +1425,9 @@
                          last-offset
                          (sb!c::compiled-debug-fun-start-pc fmap-entry))
                  (cond (#+nil (eq last-offset fun-offset)
-                              (and (equal name fname) (not first-block-seen-p))
+                        (and (equal name fname)
+                             (null kind)
+                             (not first-block-seen-p))
                               (setf first-block-seen-p t))
                        ((eq kind :external)
                         (when first-block-seen-p
@@ -1473,12 +1439,12 @@
                           (setf nil-block-seen-p t))))
                  (setf last-debug-fun
                        (sb!di::make-compiled-debug-fun fmap-entry code)))))))
-        (let ((max-offset (code-inst-area-length code)))
+        (let ((max-offset (%code-code-size code)))
           (when (and first-block-seen-p last-debug-fun)
             (add-seg last-offset
                      (- max-offset last-offset)
                      last-debug-fun))
-          (if (null segments)
+          (if (null segments) ; FIXME: when does this happen? Comment PLEASE
               (let ((offs (fun-insts-offset function)))
                 (list
                  (make-code-segment code offs (- max-offset offs))))
@@ -1491,12 +1457,12 @@
 (defun get-code-segments (code
                           &optional
                           (start-offset 0)
-                          (length (code-inst-area-length code)))
+                          (length (%code-code-size code)))
   (declare (type code-component code)
            (type offset start-offset)
            (type disassem-length length))
   (let ((segments nil))
-    (when (%code-debug-info code)
+    (when (sb!c::compiled-debug-info-p (%code-debug-info code))
       (let ((fun-map (code-fun-map code))
             (sfcache (make-source-form-cache)))
         (let ((last-offset 0)
@@ -1529,7 +1495,7 @@
                                                          code))))))
             (when last-debug-fun
               (add-seg last-offset
-                       (- (code-inst-area-length code) last-offset)
+                       (- (%code-code-size code) last-offset)
                        last-debug-fun))))))
     (if (null segments)
         (list (make-code-segment code start-offset length))
@@ -1648,7 +1614,6 @@
 (defun disassemble (object &key
                            (stream *standard-output*)
                            (use-labels t))
-  #!+sb-doc
   "Disassemble the compiled code associated with OBJECT, which can be a
   function, a lambda expression, or a symbol with a function definition. If
   it is not already compiled, the compiler is called to produce something to
@@ -1691,7 +1656,7 @@
                         (sap-int
                          (code-instructions code-component)))))
                 (when (or (< code-offs 0)
-                          (> code-offs (code-inst-area-length code-component)))
+                          (> code-offs (%code-code-size code-component)))
                   (error "address ~X not in the code component ~S"
                          address code-component))
                 (get-code-segments code-component code-offs length))
@@ -1711,7 +1676,7 @@
            (type (member t nil) use-labels))
   (let* ((code-component
           (if (functionp code-component)
-              (fun-code code-component)
+              (fun-code-header code-component)
               code-component))
          (dstate (make-dstate))
          (segments (get-code-segments code-component)))
@@ -1764,8 +1729,8 @@
                (slot-offset (words-to-bytes (car field)))
                (maybe-symbol-addr (- address slot-offset))
                (maybe-symbol
-                (make-lisp-obj
-                 (+ maybe-symbol-addr sb!vm:other-pointer-lowtag))))
+                (make-lisp-obj (+ maybe-symbol-addr sb!vm:other-pointer-lowtag)
+                               nil)))
           (when (symbolp maybe-symbol)
             (return (values maybe-symbol (cdr field))))))))
 
@@ -1818,36 +1783,33 @@
                (t
                 (values nil nil)))))))
 
-(defvar *assembler-routines-by-addr* nil)
-
-;;; Build an address-name hash-table from the name-address hash
-(defun invert-address-hash (htable &optional (addr-hash (make-hash-table)))
-  (maphash (lambda (name address)
-             (setf (gethash address addr-hash) name))
-           htable)
-  addr-hash)
+(defglobal *assembler-routines-by-addr* nil)
 
 ;;; Return the name of the primitive Lisp assembler routine or foreign
 ;;; symbol located at ADDRESS, or NIL if there isn't one.
-(defun find-assembler-routine (address)
+(defun find-assembler-routine (address &aux (addr->name *assembler-routines-by-addr*))
   (declare (type address address))
-  (when (null *assembler-routines-by-addr*)
-    (setf *assembler-routines-by-addr*
-          (invert-address-hash sb!fasl:*assembler-routines*))
+  (when (null addr->name)
+    (setf addr->name (make-hash-table) *assembler-routines-by-addr* addr->name)
+    (flet ((invert (name->addr)
+             (maphash (lambda (name address)
+                        (setf (gethash address addr->name) name))
+                      name->addr)))
+       (invert sb!fasl:*assembler-routines*)
     #!-sb-dynamic-core
-    (setf *assembler-routines-by-addr*
-          (invert-address-hash *static-foreign-symbols*
-                               *assembler-routines-by-addr*))
-    (loop for name in sb!vm:*static-funs*
+       (invert *static-foreign-symbols*))
+    (loop for name across sb!vm:+static-fdefns+
           for address =
           #!+immobile-code (sb!vm::function-raw-address name)
           #!-immobile-code (+ sb!vm::nil-value (sb!vm::static-fun-offset name))
-          do (setf (gethash address *assembler-routines-by-addr*) name))
+          do (setf (gethash address addr->name) name))
+    #!+immobile-code
+    (compute-extra-asm-routines addr->name)
     ;; Not really a routine, but it uses the similar logic for annotations
     #!+sb-safepoint
-    (setf (gethash sb!vm::gc-safepoint-page-addr *assembler-routines-by-addr*)
+    (setf (gethash sb!vm::gc-safepoint-page-addr addr->name)
           "safepoint"))
-  (gethash address *assembler-routines-by-addr*))
+  (gethash address addr->name))
 
 ;;;; some handy function for machine-dependent code to use...
 
@@ -1894,7 +1856,7 @@
 (defun note (note dstate)
   (declare (type (or string function) note)
            (type disassem-state dstate))
-  (push note (dstate-notes dstate)))
+  (setf (dstate-notes dstate) (nconc (dstate-notes dstate) (list note))))
 
 (defun prin1-short (thing stream)
   (with-print-restrictions
@@ -2030,10 +1992,35 @@
             dstate)
       t)))
 
-(defun maybe-note-static-symbol (offset dstate)
-  (dolist (symbol sb!vm:*static-symbols*)
-    (when (= (get-lisp-obj-address symbol) offset)
-      (return (note (lambda (s) (prin1 symbol s)) dstate)))))
+(defun maybe-note-static-symbol (address dstate)
+  (declare (type disassem-state dstate))
+  (when (or (not (typep address `(unsigned-byte ,sb!vm:n-machine-word-bits)))
+            (eql address 0))
+    (return-from maybe-note-static-symbol))
+  (let ((symbol
+         (block found
+           (when (eq address sb!vm::nil-value)
+             (return-from found nil))
+           (when (< address (sap-int sb!vm:*static-space-free-pointer*))
+             (dovector (symbol sb!vm:+static-symbols+)
+               (when (= (get-lisp-obj-address symbol) address)
+                 (return-from found symbol))))
+           ;; Guess whether 'address' is an immobile-space symbol by looking at
+           ;; code header constants. If it matches any constant, assume that it
+           ;; is a use of the constant.  This has false positives of course,
+           ;; as does MAYBE-NOTE-STATIC-SYMBOL in general - any random immediate
+           ;; used in an unboxed context, such as an ADD instruction,
+           ;; might be wrongly construed as an address.
+           #!+immobile-space
+           (let ((code (seg-code (dstate-segment dstate))))
+             (when code
+               (loop for i downfrom (1- (code-header-words code))
+                     to sb!vm:code-constants-offset
+                     for const = (code-header-ref code i)
+                     when (eql (get-lisp-obj-address const) address)
+                     do (return-from found const))))
+           (return-from maybe-note-static-symbol))))
+    (note (lambda (s) (prin1 symbol s)) dstate)))
 
 (defun get-internal-error-name (errnum)
   (cadr (svref sb!c:+backend-internal-errors+ errnum)))
@@ -2140,7 +2127,7 @@
       (or (find repr (cdr table) :test 'equalp)
           (car (push repr (cdr table)))))))
 
-(defun unintern-init-only-stuff ()
+(defun !unintern-symbols ()
   ;; Remove compile-time-only metadata. This preserves compatibility with the
   ;; older disassembler macros which wrapped GEN-ARG-TYPE-DEF-FORM and such
   ;; in (EVAL-WHEN (:COMPILE-TOPLEVEL :EXECUTE)), which in turn required that
@@ -2158,24 +2145,23 @@
   ;; But if you need all these macros to exist for some reason,
   ;; then define one of the two following features to keep them:
   #!+(or sb-fluid sb-retain-assembler-macros)
-  (return-from unintern-init-only-stuff)
+  (return-from !unintern-symbols nil)
 
   (do-symbols (symbol sb!assem::*backend-instruction-set-package*)
     (remf (symbol-plist symbol) 'arg-type)
     (remf (symbol-plist symbol) 'inst-format))
 
   ;; Get rid of functions that only make sense with metadata available.
-  (dolist (s '(%def-arg-type %def-inst-format %gen-arg-forms
-               all-arg-refs-relevant-p arg-or-lose arg-position arg-value-form
-               collect-labelish-operands collect-prefiltering-args
-               compare-fields-form compile-inst-printer compile-print
-               compile-printer-body compile-printer-list compile-test
-               correct-dchunk-bytespec-for-endianness
-               define-arg-type define-instruction-format
-               find-first-field-name find-printer-fun format-or-lose
-               gen-arg-forms make-arg-temp-bindings make-funstate massage-arg
-               maybe-listify modify-arg pd-error pick-printer-choice
-               preprocess-chooses preprocess-conditionals preprocess-printer
-               preprocess-test sharing-cons sharing-mapcar))
-    (fmakunbound s)
-    (unintern s 'sb-disassem)))
+  `("SB-DISASSEM"
+    %def-arg-type %def-inst-format %gen-arg-forms
+    all-arg-refs-relevant-p arg-or-lose arg-position arg-value-form
+    collect-labelish-operands collect-prefiltering-args
+    compare-fields-form compile-inst-printer compile-print
+    compile-printer-body compile-printer-list compile-test
+    correct-dchunk-bytespec-for-endianness
+    define-arg-type define-instruction-format
+    find-first-field-name find-printer-fun format-or-lose
+    gen-arg-forms make-arg-temp-bindings make-funstate massage-arg
+    maybe-listify modify-arg pd-error pick-printer-choice
+    preprocess-chooses preprocess-conditionals preprocess-printer
+    preprocess-test sharing-cons sharing-mapcar))

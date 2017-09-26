@@ -20,6 +20,28 @@
 #include "sbcl.h"
 #include "runtime.h"
 
+#ifdef LISP_FEATURE_RELOCATABLE_HEAP
+extern uword_t DYNAMIC_SPACE_START;
+extern uword_t IMMOBILE_SPACE_START, IMMOBILE_VARYOBJ_SUBSPACE_START;
+#endif
+#define IMMOBILE_SPACE_END (IMMOBILE_SPACE_START+IMMOBILE_SPACE_SIZE)
+
+#if defined(LISP_FEATURE_GENCGC) && !defined(ENABLE_PAGE_PROTECTION)
+/* Should we use page protection to help avoid the scavenging of pages
+ * that don't have pointers to younger generations?
+ * You can change this to 0 if you want SBCL not to install the handlers
+ * for SIGSEGV and SIGBUS. That will slow down GC, but might be desirable
+ * for debugging or for exploring GC strategies such as remembered sets */
+#define ENABLE_PAGE_PROTECTION 1
+#endif
+
+#ifdef LISP_FEATURE_CHENEYGC
+#define INSTALL_SIG_MEMORY_FAULT_HANDLER 1
+#endif
+#ifdef LISP_FEATURE_GENCGC
+#define INSTALL_SIG_MEMORY_FAULT_HANDLER ENABLE_PAGE_PROTECTION
+#endif
+
 /* Some standard preprocessor definitions and typedefs are needed from
  * the OS-specific #include files. This is an attempt to document
  * them on 20000729, by WHN the impatient reverse engineer.
@@ -68,12 +90,15 @@ extern void os_install_interrupt_handlers(void);
  * and simplify if the difference isn't too large. */
 extern void os_zero(os_vm_address_t addr, os_vm_size_t length);
 
-/* It looks as though this function allocates 'len' bytes at 'addr',
+/* Allocate 'len' bytes at 'addr',
  * or at an OS-chosen address if 'addr' is zero.
- *
- * FIXME: There was some documentation for these functions in
- * "hp-ux.c" in the old CMU CL code. Perhaps move/merge it in here. */
-extern os_vm_address_t os_validate(os_vm_address_t addr, os_vm_size_t len);
+ * If 'movable' then 'addr' is a preference, not a requirement. */
+#define NOT_MOVABLE 0
+#define MOVABLE 1
+#define MOVABLE_LOW 2
+extern os_vm_address_t os_validate(int movable,
+                                   os_vm_address_t addr,
+                                   os_vm_size_t len);
 
 #ifdef LISP_FEATURE_WIN32
 void* os_validate_recommit(os_vm_address_t addr, os_vm_size_t len);
@@ -84,10 +109,10 @@ extern void os_invalidate(os_vm_address_t addr, os_vm_size_t len);
 
 /* This maps a file into memory, or calls lose(..) for various
  * failures. */
-extern os_vm_address_t os_map(int fd,
-                              int offset,
-                              os_vm_address_t addr,
-                              os_vm_size_t len);
+extern void os_map(int fd,
+                   int offset,
+                   os_vm_address_t addr,
+                   os_vm_size_t len);
 
 /* This presumably flushes the instruction cache, if that can be done
  * explicitly. (It doesn't seem to be an issue for the i386 port,
@@ -102,8 +127,9 @@ extern void os_protect(os_vm_address_t addr,
                        os_vm_size_t len,
                        os_vm_prot_t protection);
 
-/* This returns true for an address which makes sense at the Lisp level. */
-extern boolean is_valid_lisp_addr(os_vm_address_t test);
+/* Return true for an address (with or without lowtag bits) within
+ * any range of memory understood by the garbage collector. */
+extern boolean gc_managed_addr_p(lispobj test);
 
 /* Given a signal context, return the address for storage of the
  * register, of the specified offset, for that context. The offset is
@@ -191,12 +217,6 @@ extern char *os_get_runtime_executable_path(int external_path);
 # define OS_VM_SIZE_FMTX "lx"
 #endif
 #endif
-
-/* FIXME: this is not the right place for this, but here we have
- * a convenient base type to hand. If it turns out we can just use
- * size_t everywhere, this can more to runtime.h. */
-typedef os_vm_size_t word_t;
-#define WORD_FMTX OS_VM_SIZE_FMTX
 
 #ifdef LISP_FEATURE_SB_THREAD
 #  ifndef CANNOT_USE_POSIX_SEM_T

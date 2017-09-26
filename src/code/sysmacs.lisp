@@ -11,19 +11,19 @@
 
 (in-package "SB!IMPL")
 
-;;;; these are initialized in cold init
+;;;; these are initialized by create_thread_struct()
 
-(!defvar *in-without-gcing* nil)
-(!defvar *gc-inhibit* t)
+(defvar *in-without-gcing*)
+(defvar *gc-inhibit*)
 
 ;;; When the dynamic usage increases beyond this amount, the system
 ;;; notes that a garbage collection needs to occur by setting
 ;;; *GC-PENDING* to T. It starts out as NIL meaning nobody has figured
 ;;; out what it should be yet.
-(!defvar *gc-pending* nil)
+(defvar *gc-pending*)
 
 #!+sb-thread
-(!defvar *stop-for-gc-pending* nil)
+(defvar *stop-for-gc-pending*)
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (dolist (symbol '(*gc-inhibit* *in-without-gcing*
@@ -38,7 +38,6 @@
 (defvar sb!vm::*pinned-objects*)
 
 (defmacro without-gcing (&body body)
-  #!+sb-doc
   "Executes the forms in the body without doing a garbage collection. It
 inhibits both automatically and explicitly triggered collections. Finally,
 upon leaving the BODY if gc is not inhibited it runs the pending gc.

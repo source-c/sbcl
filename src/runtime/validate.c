@@ -24,15 +24,18 @@
 #include "validate.h"
 #include "interr.h"                     /* for declaration of lose */
 
+#ifdef LISP_FEATURE_RELOCATABLE_HEAP
+uword_t DYNAMIC_SPACE_START;
+uword_t IMMOBILE_SPACE_START, IMMOBILE_VARYOBJ_SUBSPACE_START;
+#endif
 
 static void
 ensure_space(lispobj *start, uword_t size)
 {
-    if (os_validate((os_vm_address_t)start,(os_vm_size_t)size)==NULL) {
+    if (os_validate(NOT_MOVABLE, (os_vm_address_t)start, (os_vm_size_t)size)==NULL) {
         fprintf(stderr,
-                "ensure_space: failed to validate %lu bytes at 0x%08lx\n",
-                size,
-                (uword_t)start);
+                "ensure_space: failed to allocate %lu bytes at %p\n",
+                (long unsigned)size, start);
         fprintf(stderr,
                 "(hint: Try \"ulimit -a\"; maybe you should increase memory limits.)\n");
         exit(1);
@@ -43,7 +46,7 @@ os_vm_address_t undefined_alien_address = 0;
 
 static void
 ensure_undefined_alien(void) {
-    os_vm_address_t start = os_validate(NULL, os_vm_page_size);
+    os_vm_address_t start = os_allocate(os_vm_page_size);
     if (start) {
         os_protect(start, os_vm_page_size, OS_VM_PROT_NONE);
         undefined_alien_address = start;
@@ -56,25 +59,28 @@ void
 allocate_spaces(void)
 {
 #ifdef PRINTNOISE
-    printf("validating memory ...");
+    printf("allocating memory ...");
     fflush(stdout);
 #endif
-
-    ensure_space( (lispobj *)READ_ONLY_SPACE_START, READ_ONLY_SPACE_SIZE);
-    ensure_space( (lispobj *)STATIC_SPACE_START   , STATIC_SPACE_SIZE);
-#ifdef IMMOBILE_SPACE_START
-    ensure_space( (lispobj *)IMMOBILE_SPACE_START , IMMOBILE_SPACE_SIZE);
-#endif
+#ifndef LISP_FEATURE_RELOCATABLE_HEAP
+    // Allocate the largest space(s) first,
+    // since if that fails, it's game over.
 #ifdef LISP_FEATURE_GENCGC
     ensure_space( (lispobj *)DYNAMIC_SPACE_START  , dynamic_space_size);
 #else
     ensure_space( (lispobj *)DYNAMIC_0_SPACE_START, dynamic_space_size);
     ensure_space( (lispobj *)DYNAMIC_1_SPACE_START, dynamic_space_size);
 #endif
+#endif
 
+    ensure_space( (lispobj *)READ_ONLY_SPACE_START, READ_ONLY_SPACE_SIZE);
+    ensure_space( (lispobj *)STATIC_SPACE_START   , STATIC_SPACE_SIZE);
 #ifdef LISP_FEATURE_LINKAGE_TABLE
     ensure_space( (lispobj *)LINKAGE_TABLE_SPACE_START,
                   LINKAGE_TABLE_SPACE_SIZE);
+#endif
+#if defined(IMMOBILE_SPACE_START) && !defined(LISP_FEATURE_RELOCATABLE_HEAP)
+    ensure_space((lispobj *)IMMOBILE_SPACE_START, IMMOBILE_SPACE_SIZE);
 #endif
 
 #ifdef LISP_FEATURE_OS_PROVIDES_DLOPEN

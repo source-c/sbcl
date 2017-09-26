@@ -31,19 +31,20 @@
   (declare (type function fun))
   ;; The Lisp-level type FUNCTION can conceal a multitude of sins..
   (case (sb-kernel:widetag-of fun)
-    (#.sb-vm:simple-fun-header-widetag
+    (#.sb-vm:simple-fun-widetag
       (sb-kernel:%simple-fun-arglist fun))
-    (#.sb-vm:closure-header-widetag
+    (#.sb-vm:closure-widetag
      (get-arglist (sb-kernel:%closure-fun fun)))
     ;; In code/describe.lisp, ll. 227 (%describe-fun), we use a scheme
     ;; like above, and it seems to work. -- MNA 2001-06-12
     ;;
     ;; (There might be other cases with arglist info also.
-    ;; SIMPLE-FUN-HEADER-WIDETAG and CLOSURE-HEADER-WIDETAG just
+    ;; SIMPLE-FUN-WIDETAG and CLOSURE-WIDETAG just
     ;; happen to be the two case that I had my nose rubbed in when
     ;; debugging a GC problem caused by applying %SIMPLE-FUN-ARGLIST to
     ;; a closure. -- WHN 2001-06-05)
     (t
+     ;; FIXME: what about #+sb-fasteval ?
      #+sb-eval
      (if (typep fun 'sb-eval::interpreted-function)
          (sb-eval::interpreted-function-lambda-list fun)
@@ -302,7 +303,7 @@
     (with-input-from-string (s (get-output-stream-string out))
       (loop for line = (read-line s nil)
             while line
-            do (assert targets)
+            do (assert targets nil "Line = ~a" line)
                #+nil
                (format *error-output* "Got: ~A~%" line)
                (let ((match (pop targets)))
@@ -322,7 +323,10 @@
       (error "Missed: ~S" targets))
     (assert (not oops))))
 
-(with-test (:name (:debugger :source 1))
+(with-test (:name (:debugger :source 1)
+            ;; Division is done by an assembly routine on ppc
+            ;; and it can't locate the div-by-zero error there
+            :fails-on :ppc)
   (test-debugger
    "d
     source 0
@@ -338,7 +342,7 @@
    "debugger invoked"
    '*
    "DIVISION-BY-ZERO"
-   "operands (1 0)"
+   "Operation was (/ 1 0)"
    '*
    "INTEGER-/-INTEGER"
    "(THIS-WILL-BREAK 1)"
@@ -368,6 +372,17 @@
    "(LAMBDA (X CONT)"
    '*
    "(FUNCALL CONT (1- X) CONT)"
+   "1]"))
+
+(with-test (:name (:debugger :bogus-debug-fun :source))
+  (test-debugger
+   "d
+    debugger-test-done!"
+   `(let ()
+      (#.(gensym)))
+   '*
+   "undefined function"
+   '*
    "1]"))
 
 (with-test (:name (disassemble :high-debug-eval))
@@ -481,7 +496,7 @@
   (trace foo :break-after (and (setf *x* (sb-debug:arg 0)) nil))
   (foo 7))
 
-(defun frobbleize (arg) (sb-debug:print-backtrace) 'win)
+(defun frobbleize (arg) (declare (ignore arg)) (sb-debug:list-backtrace) 'win)
 (defmethod low-debug-method ((self t))
   (declare (optimize (debug 0)))
   (frobbleize 'me) ; make this not a tail call, so it remains on stack

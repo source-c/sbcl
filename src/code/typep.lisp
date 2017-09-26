@@ -14,7 +14,6 @@
 ;;; type TYPE. This behavior is needed e.g. to test for the validity
 ;;; of numeric subtype bounds read when cross-compiling.)
 (defun typep (object type &optional environment)
-  #!+sb-doc
   "Is OBJECT of type TYPE?"
   (declare (type lexenv-designator environment) (ignore environment))
   (declare (explicit-check))
@@ -262,8 +261,8 @@
         (when (layout-invalid obj-layout)
           (setq obj-layout (update-object-layout-or-invalid object layout)))
         (%ensure-classoid-valid classoid layout "typep"))
-    (let ((obj-inherits (layout-inherits obj-layout)))
-      (or (eq obj-layout layout)
+    (or (eq obj-layout layout)
+        (let ((obj-inherits (layout-inherits obj-layout)))
           (dotimes (i (length obj-inherits) nil)
             (when (eq (svref obj-inherits i) layout)
               (return t)))))))

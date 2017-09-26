@@ -617,6 +617,35 @@
   (assert (equalp (nested-bad 42) (make-nested-good :bar *bar*)))
   (assert (equalp *bar* (list (list (make-nested-bad :bar (list 42)))))))
 
+;;; Conditional nested DX
+
+;; These two test cases prompted a substantial redesign of the STACK
+;; phase of the compiler to handle their particular permutation of
+;; nested DX.
+
+(with-test (:name (:bug-1044465 :reduced))
+  ;; Test case from Stas Boukarev
+  (compile nil '(lambda (x)
+                 (let ((a (if x
+                              (list (list x))
+                              (list (list x)))))
+                   (declare (dynamic-extent a))
+                   (prin1 a)
+                   1))))
+
+(with-test (:name (:bug-1044465 :nasty))
+  ;; Test case from Alastair Bridgewater
+  (compile nil '(lambda (x y)
+                 (dotimes (i 2)
+                   (block bar
+                     (let ((a (if x
+                                 (list (list x))
+                                 (list (list x))))
+                           (b (if y x (return-from bar x))))
+                      (declare (dynamic-extent a))
+                      (prin1 a)
+                      b))))))
+
 ;;; multiple uses for dx lvar
 
 (defun-with-dx multiple-dx-uses ()
@@ -1279,3 +1308,53 @@
   (assert (not (funcall (compile nil '(lambda (&rest args) (elt args 10))))))
   (assert (not (funcall (compile nil '(lambda (&rest args) (cadr args))))))
   (assert (not (funcall (compile nil '(lambda (&rest args) (third args)))))))
+
+(with-test (:name :local-notinline-functions)
+  (multiple-value-bind (start result end)
+      (funcall (checked-compile
+                `(lambda ()
+                   (values (sb-kernel:current-sp)
+                           (flet ((x () (cons 1 2)))
+                             (declare (notinline x))
+                             (let ((x (x)))
+                               (declare (dynamic-extent x))
+                               (true x))
+                             (true 10))
+                           (sb-kernel:current-sp)))))
+    (assert (sb-sys:sap= start end))
+    (assert result))
+  (multiple-value-bind (start result end)
+      (funcall (checked-compile
+                `(lambda ()
+                   (declare (optimize speed))
+                   (values (sb-kernel:current-sp)
+                           (flet ((x () (cons 1 2)))
+                             (let ((x (x))
+                                   (y (x)))
+                               (declare (dynamic-extent x y))
+                               (true x)
+                               (true y))
+                             (true 10))
+                           (sb-kernel:current-sp)))))
+    (assert (sb-sys:sap= start end))
+    (assert result)))
+
+
+(with-test (:name :unused-paremeters-of-an-inlined-function)
+  (let ((name (gensym "fun")))
+    (proclaim `(inline ,name))
+    (eval `(defun ,name (a b &optional c d)
+             (declare (ignore c d))
+             (cons a b)))
+    (assert (equal (funcall
+                    (funcall
+                     (checked-compile
+                      `(lambda ()
+                         (let ((x (cons
+                                   (,name 1 2)
+                                   (,name 2 3))))
+                           (declare (dynamic-extent x))
+                           (true x))
+                         #',name)))
+                    2 3)
+                   '(2 . 3)))))

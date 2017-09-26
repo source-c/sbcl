@@ -14,7 +14,6 @@
 ;;;; FORMAT
 
 (defun format (destination control-string &rest format-arguments)
-  #!+sb-doc
   "Provides various facilities for formatting output.
   CONTROL-STRING contains a string to be output, possibly with embedded
   directives, which are flagged with the escape character \"~\". Directives
@@ -37,7 +36,8 @@
 
   FORMAT has many additional capabilities not described here. Consult the
   manual for details."
-  (declare (explicit-check))
+  (declare (explicit-check)
+           (dynamic-extent format-arguments))
   (etypecase destination
     (null
      (with-simple-output-to-string (stream)
@@ -332,29 +332,29 @@
                   (format-print-ordinal stream arg)
                   (format-print-cardinal stream arg)))))))
 
-(defparameter *cardinal-ones*
+(defglobal *cardinal-ones*
   #(nil "one" "two" "three" "four" "five" "six" "seven" "eight" "nine"))
 
-(defparameter *cardinal-tens*
+(defglobal *cardinal-tens*
   #(nil nil "twenty" "thirty" "forty"
         "fifty" "sixty" "seventy" "eighty" "ninety"))
 
-(defparameter *cardinal-teens*
+(defglobal *cardinal-teens*
   #("ten" "eleven" "twelve" "thirteen" "fourteen"  ;;; RAD
     "fifteen" "sixteen" "seventeen" "eighteen" "nineteen"))
 
-(defparameter *cardinal-periods*
+(defglobal *cardinal-periods*
   #("" " thousand" " million" " billion" " trillion" " quadrillion"
     " quintillion" " sextillion" " septillion" " octillion" " nonillion"
     " decillion" " undecillion" " duodecillion" " tredecillion"
     " quattuordecillion" " quindecillion" " sexdecillion" " septendecillion"
     " octodecillion" " novemdecillion" " vigintillion"))
 
-(defparameter *ordinal-ones*
+(defglobal *ordinal-ones*
   #(nil "first" "second" "third" "fourth"
         "fifth" "sixth" "seventh" "eighth" "ninth"))
 
-(defparameter *ordinal-tens*
+(defglobal *ordinal-tens*
   #(nil "tenth" "twentieth" "thirtieth" "fortieth"
         "fiftieth" "sixtieth" "seventieth" "eightieth" "ninetieth"))
 
@@ -1054,7 +1054,7 @@
                   (format-error*
                    "~D illegal directive~:P found inside justification block"
                    (list count)
-                   :references (list '(:ansi-cl :section (22 3 5 2)))))
+                   :references '((:ansi-cl :section (22 3 5 2)))))
                 ;; ANSI does not explicitly say that an error should
                 ;; be signalled, but the @ modifier is not explicitly
                 ;; allowed for ~> either.
@@ -1064,7 +1064,7 @@
                    "@ modifier not allowed in close directive of ~
                     justification block (i.e. ~~<...~~@>."
                    '()
-                   :references (list '(:ansi-cl :section (22 3 6 2)))))
+                   :references '((:ansi-cl :section (22 3 6 2)))))
                 (interpret-format-justification stream orig-args args
                                                 segments colonp atsignp
                                                 first-semi params))))
@@ -1163,7 +1163,7 @@
 ;;;; format interpreter and support functions for user-defined method
 
 (def-format-interpreter #\/ (string start end colonp atsignp params)
-  (let ((symbol (extract-user-fun-name string start end)))
+  (let ((symbol (the symbol (extract-user-fun-name string start end))))
     (collect ((args))
       (dolist (param-and-offset params)
         (let ((param (cdr param-and-offset)))
@@ -1171,4 +1171,4 @@
             (:arg (args (next-arg)))
             (:remaining (args (length args)))
             (t (args param)))))
-      (apply (fdefinition symbol) stream (next-arg) colonp atsignp (args)))))
+      (apply symbol stream (next-arg) colonp atsignp (args)))))

@@ -41,14 +41,16 @@ fi
 # for much longer than that, don't worry, it's likely to be normal.
 if [ "$1" != --load ]; then
     echo //doing warm init - compilation phase
-    echo '(load "loader.lisp") (load-sbcl-file "make-target-2.lisp")' | \
+    echo '(load "loader.lisp") (load-sbcl-file "src/cold/warm.lisp")' | \
     ./src/runtime/sbcl \
         --core output/cold-sbcl.core \
         --lose-on-corruption \
         --no-sysinit --no-userinit
 fi
 echo //doing warm init - load and dump phase
-echo '(load "loader.lisp") (load-sbcl-file "make-target-2-load.lisp")' | \
+echo '(load "loader.lisp") (load-sbcl-file "make-target-2-load.lisp" nil)
+#+gencgc(setf (extern-alien "gc_coalesce_string_literals" char) 2)
+(sb-ext:save-lisp-and-die "output/sbcl.core")' | \
 ./src/runtime/sbcl \
 --core output/cold-sbcl.core \
 --lose-on-corruption \
@@ -68,7 +70,7 @@ echo //checking for leftover cold-init symbols
            (when (and (symbolp obj) (not (symbol-package obj))
                       (search "!" (string obj)))
              (push obj l)))
-         :dynamic)
+         :all)
         (format t "Found ~D:~%~S~%" (length l) l))
     (abort ()
       :report "Abort building SBCL."

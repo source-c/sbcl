@@ -13,15 +13,6 @@
 
 ;;;; Type frobbing VOPs
 
-(define-vop (lowtag-of)
-  (:translate lowtag-of)
-  (:policy :fast-safe)
-  (:args (object :scs (any-reg descriptor-reg)))
-  (:results (result :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 1
-    (inst and result object lowtag-mask)))
-
 (define-vop (widetag-of)
   (:translate widetag-of)
   (:policy :fast-safe)
@@ -104,7 +95,13 @@
   (:result-types positive-fixnum)
   (:generator 6
     (loadw res x 0 fun-pointer-lowtag)
-    (inst mov res (lsr res n-widetag-bits))))
+    (let* ((n-size-bits (integer-length short-header-max-words))
+           (lshift (- n-word-bits (+ n-size-bits n-widetag-bits))))
+      ;; (ldb (byte n-size-bits n-widetag-bits) ...)
+      ;; is best done as "shift left, shift right" discarding
+      ;; bits out both ends.
+      (inst mov res (lsl res lshift))
+      (inst mov res (lsr res (+ lshift n-widetag-bits))))))
 
 (define-vop (set-header-data)
   (:translate set-header-data)

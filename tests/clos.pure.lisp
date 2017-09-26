@@ -94,3 +94,14 @@
                   (and (search "slot ~S is missing"
                                (simple-condition-format-control c))
                        :win))))))
+
+(with-test (:name :funcallable-instance-sxhash)
+  (assert
+   (/= (sxhash (make-instance 'sb-mop:funcallable-standard-object))
+       (sxhash (make-instance 'sb-mop:funcallable-standard-object))
+       42)))
+
+(with-test (:name (typep :literal-class))
+  (assert (funcall (checked-compile `(lambda (x)
+                                       (typep x #.(find-class 'symbol))))
+                   'x)))

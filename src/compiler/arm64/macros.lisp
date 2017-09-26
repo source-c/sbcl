@@ -295,12 +295,10 @@
       (emit-alignment 2))))
 
 (defun error-call (vop error-code &rest values)
-  #!+sb-doc
   "Cause an error.  ERROR-CODE is the error to cause."
   (emit-error-break vop error-trap (error-number-or-lose error-code) values))
 
 (defun generate-error-code (vop error-code &rest values)
-  #!+sb-doc
   "Generate-Error-Code Error-code Value*
   Emit code for an error with the specified Error-Code and context Values."
   (assemble (*elsewhere*)
@@ -436,21 +434,6 @@
               (inst str (32-bit-reg value) (@ lip (- (* ,offset n-word-bytes) ,lowtag))))))
        (move result value))))
 
-(sb!xc:defmacro with-pinned-objects ((&rest objects) &body body)
-  "Arrange with the garbage collector that the pages occupied by
-OBJECTS will not be moved in memory for the duration of BODY.
-Useful for e.g. foreign calls where another thread may trigger
-garbage collection.  This is currently implemented by disabling GC"
-  #!-gencgc
-  (declare (ignore objects))            ; should we eval these for side-effect?
-  #!-gencgc
-  `(without-gcing
-    ,@body)
-  #!+gencgc
-  `(let ((*pinned-objects* (list* ,@objects *pinned-objects*)))
-     (declare (truly-dynamic-extent *pinned-objects*))
-     ,@body))
-
 (defun load-inline-constant (dst value &optional lip)
   (destructuring-bind (size . label) (register-inline-constant value)
     (ecase size
@@ -475,7 +458,7 @@ garbage collection.  This is currently implemented by disabling GC"
   #!+sb-thread
   `(let ((reg ,reg))
      (load-symbol tmp-tn ',symbol)
-     (inst ldr tmp-tn (tls-index-of tmp-tn))
+     (inst ldr (32-bit-reg tmp-tn) (tls-index-of tmp-tn))
      (inst ldr reg (@ thread-tn tmp-tn)))
   #!-sb-thread
   `(load-symbol-value ,reg ,symbol))
@@ -484,7 +467,7 @@ garbage collection.  This is currently implemented by disabling GC"
   #!+sb-thread
   `(let ((reg ,reg))
      (load-symbol tmp-tn ',symbol)
-     (inst ldr tmp-tn (tls-index-of tmp-tn))
+     (inst ldr (32-bit-reg tmp-tn) (tls-index-of tmp-tn))
      (inst str reg (@ thread-tn tmp-tn)))
   #!-sb-thread
   `(store-symbol-value ,reg ,symbol))

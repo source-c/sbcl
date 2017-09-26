@@ -16,6 +16,7 @@
 #include "os.h"
 #include "search.h"
 #include "thread.h"
+#include "gc-internal.h"
 #include "genesis/primitive-objects.h"
 
 boolean search_for_type(int type, lispobj **start, int *count)
@@ -23,7 +24,7 @@ boolean search_for_type(int type, lispobj **start, int *count)
     lispobj obj;
 
     while ((*count == -1 || (*count > 0)) &&
-           is_valid_lisp_addr((os_vm_address_t)*start)) {
+           gc_managed_addr_p((lispobj)*start)) {
         obj = **start;
         if (*count != -1)
             *count -= 2;
@@ -51,31 +52,31 @@ static int __attribute__((unused)) strcmp_ucs4_ascii(uint32_t* a, char* b)
   return a[i] - b[i]; // same return convention as strcmp()
 }
 
-boolean search_for_symbol(char *name, lispobj **start, int *count)
+lispobj* search_for_symbol(char *name, lispobj start, lispobj end)
 {
+    lispobj* where = (lispobj*)start;
+    lispobj* limit = (lispobj*)end;
     struct symbol *symbol;
-    struct vector *symbol_name;
-    int namelen = strlen(name);
+    lispobj namelen = make_fixnum(strlen(name));
 
-    while (search_for_type(SYMBOL_HEADER_WIDETAG, start, count)) {
-        symbol = (struct symbol *)native_pointer((lispobj)*start);
-        if (lowtag_of(symbol->name) == OTHER_POINTER_LOWTAG) {
-            symbol_name = (struct vector *)native_pointer(symbol->name);
-            if (is_valid_lisp_addr((os_vm_address_t)symbol_name) &&
-                /* FIXME: Broken with more than one type of string
-                   (i.e. even broken given (VECTOR NIL) */
+    while (where < limit) {
+        lispobj word = *where;
+        if (widetag_of(word) == SYMBOL_WIDETAG &&
+            lowtag_of((symbol = (struct symbol *)where)->name) == OTHER_POINTER_LOWTAG) {
+            struct vector *symbol_name = VECTOR(symbol->name);
+            if (gc_managed_addr_p((lispobj)symbol_name) &&
                 ((widetag_of(symbol_name->header) == SIMPLE_BASE_STRING_WIDETAG
-                  && fixnum_value(symbol_name->length) == namelen
+                  && symbol_name->length == namelen
                   && !strcmp((char *)symbol_name->data, name))
 #ifdef LISP_FEATURE_SB_UNICODE
                  || (widetag_of(symbol_name->header) == SIMPLE_CHARACTER_STRING_WIDETAG
-                     && fixnum_value(symbol_name->length) == namelen
+                     && symbol_name->length == namelen
                      && !strcmp_ucs4_ascii((uint32_t*)symbol_name->data, name))
 #endif
                  ))
-                return 1;
+                return where;
         }
-        (*start) += 2;
+        where += OBJECT_SIZE(word, where);
     }
     return 0;
 }

@@ -61,10 +61,6 @@
   ;; is the offset in the table of the code object needing to be
   ;; patched, and <offset> is the offset that must be patched.
   (patch-table (make-hash-table :test 'eq) :type hash-table)
-  ;; a list of the table handles for all of the DEBUG-INFO structures
-  ;; dumped in this file. These structures must be back-patched with
-  ;; source location information when the compilation is complete.
-  (debug-info () :type list)
   ;; This is used to keep track of objects that we are in the process
   ;; of dumping so that circularities can be preserved. The key is the
   ;; object that we have previously seen, and the value is the object
@@ -76,7 +72,9 @@
   (circularity-table (make-hash-table :test 'eq) :type hash-table)
   ;; a hash table of structures that are allowed to be dumped. If we
   ;; try to dump a structure that isn't in this hash table, we lose.
-  (valid-structures (make-hash-table :test 'eq) :type hash-table))
+  (valid-structures (make-hash-table :test 'eq) :type hash-table)
+  ;; DEBUG-SOURCE written at the very beginning
+  (source-info nil :type (or null sb!c::debug-source)))
 
 ;;; This structure holds information about a circularity.
 (defstruct (circularity (:copier nil))
@@ -376,25 +374,12 @@
            (typecase x
              (symbol (dump-symbol x file))
              (list
-              ;; KLUDGE: The code in this case has been hacked
-              ;; to match Douglas Crosher's quick fix to CMU CL
-              ;; (on cmucl-imp 1999-12-27), applied in sbcl-0.6.8.11
-              ;; with help from Martin Atzmueller. This is not an
-              ;; ideal solution; to quote DTC,
-              ;;   The compiler locks up trying to coalesce the
-              ;;   constant lists. The hack below will disable the
-              ;;   coalescing of lists while dumping and allows
-              ;;   the code to compile. The real fix would be to
-              ;;   take a little more care while dumping these.
-              ;; So if better list coalescing is needed, start here.
-              ;; -- WHN 2000-11-07
-              (if (maybe-cyclic-p x)
-                  (progn
-                    (dump-list x file)
-                    (eq-save-object x file))
-                  (unless (equal-check-table x file)
-                    (dump-list x file)
-                    (equal-save-object x file))))
+              (cond ((not (coalesce-tree-p x))
+                     (dump-list x file)
+                     (eq-save-object x file))
+                    ((not (equal-check-table x file))
+                     (dump-list x file t)
+                     (equal-save-object x file))))
              (layout
               (dump-layout x file)
               (eq-save-object x file))
@@ -500,13 +485,16 @@
 
 ;;; Emit a funcall of the function and return the handle for the
 ;;; result.
-(defun fasl-dump-load-time-value-lambda (fun file)
+(defun fasl-dump-load-time-value-lambda (fun file no-skip)
   (declare (type sb!c::clambda fun) (type fasl-output file))
   (let ((handle (gethash (sb!c::leaf-info fun)
                          (fasl-output-entry-table file))))
     (aver handle)
     (dump-push handle file)
-    (dump-fop 'fop-funcall file)
+    ;; Can't skip MAKE-LOAD-FORM due to later references
+    (if no-skip
+        (dump-fop 'fop-funcall-no-skip file)
+        (dump-fop 'fop-funcall file))
     (dump-byte 0 file))
   (dump-pop file))
 
@@ -668,49 +656,63 @@
 ;;;
 ;;; Otherwise, we recursively call the dumper to dump the current
 ;;; element.
-(defun dump-list (list file)
+(defun dump-list (list file &optional coalesce)
   (aver (and list
              (not (gethash list (fasl-output-circularity-table file)))))
   (let ((circ (fasl-output-circularity-table file)))
-   (flet ((cdr-circularity (obj n)
-            (let ((ref (gethash obj circ)))
-              (when ref
-                (push (make-circularity :type :rplacd
-                                        :object list
-                                        :index (1- n)
-                                        :value obj
-                                        :enclosing-object ref)
-                      *circularities-detected*)
-                (terminate-undotted-list n file)
-                t))))
-     (do* ((l list (cdr l))
-           (n 0 (1+ n)))
-          ((atom l)
-           (cond ((null l)
-                  (terminate-undotted-list n file))
-                 (t
-                  (cond ((cdr-circularity l n))
-                        (t
-                         (sub-dump-object l file)
-                         (terminate-dotted-list n file))))))
-       (declare (type index n))
-       (when (cdr-circularity l n)
-         (return))
+    (flet ((cdr-circularity (obj n)
+             ;; COALESCE means there's no cycles
+             (let ((ref (gethash obj circ)))
+               (when ref
+                 (push (make-circularity :type :rplacd
+                                         :object list
+                                         :index (1- n)
+                                         :value obj
+                                         :enclosing-object ref)
+                       *circularities-detected*)
+                 (terminate-undotted-list n file)
+                 t))))
+      (do* ((l list (cdr l))
+            (n 0 (1+ n)))
+           ((atom l)
+            (cond ((null l)
+                   (terminate-undotted-list n file))
+                  (t
+                   (cond ((cdr-circularity l n))
+                         (t
+                          (sub-dump-object l file)
+                          (terminate-dotted-list n file))))))
+        (declare (type index n))
+        (when (cdr-circularity l n)
+          (return))
 
-       (setf (gethash l circ) list)
+        (setf (gethash l circ) list)
 
-       (let* ((obj (car l))
-              (ref (gethash obj circ)))
-         (cond (ref
-                (push (make-circularity :type :rplaca
-                                        :object list
-                                        :index n
-                                        :value obj
-                                        :enclosing-object ref)
-                      *circularities-detected*)
-                (sub-dump-object nil file))
-               (t
-                (sub-dump-object obj file))))))))
+        (let* ((obj (car l))
+               (ref (gethash obj circ)))
+          (cond (ref
+                 (push (make-circularity :type :rplaca
+                                         :object list
+                                         :index n
+                                         :value obj
+                                         :enclosing-object ref)
+                       *circularities-detected*)
+                 (sub-dump-object nil file))
+                ;; Avoid coalescing if COALESCE-TREE-P decided not to
+                ((consp obj)
+                 ;; This is the same as DUMP-NON-IMMEDIATE-OBJECT but
+                 ;; without calling COALESCE-TREE-P again.
+                 (let ((index (gethash obj (fasl-output-eq-table file))))
+                   (cond (index
+                          (dump-push index file))
+                         ((not coalesce)
+                          (dump-list obj file)
+                          (eq-save-object obj file))
+                         ((not (equal-check-table obj file))
+                          (dump-list obj file t)
+                          (equal-save-object obj file)))))
+                (t
+                 (sub-dump-object obj file))))))))
 
 (defun terminate-dotted-list (n file)
   (declare (type index n) (type fasl-output file))
@@ -878,12 +880,16 @@
                (ecase bits
                  (8  sb!vm:simple-array-signed-byte-8-widetag)
                  (16 sb!vm:simple-array-signed-byte-16-widetag)
-                 (32 sb!vm:simple-array-signed-byte-32-widetag)))
+                 (32 sb!vm:simple-array-signed-byte-32-widetag)
+                 #!+64-bit
+                 (64 sb!vm:simple-array-signed-byte-64-widetag)))
               (unsigned-byte
                (ecase bits
                  (8  sb!vm:simple-array-unsigned-byte-8-widetag)
                  (16 sb!vm:simple-array-unsigned-byte-16-widetag)
-                 (32 sb!vm:simple-array-unsigned-byte-32-widetag))))
+                 (32 sb!vm:simple-array-unsigned-byte-32-widetag)
+                 #!+64-bit
+                 (64 sb!vm:simple-array-unsigned-byte-64-widetag))))
             (/ bits sb!vm:n-byte-bits)
             bits)))
         ((typep vector '(simple-bit-vector 0))
@@ -1047,6 +1053,19 @@
         (:code-object
          (aver (null name))
          (dump-fop 'fop-code-object-fixup fasl-output))
+        #!+immobile-space
+        (:layout
+         (dump-non-immediate-object (classoid-name (layout-classoid name))
+                                    fasl-output)
+         (dump-fop 'fop-layout-fixup fasl-output))
+        #!+immobile-space
+        (:immobile-object
+         (dump-non-immediate-object (the symbol name) fasl-output)
+         (dump-fop 'fop-immobile-obj-fixup fasl-output))
+        #!+immobile-code
+        (:named-call
+         (dump-non-immediate-object name fasl-output)
+         (dump-fop 'fop-named-call-fixup fasl-output))
         #!+immobile-code
         (:static-call
          (dump-non-immediate-object name fasl-output)
@@ -1073,11 +1092,9 @@
 ;;; We dump trap objects in any unused slots or forward referenced slots.
 (defun dump-code-object (component code-segment code-length fixups
                          fasl-output entry-offsets)
-
   (declare (type component component)
            (type index code-length)
            (type fasl-output fasl-output))
-
   (let* ((2comp (component-info component))
          (constants (sb!c:ir2-component-constants 2comp))
          (header-length (length constants)))
@@ -1117,9 +1134,9 @@
       ;; Dump the debug info.
       (let ((info (sb!c::debug-info-for-component component))
             (*dump-only-valid-structures* nil))
-        (dump-object info fasl-output)
-        (push (dump-to-table fasl-output)
-              (fasl-output-debug-info fasl-output)))
+        (setf (sb!c::debug-info-source info)
+              (fasl-output-source-info fasl-output))
+        (dump-object info fasl-output))
 
       (dump-object (if (eq (sb!c::component-kind component) :toplevel) :toplevel nil)
                    fasl-output)
@@ -1134,7 +1151,7 @@
       ;; dumps aren't included in the LENGTH passed to FOP-CODE.
       (dump-fixups fixups fasl-output)
 
-      #!-(or x86 x86-64)
+      #!-(or x86 (and x86-64 (not immobile-space)))
       (dump-fop 'fop-sanctify-for-execution fasl-output)
 
       (let ((handle (dump-pop fasl-output)))
@@ -1235,35 +1252,6 @@
   (dump-fop 'fop-funcall-for-effect fasl-output)
   (dump-byte 0 fasl-output)
   (values))
-
-;;; Compute the correct list of DEBUG-SOURCE structures and backpatch
-;;; all of the dumped DEBUG-INFO structures. We clear the
-;;; FASL-OUTPUT-DEBUG-INFO, so that subsequent components with
-;;; different source info may be dumped.
-(defun fasl-dump-source-info (info fasl-output)
-  (declare (type sb!c::source-info info))
-  (let ((res (sb!c::debug-source-for-info info))
-        (*dump-only-valid-structures* nil))
-    ;; Zero out the timestamps to get reproducible fasls.
-    #+sb-xc-host (setf (sb!c::debug-source-created res) 0
-                       (sb!c::debug-source-compiled res) 0)
-    (dump-object res fasl-output)
-    (let ((res-handle (dump-pop fasl-output)))
-      (dolist (info-handle (fasl-output-debug-info fasl-output))
-        (dump-push res-handle fasl-output)
-        (dump-fop 'fop-structset fasl-output)
-        (dump-word info-handle fasl-output)
-        (macrolet ((debug-info-source-index ()
-                     (let ((dd (find-defstruct-description 'sb!c::debug-info)))
-                       (dsd-index (find 'source (dd-slots dd)
-                                        :key #'dsd-name :test 'string=)))))
-          (dump-word (debug-info-source-index) fasl-output)))
-      #+sb-xc-host
-      (progn
-        (dump-push res-handle fasl-output)
-        (dump-fop 'fop-note-debug-source fasl-output))))
-  (setf (fasl-output-debug-info fasl-output) nil)
-  (values))
 
 ;;;; dumping structures
 
@@ -1304,6 +1292,9 @@
   (when (layout-invalid obj)
     (compiler-error "attempt to dump reference to obsolete class: ~S"
                     (layout-classoid obj)))
+  ;; STANDARD-OBJECT could in theory be dumpable, but nothing else,
+  ;; because all its subclasses can evolve to have new layouts.
+  (aver (not (logtest (layout-%flags obj) +pcl-object-layout-flag+)))
   (let ((name (classoid-name (layout-classoid obj))))
     ;; Q: Shouldn't we aver that NAME is the proper name for its classoid?
     (unless name

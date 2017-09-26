@@ -290,8 +290,6 @@
   (:vop-var vop)
   (:save-p t)
   (:generator 0
-    ;; ABI: Direction flag must be clear on function entry. -- JES, 2006-01-20
-    (inst cld)
     #!+sb-safepoint
     (progn
       ;; Current PC - don't rely on function to keep it in a form that
@@ -339,13 +337,6 @@
     (inst and rsp-tn -16)
     (move result rsp-tn)))
 
-(define-vop (dealloc-number-stack-space)
-  (:info amount)
-  (:generator 0
-    (unless (zerop amount)
-      (let ((delta (logandc2 (+ amount 7) 7)))
-        (inst add rsp-tn delta)))))
-
 (macrolet ((alien-stack-ptr ()
              #!+sb-thread '(symbol-known-tls-cell '*alien-stack-pointer*)
              #!-sb-thread '(static-symbol-value-ea '*alien-stack-pointer*)))
@@ -387,12 +378,12 @@
     (let* ((segment (make-segment))
            (rax rax-tn)
            #!+(or win32 (not sb-thread)) (rcx rcx-tn)
-           #!-win32 (rdi rdi-tn)
-           #!-win32 (rsi rsi-tn)
+           #!-(and win32 sb-thread) (rdi rdi-tn)
+           #!-(and win32 sb-thread) (rsi rsi-tn)
            (rdx rdx-tn)
            (rbp rbp-tn)
            (rsp rsp-tn)
-           #!+win32 (r8 r8-tn)
+           #!+(and win32 sb-thread) (r8 r8-tn)
            (xmm0 float0-tn)
            ([rsp] (make-ea :qword :base rsp :disp 0))
            ;; How many arguments have been copied
@@ -406,7 +397,8 @@
                          (subseq *float-regs* 0 #!-win32 8 #!+win32 4))))
       (assemble (segment)
         ;; Make room on the stack for arguments.
-        (inst sub rsp (* n-word-bytes (length argument-types)))
+        (when argument-types
+          (inst sub rsp (* n-word-bytes (length argument-types))))
         ;; Copy arguments from registers to stack
         (dolist (type argument-types)
           (let ((integerp (not (alien-float-type-p type)))
@@ -456,21 +448,15 @@
         #!-sb-thread
         (progn
           ;; arg0 to FUNCALL3 (function)
-          ;;
-          ;; Indirect the access to ENTER-ALIEN-CALLBACK through
-          ;; the symbol-value slot of SB-ALIEN::*ENTER-ALIEN-CALLBACK*
-          ;; to ensure it'll work even if the GC moves ENTER-ALIEN-CALLBACK.
-          ;; Skip any SB-THREAD TLS magic, since we don't expect anyone
-          ;; to rebind the variable. -- JES, 2006-01-01
-          (inst mov rdi (+ nil-value (static-symbol-offset
-                                      'sb!alien::*enter-alien-callback*)))
-          (loadw rdi rdi symbol-value-slot other-pointer-lowtag)
+          (inst mov rdi (make-ea :qword :disp (static-fdefn-fun-addr 'enter-alien-callback)))
           ;; arg0 to ENTER-ALIEN-CALLBACK (trampoline index)
           (inst mov rsi (fixnumize index))
           ;; arg1 to ENTER-ALIEN-CALLBACK (pointer to argument vector)
           (inst mov rdx rsp)
           ;; add room on stack for return value
-          (inst sub rsp 8)
+          (inst sub rsp (if (evenp arg-count)
+                            (* n-word-bytes 2)
+                            n-word-bytes))
           ;; arg2 to ENTER-ALIEN-CALLBACK (pointer to return value)
           (inst mov rcx rsp)
 
@@ -493,7 +479,9 @@
           ;; arg1 to ENTER-ALIEN-CALLBACK (pointer to argument vector)
           (inst mov #!-win32 rsi #!+win32 rdx rsp)
           ;; add room on stack for return value
-          (inst sub rsp 8)
+          (inst sub rsp (if (evenp arg-count)
+                            (* n-word-bytes 2)
+                            n-word-bytes))
           ;; arg2 to ENTER-ALIEN-CALLBACK (pointer to return value)
           (inst mov #!-win32 rdx #!+win32 r8 rsp)
           ;; Make new frame
@@ -524,7 +512,13 @@
 
         ;; Pop the arguments and the return value from the stack to get
         ;; the return address at top of stack.
-        (inst add rsp (* (1+ (length argument-types)) n-word-bytes))
+
+        (inst add rsp (* (+ arg-count
+                            ;; Plus the return value and make sure it's aligned
+                            (if (evenp arg-count)
+                                2
+                                1))
+                         n-word-bytes))
         ;; Return
         (inst ret))
       (finalize-segment segment)

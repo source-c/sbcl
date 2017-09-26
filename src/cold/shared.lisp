@@ -47,10 +47,16 @@
   (or #+sbcl
       (let ((envvar (sb-ext:posix-getenv "SBCL_MAKE_PARALLEL")))
         (when envvar
+          (require :sb-posix)
           (parse-make-host-parallelism envvar)))))
 
 (defun make-host-1-parallelism () (car *make-host-parallelism*))
 (defun make-host-2-parallelism () (cdr *make-host-parallelism*))
+
+#+sbcl
+(let ((f (multiple-value-bind (sym access) (find-symbol "OS-EXIT" "SB-SYS")
+           (if (eq access :external) sym 'sb-unix:unix-exit))))
+  (defun exit-process (arg) (funcall f arg)))
 
 ;;; If TRUE, then COMPILE-FILE is being invoked only to process
 ;;; :COMPILE-TOPLEVEL forms, not to produce an output file.
@@ -156,11 +162,6 @@
                                       (read-from-file customizer-file-name))
                              #'identity)))
         (funcall customizer default-features)))
-(let ((*print-length* nil)
-      (*print-level* nil))
-  (format t
-          "target features *SHEBANG-FEATURES*=~%~@<~S~:>~%"
-          *shebang-features*))
 
 (defvar *shebang-backend-subfeatures*
   (let* ((default-subfeatures nil)
@@ -170,11 +171,13 @@
                                   (read-from-file customizer-file-name))
                          #'identity)))
     (funcall customizer default-subfeatures)))
-(let ((*print-length* nil)
-      (*print-level* nil))
-  (format t
-          "target backend-subfeatures *SHEBANG-BACKEND-FEATURES*=~@<~S~:>~%"
-          *shebang-backend-subfeatures*))
+
+(progn (write-string "target *FEATURES* = ")
+       (write *shebang-features* :pretty nil :length nil)
+       (terpri)
+       (write-string "*shebang-backend-subfeatures* = ")
+       (write *shebang-backend-subfeatures* :pretty nil :length nil)
+       (terpri))
 
 ;;; Call for effect of signaling an error if no target picked.
 (target-platform-name)
@@ -201,16 +204,16 @@
           ":GENCGC not supported on selected architecture")
          ("(not (or gencgc cheneygc))"
           "One of :GENCGC or :CHENEYGC must be enabled")
-         ("(and win32 (not (and sb-thread
-                                sb-safepoint sb-thruption sb-wtimer
-                                sb-dynamic-core)))"
-          ":SB-WIN32 requires :SB-THREAD and related features")
-         ("(and sb-dynamic-core (not (and linkage-table sb-thread)))"
-          ;; Subtle memory corruption follows when sb-dynamic-core is
-          ;; active, and non-threaded allocation routines have not been
-          ;; updated to take the additional indirection into account.
-          ;; Let's avoid this unusual combination.
-          ":SB-DYNAMIC-CORE requires :LINKAGE-TABLE and :SB-THREAD")
+         ("(and sb-dynamic-core (not linkage-table))"
+          ":SB-DYNAMIC-CORE requires :LINKAGE-TABLE")
+         ("(and relocatable-heap (or cheneygc win32))"
+          "Relocatable heap requires gencgc + not win32")
+         ("(and sb-linkable-runtime (not sb-dynamic-core))"
+          ":SB-LINKABLE-RUNTIME requires :SB-DYNAMIC-CORE")
+         ("(and sb-linkable-runtime (not (or x86 x86-64)))"
+          ":SB-LINKABLE-RUNTIME not supported on selected architecture")
+         ("(and sb-linkable-runtime (not (or darwin linux win32)))"
+          ":SB-LINKABLE-RUNTIME not supported on selected operating system")
          ("(and sb-eval sb-fasteval)"
           ;; It sorta kinda works to have both, but there should be no need,
           ;; and it's not really supported.
@@ -221,6 +224,8 @@
           ":COMPACT-INSTANCE-HEADER requires :IMMOBILE-SPACE feature")
         ("(and immobile-code (not immobile-space))"
           ":IMMOBILE-CODE requires :IMMOBILE-SPACE feature")
+        ("(and immobile-symbols (not immobile-space))"
+          ":IMMOBILE-SYMBOLS requires :IMMOBILE-SPACE feature")
          ;; There is still hope to make multithreading on DragonFly x86-64
          ("(and sb-thread x86 dragonfly)"
           ":SB-THREAD not supported on selected architecture")))
@@ -288,13 +293,11 @@
     ;; genesis to include in the cold core.
     :not-genesis))
 
-(defparameter *stems-and-flags* (read-from-file "build-order.lisp-expr"))
-
 (defvar *array-to-specialization* (make-hash-table :test #'eq))
 
 (defmacro do-stems-and-flags ((stem flags) &body body)
   (let ((stem-and-flags (gensym "STEM-AND-FLAGS")))
-    `(dolist (,stem-and-flags *stems-and-flags*)
+    `(dolist (,stem-and-flags (get-stems-and-flags))
        (let ((,stem (first ,stem-and-flags))
              (,flags (rest ,stem-and-flags)))
          ,@body
@@ -337,8 +340,13 @@
     (concatenate 'string obj-prefix (stem-remap-target stem) obj-suffix)))
 (compile 'stem-object-path)
 
+(defvar *stems-and-flags* nil)
 ;;; Check for stupid typos in FLAGS list keywords.
-(let ((stems (make-hash-table :test 'equal)))
+(defun get-stems-and-flags ()
+ (when *stems-and-flags*
+   (return-from get-stems-and-flags *stems-and-flags*))
+ (setf *stems-and-flags* (read-from-file "build-order.lisp-expr"))
+ (let ((stems (make-hash-table :test 'equal)))
   (do-stems-and-flags (stem flags)
     ;; We do duplicate stem comparison based on the object path in
     ;; order to cover the case of stems with an :assem flag, which
@@ -358,6 +366,7 @@
       (when set-difference
         (error "found unexpected flag(s) in *STEMS-AND-FLAGS*: ~S"
                set-difference)))))
+  *stems-and-flags*)
 
 ;;;; tools to compile SBCL sources to create the cross-compiler
 
@@ -538,20 +547,3 @@
              (funcall *target-compile-file* filename))))
 (compile 'target-compile-file)
 
-(defun make-assembler-package (pkg-name)
-  (when (find-package pkg-name)
-    (delete-package pkg-name))
-  (let ((pkg (make-package pkg-name
-                           :use '("CL" "SB!INT" "SB!EXT" "SB!KERNEL" "SB!VM"
-                                  "SB!SYS" ; for SAP accessors
-                                  ;; Dependence of the assembler on the compiler
-                                  ;; feels a bit backwards, but assembly needs
-                                  ;; TN-SC, TN-OFFSET, etc. because the compiler
-                                  ;; doesn't speak the assembler's language.
-                                  ;; Rather vice-versa.
-                                  "SB!C"))))
-    ;; Both SB-ASSEM and SB-DISASSEM export these two symbols.
-    ;; Neither is shadowing-imported. If you need one, package-qualify it.
-    (shadow '("SEGMENT" "MAKE-SEGMENT") pkg)
-    (use-package '("SB!ASSEM" "SB!DISASSEM") pkg)
-    pkg))

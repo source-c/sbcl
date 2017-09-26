@@ -20,9 +20,9 @@
   (declare (function function))
   ;; It's too bad that TYPECASE isn't able to generate equivalent code.
   (case (fun-subtype function)
-    (#.sb!vm:closure-header-widetag
+    (#.sb!vm:closure-widetag
      (%closure-fun function))
-    (#.sb!vm:funcallable-instance-header-widetag
+    (#.sb!vm:funcallable-instance-widetag
      ;; %FUNCALLABLE-INSTANCE-FUNCTION is not known to return a FUNCTION.
      ;; Is that right? Shouldn't we always initialize to something
      ;; that is a function, such as an error-signaling trampoline?
@@ -63,74 +63,75 @@
     (sb!interpreter:interpreted-function (sb!interpreter:%fun-type function))
     (t (%simple-fun-type (%fun-fun function)))))
 
-(!defglobal *closure-name-marker* (make-symbol ".CLOSURE-NAME."))
-(defun closure-name (closure)
-  (declare (closure closure))
-  (let ((len (get-closure-length closure)))
-    (if (and (>= len 4)
-             ;; The number of closure-values is 1- the len.
-             ;; The index of the last value is 1- that.
-             ;; The index of the name-marker is 1- that.
-             ;; (closure index 0 is the first closed-over value)
-             (eq (%closure-index-ref closure (- len 3))
-                 (load-time-value *closure-name-marker* t)))
-        (values (%closure-index-ref closure (- len 2)) t)
-        (values nil nil))))
+(defconstant +closure-header-namedp+ #x800000)
+(macrolet ((closure-header-word (closure)
+             `(sap-ref-word (int-sap (get-lisp-obj-address ,closure))
+                            (- sb!vm:fun-pointer-lowtag))))
+  (defun closure-name (closure)
+    (declare (closure closure))
+    (if (logtest (with-pinned-objects (closure) (closure-header-word closure))
+                 +closure-header-namedp+)
+        ;; GET-CLOSURE-LENGTH counts the 'fun' slot
+        (values (%closure-index-ref closure (- (get-closure-length closure) 2)) t)
+        (values nil nil)))
 
-;; Add 2 "slots" to the payload of a closure, one for the magic symbol
-;; signifying that there is a name, and one for the name itself.
-(defun nameify-closure (closure)
-  (declare (closure closure))
-  (let* ((physical-len (get-closure-length closure)) ; excluding header
-         ;; subtract 1 because physical-len includes the trampoline word.
-         (new-n-closure-vals (+ 2 (1- physical-len)))
-         ;; Closures and funcallable-instances are pretty much the same to GC.
-         ;; They're both varying-length boxed-payload objects.
-         ;; But funcallable-instance has <tramp, function, info>
-         ;; where closure has <tramp, info> so subtract 1 more word.
-         (copy (%make-funcallable-instance (1- new-n-closure-vals))))
-    (with-pinned-objects (closure copy)
-      ;; change the widetag from funcallable-instance to closure.
-      (setf (sap-ref-word (int-sap (get-lisp-obj-address copy))
-                          (- sb!vm:fun-pointer-lowtag))
-            (logior (ash (+ physical-len 2) 8) sb!vm:closure-header-widetag))
-      (macrolet ((word (obj index)
-                   `(sap-ref-lispobj (int-sap (get-lisp-obj-address ,obj))
-                                     (+ (- sb!vm:fun-pointer-lowtag)
-                                        (ash ,index sb!vm:word-shift)))))
-        (loop for i from 1 to physical-len
-              do (setf (word copy i) (word closure i)))
-        (setf (word copy (1+ physical-len)) *closure-name-marker*)))
-    copy))
+  ;; Return a new object that has 1 more slot than CLOSURE,
+  ;; and frob its header bit signifying that it is named.
+  (declaim (ftype (sfunction (closure) closure) nameify-closure))
+  (defun nameify-closure (closure)
+    (declare (closure closure))
+    (let* ((n-words (get-closure-length closure)) ; excluding header
+           ;; N-WORDS includes the trampoline, so the number of slots we would
+           ;; pass to %COPY-CLOSURE is 1 less than that, were it not for
+           ;; the fact that we actually want to create 1 additional slot.
+           ;; So in effect, asking for N-WORDS does exactly the right thing.
+           (copy #!-(or x86 x86-64)
+                 (sb!vm::%copy-closure n-words (%closure-fun closure))
+                 #!+(or x86 x86-64)
+                 ;; CLOSURE was tested on entry as (SATISFIES CLOSUREP) which,
+                 ;; sadly, does not imply FUNCTIONP of the object
+                 ;; because the type system is not smart enough.
+                 (with-pinned-objects ((%closure-fun (truly-the function closure)))
+                   ;; %CLOSURE-CALLEE manifests as a fixnum which remains
+                   ;; valid across GC due to %CLOSURE-FUN being pinned
+                   ;; until after the new closure is made.
+                   (sb!vm::%copy-closure n-words (sb!vm::%closure-callee closure)))))
+      (with-pinned-objects (copy)
+        (loop with sap = (int-sap (get-lisp-obj-address copy))
+              for i from 0 below (1- n-words)
+              for ofs from (- (ash 2 sb!vm:word-shift) sb!vm:fun-pointer-lowtag)
+                        by sb!vm:n-word-bytes
+              do (setf (sap-ref-lispobj sap ofs) (%closure-index-ref closure i)))
+        (setf (closure-header-word copy) ; Update the header
+              ;; Closure copy lost its high header bits, so OR them in again.
+              (logior #!+(and immobile-space 64-bit)
+                      (get-lisp-obj-address sb!vm:function-layout)
+                      +closure-header-namedp+
+                      (closure-header-word copy))))
+      (truly-the closure copy)))
 
-;; Rename a closure. Doing so changes its identity unless it was already named.
-;; To do this without allocating a new closure, we'd need an interface that
-;; requests a placeholder from the outset. One possibility is that
-;; (NAMED-LAMBDA NIL (x) ...) would allocate the name, initially stored as nil.
-;; In that case, the simple-fun's debug-info could also contain a bit that
-;; indicates that all closures over it are named, eliminating the storage
-;; and check for *closure-name-marker* in the closure values.
-(defun set-closure-name (closure new-name)
-  (declare (closure closure))
-  (unless (nth-value 1 (closure-name closure))
-    (setq closure (nameify-closure closure)))
-  ;; There are no closure slot setters, and in fact SLOT-SET
-  ;; does not exist in a variant that takes a non-constant index.
-  (with-pinned-objects (closure)
-    (setf (sap-ref-lispobj (int-sap (get-lisp-obj-address closure))
-                           (+ (- sb!vm:fun-pointer-lowtag)
-                              (ash (get-closure-length closure)
-                                   sb!vm:word-shift)))
-          new-name))
-  closure)
+  ;; Rename a closure. Doing so changes its identity unless it was already named.
+  (defun set-closure-name (closure new-name)
+    (declare (closure closure))
+    (unless (logtest (with-pinned-objects (closure) (closure-header-word closure))
+                     +closure-header-namedp+)
+      (setq closure (nameify-closure closure)))
+    ;; There are no closure slot setters, and in fact SLOT-SET
+    ;; does not exist in a variant that takes a non-constant index.
+    (with-pinned-objects (closure)
+      (setf (sap-ref-lispobj (int-sap (get-lisp-obj-address closure))
+                             (- (ash (get-closure-length closure) sb!vm:word-shift)
+                                sb!vm:fun-pointer-lowtag)) new-name))
+    closure))
 
 ;;; a SETFable function to return the associated debug name for FUN
 ;;; (i.e., the third value returned from CL:FUNCTION-LAMBDA-EXPRESSION),
 ;;; or NIL if there's none
 (defun %fun-name (function)
   (case (fun-subtype function)
-    (#.sb!vm:funcallable-instance-header-widetag
-     (let ((layout (%funcallable-instance-layout function)))
+    (#.sb!vm:funcallable-instance-widetag
+     (let (#!+(or sb-eval sb-fasteval)
+           (layout (%funcallable-instance-layout function)))
        ;; We know that funcallable-instance-p is true,
        ;; and so testing via TYPEP would be wasteful.
        (cond #!+sb-eval
@@ -147,7 +148,7 @@
                                    function)
               (return-from %fun-name
                 (sb!mop:generic-function-name function))))))
-    (#.sb!vm:closure-header-widetag
+    (#.sb!vm:closure-widetag
      (multiple-value-bind (name namedp) (closure-name function)
        (when namedp
          (return-from %fun-name name)))))
@@ -251,10 +252,12 @@
   (let ((f (%code-entry-point code-obj 0)))
     (or (and f
              (let ((from (code-header-words code-obj))
-                   (to (ash (with-pinned-objects (f)
+                   ;; Ignore the layout pointer (if present) in the upper bits
+                   ;; of the function header.
+                   (to (ldb (byte 24 sb!vm:n-widetag-bits)
+                            (with-pinned-objects (f)
                               (sap-ref-word (int-sap (get-lisp-obj-address f))
-                                            (- sb!vm:fun-pointer-lowtag)))
-                            (- sb!vm:n-widetag-bits))))
+                                            (- sb!vm:fun-pointer-lowtag))))))
                (and (< from to) (- to from))))
         0)))
 
@@ -262,12 +265,10 @@
 
 (defvar *features*
   '#.(sort (copy-list sb-cold:*shebang-features*) #'string<)
-  #!+sb-doc
   "a list of symbols that describe features provided by the
    implementation")
 
 (defun machine-instance ()
-  #!+sb-doc
   "Return a string giving the name of the local machine."
   #!+win32 (sb!win32::get-computer-name)
   #!-win32 (truly-the simple-string (sb!unix:unix-gethostname)))
@@ -276,7 +277,6 @@
 (defvar *machine-version*)
 
 (defun machine-version ()
-  #!+sb-doc
   "Return a string describing the version of the computer hardware we
 are running on, or NIL if we can't find any useful information."
   (unless (boundp '*machine-version*)
@@ -291,28 +291,22 @@ are running on, or NIL if we can't find any useful information."
 ;;; a symbol in COMMON-LISP..
 (declaim (type (or null string) *short-site-name* *long-site-name*))
 (defvar *short-site-name* nil
-  #!+sb-doc
   "The value of SHORT-SITE-NAME.")
 (defvar *long-site-name* nil
-  #!+sb-doc
   "The value of LONG-SITE-NAME.")
 (defun short-site-name ()
-  #!+sb-doc
   "Return a string with the abbreviated site name, or NIL if not known."
   *short-site-name*)
 (defun long-site-name ()
-  #!+sb-doc
   "Return a string with the long form of the site name, or NIL if not known."
   *long-site-name*)
 
 ;;;; ED
 (declaim (type list *ed-functions*))
 (defvar *ed-functions* '()
-  #!+sb-doc
   "See function documentation for ED.")
 
 (defun ed (&optional x)
-  #!+sb-doc
   "Starts the editor (on a file or a function if named).  Functions
 from the list *ED-FUNCTIONS* are called in order with X as an argument
 until one of them returns non-NIL; these functions are responsible for
@@ -322,7 +316,7 @@ the file system."
            (error 'extension-failure
                   :format-control "Don't know how to ~S ~A"
                   :format-arguments (list 'ed x)
-                  :references (list '(:sbcl :variable *ed-functions*))))
+                  :references '((:sbcl :variable *ed-functions*))))
     (when (funcall fun x)
       (return t))))
 
@@ -344,7 +338,6 @@ the file system."
 (defvar *dribble-stream* nil)
 
 (defun dribble (&optional pathname &key (if-exists :append))
-  #!+sb-doc
   "With a file name as an argument, dribble opens the file and sends a
   record of further I/O to that file. Without an argument, it closes
   the dribble file, and quits logging."
@@ -379,12 +372,10 @@ the file system."
 ;;;; some *LOAD-FOO* variables
 
 (defvar *load-print* nil
-  #!+sb-doc
   "the default for the :PRINT argument to LOAD")
 
 (defvar *load-verbose* nil
   ;; Note that CMU CL's default for this was T, and ANSI says it's
   ;; implementation-dependent. We choose NIL on the theory that it's
   ;; a nicer default behavior for Unix programs.
-  #!+sb-doc
   "the default for the :VERBOSE argument to LOAD")

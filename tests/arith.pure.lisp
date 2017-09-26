@@ -470,9 +470,10 @@
                                      (slow-result (handler-case
                                                       (apply slow call-args)
                                                     (division-by-zero () :div0))))
-                                (if (eql fast-result slow-result)
-                                    (print (list :ok `(,op ,@args) :=> fast-result))
-                                    (error "oops: ~S, ~S" args call-args)))))))))))
+                                (if (not (eql fast-result slow-result))
+                                    (error "oops: ~S, ~S" args call-args)
+                                    #+nil (print (list :ok `(,op ,@args) :=> fast-result))
+                                    ))))))))))
 
 ;;; (TRUNCATE <unsigned-word> <constant unsigned-word>) is optimized
 ;;; to use multiplication instead of division. This propagates to FLOOR,
@@ -560,9 +561,9 @@
         results)
     (dolist (base (cons bignum numbers))
       (dolist (power numbers)
-        (format t "(expt ~s ~s) => " base power)
+        #+nil (format t "(expt ~s ~s) => " base power)
         (let ((result (expt base power)))
-          (format t "~s~%" result)
+          #+nil (format t "~s~%" result)
           (push result results))))
     (assert (every #'numberp results))))
 
@@ -583,6 +584,8 @@
              (and (nearly-equal-p (realpart x) (realpart y))
                   (nearly-equal-p (imagpart x) (imagpart y))))
            (print-result (msg base power got expected)
+             (declare (ignorable msg base power got expected))
+             #+nil
              (format t "~a (expt ~s ~s)~%got      ~s~%expected ~s~%"
                      msg base power got expected)))
     (let ((n-broken 0))
@@ -783,3 +786,24 @@
     (assert (= (funcall fun sb-ext:most-positive-word)
                (logxor sb-ext:most-positive-word
                        (1- (expt 2 (/ sb-vm:n-word-bits 2))))))))
+
+(with-test (:name :logand-mask-word)
+  (let ((fun (checked-compile `(lambda (x)
+                                 (logand x (ash sb-ext:most-positive-word -1))))))
+    (assert (= (funcall fun -1)
+               (ash most-positive-word -1)))))
+
+(with-test (:name ://complex-real-single-float)
+  (assert (= (funcall (checked-compile `(lambda (b)
+                                          (declare (type single-float b))
+                                          (/ #c(1.0 2.0) b)))
+                      1.0)
+             #c(1.0 2.0))))
+
+(with-test (:name :unsigned-ash)
+  (let ((fun (checked-compile
+              `(lambda (x)
+                 (declare (sb-vm:signed-word x))
+                 (ash x -64)))))
+    (assert (zerop (funcall fun 123)))
+    (assert (= (funcall fun -321) -1))))

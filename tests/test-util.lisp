@@ -6,7 +6,7 @@
            #:make-kill-thread #:make-join-thread
            #:checked-compile #:checked-compile-capturing-source-paths
            #:checked-compile-condition-source-paths
-           #:runtime #:split-string))
+           #:runtime #:split-string #:shuffle))
 
 (in-package :test-util)
 
@@ -136,7 +136,7 @@
       (log-msg "~@<~A ~S ~:_~A~:>"
                type test-name condition)
       (log-msg "~@<~A ~S ~:_due to ~S: ~4I~:_\"~A\"~:>"
-               type test-name condition condition))
+               type test-name (type-of condition) condition))
   (push (list type *test-file* (or test-name *test-count*))
         *failures*)
   (unless (stringp condition)
@@ -184,6 +184,9 @@
                         (allow-notes t)
                         (allow-compiler-errors allow-failure)
                         condition-transform)
+  (when (functionp form)
+    (error "~@<~S is a function, not a form.~@:>" form))
+
   (let ((warnings '())
         (style-warnings '())
         (notes '())
@@ -214,7 +217,7 @@
           (declare (ignore warnings-p))
           (labels ((fail (kind conditions &optional allowed-type)
                      (error "~@<Compilation of ~S signaled ~A~P:~
-                             ~{~@:_~@:_~{~/sb-impl:print-symbol-with-prefix/: ~A~}~}~
+                             ~{~@:_~@:_~{~/sb-ext:print-symbol-with-prefix/: ~A~}~}~
                              ~@[~@:_~@:_Allowed type is ~S.~]~@:>"
                             form kind (length conditions)
                             (mapcar (lambda (condition)
@@ -323,3 +326,15 @@
         for end = (position delimiter string) then (position delimiter string :start begin)
         collect (subseq string begin end)
         while end))
+
+(defun shuffle (sequence)
+  (typecase sequence
+    (list
+     (coerce (shuffle (coerce sequence 'vector)) 'list))
+    (vector ; destructive
+     (let ((vector sequence))
+       (loop for lim from (1- (length vector)) downto 0
+             for chosen = (random (1+ lim))
+             unless (= chosen lim)
+             do (rotatef (aref vector chosen) (aref vector lim)))
+       vector))))

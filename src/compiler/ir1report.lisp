@@ -17,7 +17,6 @@
 (declaim (special *current-path*))
 
 (defvar *enclosing-source-cutoff* 1
-  #!+sb-doc
   "The maximum number of enclosing non-original source forms (i.e. from
   macroexpansion) that we print in full. For additional enclosing forms, we
   print only the CAR.")
@@ -60,9 +59,9 @@
 (declaim (type (or null compiler-error-context node) *compiler-error-context*))
 (defvar *compiler-error-context* nil)
 
-;;; a hashtable mapping macro names to source context parsers. Each parser
+;;; a plist mapping macro names to source context parsers. Each parser
 ;;; function returns the source-context list for that form.
-(defvar *source-context-methods* (make-hash-table))
+(defglobal *source-context-methods* nil)
 
 ;;; documentation originally from cmu-user.tex:
 ;;;   This macro defines how to extract an abbreviated source context from
@@ -79,14 +78,13 @@
 ;;; user wants to do some heavy tweaking to make SBCL give more
 ;;; informative output about his code.
 (defmacro define-source-context (name lambda-list &body body)
-  #!+sb-doc
   "DEFINE-SOURCE-CONTEXT Name Lambda-List Form*
    This macro defines how to extract an abbreviated source context from the
    Named form when it appears in the compiler input. Lambda-List is a DEFMACRO
    style lambda-list used to parse the arguments. The Body should return a
    list of subforms suitable for a \"~{~S ~}\" format string."
   (with-unique-names (whole)
-    `(setf (gethash ',name *source-context-methods*)
+    `(setf (getf *source-context-methods* ',name)
            (lambda (,whole)
              (destructuring-bind ,lambda-list ,whole ,@body)))))
 
@@ -120,9 +118,9 @@
                              (declare (ignore x))
                              (list (first form) (second form))))
                          (context-fun
-                           (gethash (first form)
-                                    *source-context-methods*
-                                    context-fun-default)))
+                           (getf *source-context-methods*
+                                 (first form)
+                                 context-fun-default)))
                     (declare (type function context-fun))
                     (funcall context-fun (rest form))))
                  (t
@@ -421,9 +419,9 @@ has written, having proved that it is unreachable."))
              (with-unique-names (block)
                `(block ,block
                   (let ((,condition
-                         (coerce-to-condition ,datum ,args
-                                              'simple-compiler-note
-                                              'with-condition)))
+                          (apply #'coerce-to-condition ,datum
+                                 'simple-compiler-note 'with-condition
+                                 ,args)))
                     (restart-case
                         (signal ,condition)
                       (muffle-warning ()
@@ -528,7 +526,6 @@ has written, having proved that it is unreachable."))
 ;;;; undefined warnings
 
 (defvar *undefined-warning-limit* 3
-  #!+sb-doc
   "If non-null, then an upper limit on the number of unknown function or type
   warnings that the compiler will print for any given name in a single
   compilation. This prevents excessive amounts of output when the real

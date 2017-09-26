@@ -16,17 +16,14 @@
 (in-package "SB!C")
 
 ;;; ANSI limits on compilation
-(def!constant sb!xc:call-arguments-limit sb!xc:most-positive-fixnum
-  #!+sb-doc
+(defconstant sb!xc:call-arguments-limit sb!xc:most-positive-fixnum
   "The exclusive upper bound on the number of arguments which may be passed
   to a function, including &REST args.")
-(def!constant sb!xc:lambda-parameters-limit sb!xc:most-positive-fixnum
-  #!+sb-doc
+(defconstant sb!xc:lambda-parameters-limit sb!xc:most-positive-fixnum
   "The exclusive upper bound on the number of parameters which may be specified
   in a given lambda list. This is actually the limit on required and &OPTIONAL
   parameters. With &KEY and &AUX you can get more.")
-(def!constant sb!xc:multiple-values-limit sb!xc:most-positive-fixnum
-  #!+sb-doc
+(defconstant sb!xc:multiple-values-limit sb!xc:most-positive-fixnum
   "The exclusive upper bound on the number of multiple VALUES that you can
   return.")
 
@@ -66,10 +63,11 @@
 ;;;             references (even under #'without FUNCALL)."
 (deftype inlinep ()
   '(member :inline :maybe-inline :notinline nil))
-(defparameter *inlinep-translations*
+(defconstant-eqx +inlinep-translations+
   '((inline . :inline)
     (notinline . :notinline)
-    (maybe-inline . :maybe-inline)))
+    (maybe-inline . :maybe-inline))
+  #'equal)
 
 ;;; *FREE-VARS* translates from the names of variables referenced
 ;;; globally to the LEAF structures for them. *FREE-FUNS* is like
@@ -110,6 +108,7 @@
 (defvar *eval-tlf-index*)
 (defvar *dynamic-counts-tn*)
 (defvar *elsewhere*)
+(defvar *elsewhere-label*)
 (defvar *event-info*)
 (defvar *event-note-threshold*)
 (defvar *failure-p*)
@@ -133,9 +132,9 @@
 (defvar *undefined-warnings*)
 (defvar *warnings-p*)
 (defvar *lambda-conversions*)
+(defvar *compile-object* nil)
 
 (defvar *stack-allocate-dynamic-extent* t
-  #!+sb-doc
   "If true (the default), the compiler respects DYNAMIC-EXTENT declarations
 and stack allocates otherwise inaccessible parts of the object whenever
 possible. Potentially long (over one page in size) vectors are, however, not
@@ -231,12 +230,13 @@ the stack without triggering overflow protection.")
     (style-warn 'asterisks-around-lexical-variable-name
                 :format-control
                 "using the lexical binding of the symbol ~
-                 ~/sb-impl::print-symbol-with-prefix/, not the~@
+                 ~/sb-ext:print-symbol-with-prefix/, not the~@
                  dynamic binding"
                 :format-arguments (list symbol)))
   (values))
 
-(def!struct (debug-name-marker (:print-function print-debug-name-marker)))
+(def!struct (debug-name-marker (:print-function print-debug-name-marker)
+                               (:copier nil)))
 
 (defvar *debug-name-level* 4)
 (defvar *debug-name-length* 12)
@@ -311,7 +311,7 @@ the stack without triggering overflow protection.")
 (in-package "SB!ALIEN")
 
 ;;; Information describing a heap-allocated alien.
-(def!struct (heap-alien-info)
+(def!struct (heap-alien-info (:copier nil))
   ;; The type of this alien.
   (type (missing-arg) :type alien-type)
   ;; Its name.

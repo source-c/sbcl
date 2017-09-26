@@ -217,9 +217,6 @@ typedef signed long s64;
 typedef unsigned int u32;
 typedef signed int s32;
 
-/* this is an integral type the same length as a machine pointer */
-typedef uintptr_t pointer_sized_uint_t;
-
 #ifdef _WIN64
 #define AMD64_SYSV_ABI __attribute__((sysv_abi))
 #else
@@ -246,7 +243,7 @@ typedef s32 sword_t;
 /* FIXME: we do things this way because of the alpha32 port.  once
    alpha64 has arrived, all this nastiness can go away */
 #if 64 == N_WORD_BITS
-#define LOW_WORD(c) ((pointer_sized_uint_t)c)
+#define LOW_WORD(c) ((uintptr_t)c)
 #define OBJ_FMTX "lx"
 typedef uintptr_t lispobj;
 #else
@@ -283,32 +280,15 @@ static inline uword_t instance_length(lispobj header)
 {
   return HEADER_VALUE_MASKED(header);
 }
-static inline lispobj instance_layout(lispobj* instance_ptr) // native ptr
-{
-#ifdef LISP_FEATURE_COMPACT_INSTANCE_HEADER
-  return instance_ptr[0] >> 32; // the high half of the header is the layout
+/* Define an assignable instance_layout() macro taking a native pointer */
+#ifndef LISP_FEATURE_COMPACT_INSTANCE_HEADER
+# define instance_layout(instance_ptr) (instance_ptr)[1]
+#elif defined(LISP_FEATURE_64_BIT) && defined(LISP_FEATURE_LITTLE_ENDIAN)
+  // so that this stays an lvalue, it can't be cast to lispobj
+# define instance_layout(instance_ptr) ((uint32_t*)(instance_ptr))[1]
 #else
-  return instance_ptr[1]; // the word following the header is the layout
+# error "No instance_layout() defined"
 #endif
-}
-
-static inline struct cons *
-CONS(lispobj obj)
-{
-  return (struct cons *)(obj - LIST_POINTER_LOWTAG);
-}
-
-static inline struct symbol *
-SYMBOL(lispobj obj)
-{
-  return (struct symbol *)(obj - OTHER_POINTER_LOWTAG);
-}
-
-static inline struct fdefn *
-FDEFN(lispobj obj)
-{
-  return (struct fdefn *)(obj - OTHER_POINTER_LOWTAG);
-}
 
 /* Is the Lisp object obj something with pointer nature (as opposed to
  * e.g. a fixnum or character or unbound marker)? */
@@ -342,7 +322,7 @@ is_lisp_immediate(lispobj obj)
 static inline lispobj *
 native_pointer(lispobj obj)
 {
-    return (lispobj *) ((pointer_sized_uint_t) (obj & ~LOWTAG_MASK));
+    return (lispobj *) ((uintptr_t) (obj & ~LOWTAG_MASK));
 }
 
 /* inverse operation: create a suitably tagged lispobj from a native
@@ -404,6 +384,23 @@ other_immediate_lowtag_p(lispobj header)
     return (lowtag_of(header) & 3) == OTHER_IMMEDIATE_0_LOWTAG;
 }
 
+static inline int
+is_cons_half(lispobj obj)
+{
+    /* A word that satisfies other_immediate_lowtag_p is a headered object
+     * and can not be half of a cons, except that widetags which satisfy
+     * other_immediate and are Lisp immediates can be half of a cons */
+    return !other_immediate_lowtag_p(obj)
+#if N_WORD_BITS == 64
+        || ((uword_t)IMMEDIATE_WIDETAGS_MASK >> (widetag_of(obj) >> 2)) & 1;
+#else
+      /* The above bit-shifting approach is not applicable
+       * since we can't employ a 64-bit unsigned integer constant. */
+      || widetag_of(obj) == CHARACTER_WIDETAG
+      || widetag_of(obj) == UNBOUND_MARKER_WIDETAG;
+#endif
+}
+
 /* KLUDGE: As far as I can tell there's no ANSI C way of saying
  * "this function never returns". This is the way that you do it
  * in GCC later than version 2.5 or so. */
@@ -443,5 +440,21 @@ void *os_dlsym_default(char *name);
 struct lisp_startup_options {
     boolean noinform;
 };
+
+/* Even with just -O1, gcc optimizes the jumps in this "loop" away
+ * entirely, giving the ability to define WITH-FOO-style macros. */
+#define RUN_BODY_ONCE(prefix, finally_do)               \
+    int prefix##done = 0;                               \
+    for (; !prefix##done; finally_do, prefix##done = 1)
+
+// casting to void is no longer enough to suppress a warning about unused
+// results of libc functions declared with warn_unused_result.
+// from http://git.savannah.gnu.org/cgit/gnulib.git/tree/lib/ignore-value.h
+#if 3 < __GNUC__ + (4 <= __GNUC_MINOR__)
+# define ignore_value(x) \
+      (__extension__ ({ __typeof__ (x) __x = (x); (void) __x; }))
+#else
+# define ignore_value(x) ((void) (x))
+#endif
 
 #endif /* _SBCL_RUNTIME_H_ */

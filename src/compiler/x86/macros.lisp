@@ -39,7 +39,6 @@
 ;;;; instruction-like macros
 
 (defmacro move (dst src)
-  #!+sb-doc
   "Move SRC into DST unless they are location=."
   (once-only ((n-dst dst)
               (n-src src))
@@ -160,7 +159,6 @@
   `(store-symbol-value ,reg *binding-stack-pointer*))
 
 (defmacro load-type (target source &optional (offset 0))
-  #!+sb-doc
   "Loads the type bits of a pointer into target independent of
    byte-ordering issues."
   (once-only ((n-target target)
@@ -190,6 +188,7 @@
 ;;; overhead.
 
 (defun allocation-dynamic-extent (alloc-tn size lowtag)
+  (aver (not (location= alloc-tn esp-tn)))
   (inst sub esp-tn size)
   ;; FIXME: SIZE _should_ be double-word aligned (suggested but
   ;; unfortunately not enforced by PAD-DATA-BLOCK and
@@ -198,7 +197,6 @@
   ;; unneccessary and could be removed.  If not, explain why.  -- CSR,
   ;; 2004-03-30
   (inst and esp-tn (lognot lowtag-mask))
-  (aver (not (location= alloc-tn esp-tn)))
   (inst lea alloc-tn (make-ea :byte :base esp-tn :disp lowtag))
   (values))
 
@@ -313,6 +311,9 @@
   (cond
     (dynamic-extent
      (allocation-dynamic-extent alloc-tn size lowtag))
+    ;; Inline allocation can't work if (and (not sb-thread) sb-dynamic-core)
+    ;; because boxed_region points to the linkage table, not the alloc region.
+    #!+(or sb-thread (not sb-dynamic-core))
     ((or (null inline) (policy inline (>= speed space)))
      (allocation-inline alloc-tn size))
     (t
@@ -357,12 +358,10 @@
     (encode-internal-error-args values)))
 
 (defun error-call (vop error-code &rest values)
-  #!+sb-doc
   "Cause an error. ERROR-CODE is the error to cause."
   (emit-error-break vop error-trap (error-number-or-lose error-code) values))
 
 (defun generate-error-code (vop error-code &rest values)
-  #!+sb-doc
   "Generate-Error-Code Error-code Value*
   Emit code for an error with the specified Error-Code and context Values."
   (assemble (*elsewhere*)
@@ -591,39 +590,6 @@
                                            n-word-bytes) ,lowtag))
                   value)))
         (move result value)))))
-
-;;; helper for alien stuff.
-
-(sb!xc:defmacro with-pinned-objects ((&rest objects) &body body)
-  "Arrange with the garbage collector that the pages occupied by
-OBJECTS will not be moved in memory for the duration of BODY.
-Useful for e.g. foreign calls where another thread may trigger
-collection."
-  (if objects
-      (let ((pins (make-gensym-list (length objects)))
-            (wpo (sb!xc:gensym "WITH-PINNED-OBJECTS-THUNK")))
-        ;; BODY is stuffed in a function to preserve the lexical
-        ;; environment.
-        `(flet ((,wpo () (progn ,@body)))
-           ;; The cross-compiler prints either "unknown type: COMPILER-NOTE" at
-           ;; each use of W-P-O prior to 'ir1report' being compiled, or else
-           ;; "could not stack allocate". Kill it with fire :-(
-           (declare (muffle-conditions #+sb-xc compiler-note #-sb-xc t))
-           ;; PINS are dx-allocated in case the compiler for some
-           ;; unfathomable reason decides to allocate value-cells
-           ;; for them -- since we have DX value-cells on x86oid
-           ;; platforms this still forces them on the stack.
-           (dx-let ,(mapcar #'list pins objects)
-             (multiple-value-prog1 (,wpo)
-               ;; TOUCH-OBJECT has a VOP with an empty body: compiler
-               ;; thinks we're using the argument and doesn't flush
-               ;; the variable, but we don't have to pay any extra
-               ;; beyond that -- and MULTIPLE-VALUE-PROG1 keeps them
-               ;; live till the body has finished. *whew*
-               ,@(mapcar (lambda (pin)
-                           `(touch-object ,pin))
-                         pins)))))
-      `(progn ,@body)))
 
 ;;; Helper to hide the fact that thread access on Windows needs one more
 ;;; instruction, needs the FS prefix in that instruction _instead_ of

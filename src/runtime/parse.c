@@ -23,8 +23,6 @@
 #endif
 #include "runtime.h"
 
-#if defined(LISP_FEATURE_SB_LDB)
-
 #include "globals.h"
 #include "vars.h"
 #include "parse.h"
@@ -196,7 +194,7 @@ char *parse_addr(char **ptr, boolean safely)
         result = (value & ~3);
     }
 
-    if (safely && !is_valid_lisp_addr((os_vm_address_t)result)) {
+    if (safely && !gc_managed_addr_p(result)) {
         printf("invalid Lisp-level address: %p\n", (void *)result);
         throw_to_monitor();
     }
@@ -206,34 +204,31 @@ char *parse_addr(char **ptr, boolean safely)
 
 static lispobj lookup_symbol(char *name)
 {
-    int count;
     lispobj *headerptr;
 
     /* Search static space. */
-    headerptr = (lispobj *)STATIC_SPACE_START;
-    count =
-        (lispobj *)SymbolValue(STATIC_SPACE_FREE_POINTER,0) -
-        (lispobj *)STATIC_SPACE_START;
-    if (search_for_symbol(name, &headerptr, &count))
+    if ((headerptr = search_for_symbol(name,
+                                       STATIC_SPACE_START,
+                                       (uword_t)static_space_free_pointer)))
         return make_lispobj(headerptr, OTHER_POINTER_LOWTAG);
 
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
     /* Search immobile space. */
-    headerptr = (lispobj *)IMMOBILE_SPACE_START;
-    count = IMMOBILE_FIXEDOBJ_SUBSPACE_SIZE / N_WORD_BYTES;
-    if (search_for_symbol(name, &headerptr, &count))
+    if ((headerptr = search_for_symbol(name,
+                                       IMMOBILE_SPACE_START,
+                                       (uword_t)immobile_fixedobj_free_pointer)))
         return make_lispobj(headerptr, OTHER_POINTER_LOWTAG);
 #endif
 
     /* Search dynamic space. */
 #if defined(LISP_FEATURE_GENCGC)
-    headerptr = (lispobj *)DYNAMIC_SPACE_START;
-    count = (lispobj *)get_alloc_pointer() - headerptr;
+    uword_t start = DYNAMIC_SPACE_START;
+    uword_t end   = (uword_t)get_alloc_pointer();
 #else
-    headerptr = (lispobj *)current_dynamic_space;
-    count = dynamic_space_free_pointer - headerptr;
+    uword_t start = (uword_t)current_dynamic_space;
+    uword_t end   = (uword_t)dynamic_space_free_pointer;
 #endif
-    if (search_for_symbol(name, &headerptr, &count))
+    if ((headerptr = search_for_symbol(name, start, end)))
         return make_lispobj(headerptr, OTHER_POINTER_LOWTAG);
 
     return 0;
@@ -285,7 +280,7 @@ lispobj parse_lispobj(char **ptr)
             int regnum;
             os_context_t *context;
 
-            free_ici = fixnum_value(SymbolValue(FREE_INTERRUPT_CONTEXT_INDEX,thread));
+            free_ici = fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX,thread));
 
             if (free_ici == 0) {
                 printf("Variable ``%s'' is not valid -- there is no current interrupt context.\n", token);
@@ -308,7 +303,7 @@ lispobj parse_lispobj(char **ptr)
     } else if (token[0] == '@') {
         if (string_to_long(token+1, &pointer)) {
             pointer &= ~3;
-            if (is_valid_lisp_addr((os_vm_address_t)pointer))
+            if (gc_managed_addr_p(pointer))
                 result = *(lispobj *)pointer;
             else {
                 printf("invalid Lisp-level address: ``%s''\n", token+1);
@@ -331,5 +326,3 @@ lispobj parse_lispobj(char **ptr)
 
     return result;
 }
-
-#endif /* defined(LISP_FEATURE_SB_LDB) */

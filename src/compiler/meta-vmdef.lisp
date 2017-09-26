@@ -45,37 +45,46 @@
      (aver (not (logtest size (1- size-alignment))))
      (aver (not (logtest size-increment (1- size-alignment))))))
 
-  (let ((sb (if (eq kind :non-packed)
-                 (make-sb :name name :kind kind)
-                 (make-finite-sb :name name :kind kind :size size
-                                 :size-increment size-increment
-                                 :size-alignment size-alignment))))
-    `(progn
-       (/show0 "in DEFINE-STORAGE-BASE")
-       ;; DEFINE-STORAGE-CLASS need the storage bases while building
+  `(progn
+       ;; DEFINE-STORAGE-CLASS needs the storage bases while building
        ;; the cross-compiler, but to eval this during cross-compilation
        ;; would kill the cross-compiler.
-       (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
-         (let ((sb (,(if (eq kind :non-packed) 'copy-sb 'copy-finite-sb)
-                    ',sb)))
-           (setf *backend-sb-list*
-                 (cons sb (remove ',name *backend-sb-list* :key #'sb-name)))))
-       ,@(unless (eq kind :non-packed)
-           `((let ((res (sb-or-lose ',name)))
-               (/show0 "not :NON-PACKED, i.e. hairy case")
-               (setf (finite-sb-always-live res)
-                     (make-array ',size :initial-element #*))
-               (/show0 "doing second SETF")
-               (setf (finite-sb-conflicts res)
-                     (make-array ',size :initial-element '#()))
-               (/show0 "doing third SETF")
-               (setf (finite-sb-live-tns res)
-                     (make-array ',size :initial-element nil))
-               (/show0 "doing fourth SETF")
-               (setf (finite-sb-always-live-count res)
-                     (make-array ',size :initial-element 0)))))
-       (/show0 "finished with DEFINE-STORAGE-BASE expansion")
-       ',name)))
+     (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
+       (unless (find ',name *backend-sbs* :key 'sb-name)
+         (let* ((index (length *backend-sbs*))
+                (sbs (make-array (1+ index))))
+           (replace sbs *backend-sbs*)
+           (setf (aref sbs index)
+                 ,(if (eq kind :non-packed)
+                      `(make-sb :%index index :name ',name :kind ,kind)
+                      `(make-finite-sb :%index index :name ',name
+                                       :kind ,kind :size ,size
+                                       :size-increment ,size-increment
+                                       :size-alignment ,size-alignment)))
+           (setf *backend-sbs* sbs))))
+     ',name))
+
+(defun finite-sbs-ctor-form ()
+  `(vector
+    ,@(loop for sb across *backend-sbs*
+            for index from 0
+            collect
+            (if (eq (sb-kind sb) :non-packed)
+                0
+                ;; These "proxy" objects don't really need to be instances of
+                ;; FINITE-SB.  Not all slots of them are accessed.
+                (let ((size (sb-size sb)))
+                  `(make-finite-sb
+                    :%index ,(sb-%index sb)
+                    :name ',(sb-name sb)
+                    :kind ,(sb-kind sb)
+                    :size ,(sb-size sb)
+                    :size-increment ,(finite-sb-size-increment sb)
+                    :size-alignment ,(finite-sb-size-alignment sb)
+                    :always-live (make-array ,size :initial-element #*)
+                    :conflicts (make-array ,size :initial-element #())
+                    :live-tns (make-array ,size :initial-element nil)
+                    :always-live-count (make-array ,size :initial-element 0)))))))
 
 ;;; Define a storage class NAME that uses the named Storage-Base.
 ;;; NUMBER is a small, non-negative integer that is used as an alias.
@@ -212,7 +221,8 @@
              (setf (svref (sc-load-costs to-sc) num) ',cost)))))
 
      (defun ,name ,lambda-list
-       (sb!assem:assemble (*code-segment* ,(first lambda-list))
+       (declare (ignorable ,(car lambda-list)))
+       (sb!assem:assemble ()
          ,@body))))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
@@ -259,6 +269,7 @@
 ;;; operand or temporary at meta-compile time. Besides the obvious
 ;;; stuff, we also store the names of per-operand temporaries here.
 (def!struct (operand-parse
+             (:copier nil)
              #-sb-xc-host (:pure t))
   ;; name of the operand (which we bind to the TN)
   (name nil :type symbol)
@@ -338,10 +349,6 @@
   (info-args () :type list)
   ;; an efficiency note associated with this VOP
   (note nil :type (or string null))
-  ;; a list of the names of the Effects and Affected attributes for
-  ;; this VOP
-  (effects '#1=(any) :type list)
-  (affected '#1# :type list)
   ;; a list of the names of functions this VOP is a translation of and
   ;; the policy that allows this translation to be done. :FAST is a
   ;; safe default, since it isn't a safe policy.
@@ -371,8 +378,6 @@
   (variant-vars :test variant-vars)
   (info-args :test info-args)
   (note :test note)
-  effects
-  affected
   translate
   ltn-policy
   (save-p :test save-p)
@@ -490,30 +495,24 @@
 
 ;;; Return a time spec describing a time during the evaluation of a
 ;;; VOP, used to delimit operand and temporary lifetimes. The
-;;; representation is a cons whose CAR is the number of the evaluation
-;;; phase and the CDR is the sub-phase. The sub-phase is 0 in the
-;;; :LOAD and :SAVE phases.
+;;; representation is a fixnum [phase][16-bit sub-phase].
+;;; The sub-phase is 0 in the :LOAD and :SAVE phases.
 (defun parse-time-spec (spec)
   (let ((dspec (if (atom spec) (list spec 0) spec)))
     (unless (and (= (length dspec) 2)
                  (typep (second dspec) 'unsigned-byte))
       (error "malformed time specifier: ~S" spec))
-
-    (cons (case (first dspec)
-            (:load 0)
-            (:argument 1)
-            (:eval 2)
-            (:result 3)
-            (:save 4)
-            (t
-             (error "unknown phase in time specifier: ~S" spec)))
-          (second dspec))))
-
-;;; Return true if the time spec X is the same or later time than Y.
-(defun time-spec-order (x y)
-  (or (> (car x) (car y))
-      (and (= (car x) (car y))
-           (>= (cdr x) (cdr y)))))
+    (let ((phase (case (first dspec)
+                   (:load 0)
+                   (:argument 1)
+                   (:eval 2)
+                   (:result 3)
+                   (:save 4)
+                   (t
+                    (error "unknown phase in time specifier: ~S" spec))) )
+          (sub-phase (second dspec)))
+      (+ (ash phase 16)
+         sub-phase))))
 
 ;;;; generation of emit functions
 
@@ -587,8 +586,8 @@
                                   (lambda (x y)
                                     (let ((x-time (car x))
                                           (y-time (car y)))
-                                      (if (time-spec-order x-time y-time)
-                                          (if (time-spec-order y-time x-time)
+                                      (if (>= x-time y-time)
+                                          (if (>= y-time x-time)
                                               (and (not (cdr x)) (cdr y))
                                               nil)
                                           t)))
@@ -684,10 +683,13 @@
                          (if load-p
                              `(,(cdr (first funs)) ,n-vop ,tn ,load-tn)
                              `(,(cdr (first funs)) ,n-vop ,load-tn ,tn)))))
-          (if (eq (operand-parse-load op) t)
-              `(when ,load-tn ,form)
-              `(when (eq ,load-tn ,(operand-parse-name op))
-                 ,form)))
+          (cond (load-p
+                 form)
+                ((eq (operand-parse-load op) t)
+                 `(when ,load-tn ,form))
+                (t
+                 `(when (eq ,load-tn ,(operand-parse-name op))
+                    ,form))))
         `(when ,load-tn
            (error "load TN allocated, but no move function?~@
                    VM definition is inconsistent, recompile and try again.")))))
@@ -698,9 +700,15 @@
 (defun decide-to-load (parse op)
   (let ((load (operand-parse-load op))
         (load-tn (operand-parse-load-tn op))
-        (temp (operand-parse-temp op)))
+        (temp (operand-parse-temp op))
+        (loads (and (eq (operand-parse-kind op) :argument)
+                    (call-move-fun parse op t))))
     (if (eq load t)
-        `(or ,load-tn (tn-ref-tn ,temp))
+        `(cond (,load-tn
+                ,loads
+                ,load-tn)
+               (t
+                (tn-ref-tn ,temp)))
         (collect ((binds)
                   (ignores))
           (dolist (x (vop-parse-operands parse))
@@ -708,12 +716,14 @@
               (let ((name (operand-parse-name x)))
                 (binds `(,name (tn-ref-tn ,(operand-parse-temp x))))
                 (ignores name))))
-          `(if (and ,load-tn
-                    (let ,(binds)
-                      (declare (ignorable ,@(ignores)))
-                      ,load))
-               ,load-tn
-               (tn-ref-tn ,temp))))))
+          `(cond ((and ,load-tn
+                       (let ,(binds)
+                         (declare (ignorable ,@(ignores)))
+                         ,load))
+                  ,loads
+                  ,load-tn)
+                 (t
+                  (tn-ref-tn ,temp)))))))
 
 ;;; Make a lambda that parses the VOP TN-REFS, does automatic operand
 ;;; loading, and runs the appropriate code generator.
@@ -734,9 +744,8 @@
                     (binds `(,(operand-parse-load-tn op)
                              (tn-ref-load-tn ,temp)))
                     (binds `(,name ,(decide-to-load parse op)))
-                    (if (eq (operand-parse-kind op) :argument)
-                        (loads (call-move-fun parse op t))
-                        (saves (call-move-fun parse op nil))))
+                    (when (eq (operand-parse-kind op) :result)
+                      (saves (call-move-fun parse op nil))))
                    (t
                     (binds `(,name (tn-ref-tn ,temp)))))))
           (:temporary
@@ -745,6 +754,7 @@
           ((:more-argument :more-result))))
 
       `(named-lambda (vop ,(vop-parse-name parse)) (,n-vop)
+         (declare (ignorable ,n-vop))
          (let* (,@(access-operands (vop-parse-args parse)
                                    (vop-parse-more-args parse)
                                    `(vop-args ,n-vop))
@@ -766,8 +776,8 @@
                   ,@(binds))
            (declare (ignore ,@(vop-parse-ignores parse)))
            ,@(loads)
-           (sb!assem:assemble (*code-segment* ,n-vop)
-                              ,@(vop-parse-body parse))
+           (assemble ()
+             ,@(vop-parse-body parse))
            ,@(saves))))))
 
 (defvar *parse-vop-operand-count*)
@@ -918,10 +928,10 @@
             (t
              (error "unknown temporary option: ~S" opt))))
 
-        (unless (and (time-spec-order (operand-parse-dies res)
-                                      (operand-parse-born res))
-                     (not (time-spec-order (operand-parse-born res)
-                                           (operand-parse-dies res))))
+        (unless (and (>= (operand-parse-dies res)
+                         (operand-parse-born res))
+                     (< (operand-parse-born res)
+                        (operand-parse-dies res)))
           (error "Temporary lifetime doesn't begin before it ends: ~S" spec))
 
         (unless (operand-parse-sc res)
@@ -977,10 +987,6 @@
             (setf (vop-parse-cost parse)
                   (vop-spec-arg spec 'unsigned-byte 1 nil))
           (setf (vop-parse-body parse) (cddr spec)))
-        (:effects
-         (setf (vop-parse-effects parse) (rest spec)))
-        (:affected
-         (setf (vop-parse-affected parse) (rest spec)))
         (:info
          (setf (vop-parse-info-args parse) (rest spec)))
         (:ignore
@@ -1312,13 +1318,7 @@
                                 `(primitive-type-or-lose ',type))
                               (rest type))))
            (:constant
-            ``(:constant ,(named-lambda (vop-arg-typep) (x)
-                              ;; Can't handle SATISFIES during XC
-                              ,(if (and (consp (second type))
-                                        (eq (caadr type) 'satisfies))
-                                   `(,(cadadr type) x)
-                                   `(sb!xc:typep x ',(second type))))
-                         ,',(second type)))))))
+            ``(:constant . ,',(second type)))))))
 
 (defun specify-operand-types (types ops more-ops)
   (if (eq types :unspecified)
@@ -1402,8 +1402,6 @@
       :ltn-policy ',(vop-parse-ltn-policy parse)
       :save-p ',(vop-parse-save-p parse)
       :move-args ',(vop-parse-move-args parse)
-      :effects (vop-attributes ,@(vop-parse-effects parse))
-      :affected (vop-attributes ,@(vop-parse-affected parse))
       ,@(make-costs-and-restrictions parse)
       ,@(make-emit-function-and-friends parse)
       ,@(inherit-vop-info :generator-function iparse
@@ -1506,12 +1504,6 @@
 ;;;     the body, so code may be emitted by using the local INST macro.
 ;;;     During the evaluation of the body, the names of the operands
 ;;;     and temporaries are bound to the actual TNs.
-;;;
-;;; :EFFECTS Effect*
-;;; :AFFECTED Effect*
-;;;     Specifies the side effects that this VOP has and the side
-;;;     effects that effect its execution. If unspecified, these
-;;;     default to the worst case.
 ;;;
 ;;; :INFO Name*
 ;;;     Define some magic arguments that are passed directly to the code
@@ -1828,8 +1820,8 @@
     (collect ((clauses))
       (do ((cases forms (rest cases)))
           ((null cases)
-           (clauses `(t (error "unknown SC to SC-CASE for ~S:~%  ~S" ,n-tn
-                               (sc-name (tn-sc ,n-tn))))))
+           (clauses `(t (locally (declare (optimize (safety 0))) ;; avoid NIL-FUN-RETURNED-ERROR
+                          (unknown-sc-case ,n-tn)))))
         (let ((case (first cases)))
           (when (atom case)
             (error "illegal SC-CASE clause: ~S" case))
@@ -1847,6 +1839,9 @@
       `(let* ((,n-tn ,tn)
               (,n-sc (sc-number (tn-sc ,n-tn))))
          (cond ,@(clauses))))))
+
+(defun unknown-sc-case (tn)
+  (error "unknown SC to SC-CASE for ~S:~%  ~S" tn (sc-name (tn-sc tn))))
 
 ;;; Return true if TNs SC is any of the named SCs, false otherwise.
 (defmacro sc-is (tn &rest scs)

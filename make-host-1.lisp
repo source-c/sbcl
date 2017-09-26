@@ -39,7 +39,7 @@
                            (setq fail 'warning))))
                       ;; Prevent regressions on a couple platforms
                       ;; that are known to build cleanly.
-                      #!+(or x86 x86-64)
+                      #!+(or x86 x86-64 arm64)
                       (sb-int:simple-style-warning
                        (lambda (c)
                          (when (and in-summary
@@ -66,10 +66,9 @@
 ;;; Let's check that the type system, and various other things, are
 ;;; reasonably sane. (It's easy to spend a long time wandering around
 ;;; confused trying to debug cross-compilation if it isn't.)
- (when (find :sb-test *shebang-features*)
-   (load "tests/type.before-xc.lisp")
-   (load "tests/info.before-xc.lisp")
-   (load "tests/vm.before-xc.lisp"))
+ (load "tests/type.before-xc.lisp")
+ (load "tests/info.before-xc.lisp")
+ (load "tests/vm.before-xc.lisp")
 ;; When building on a slow host using a slow Lisp,
 ;; the wait time in slurp-ucd seems interminable - over a minute.
 ;; Compiling seems to help a bit, but maybe it's my imagination.

@@ -20,14 +20,19 @@
                            code-component) allocate-code-object))
 (defun allocate-code-object (#!+immobile-code immobile-p boxed unboxed)
   #!+gencgc
-  (without-gcing
-   (if (or #!+immobile-code immobile-p)
-       #!+immobile-code (sb!vm::allocate-immobile-code boxed unboxed)
-       #!-immobile-code nil
-       (%make-lisp-obj
-        (alien-funcall (extern-alien "alloc_code_object"
-                                     (function unsigned unsigned unsigned))
-                       boxed unboxed))))
+  (let ((code
+          (without-gcing
+            (cond #!+immobile-code
+                  (immobile-p
+                   (sb!vm::allocate-immobile-code boxed unboxed))
+                  (t
+                   (%make-lisp-obj
+                    (alien-funcall (extern-alien "alloc_code_object"
+                                                 (function unsigned unsigned unsigned))
+                                   boxed unboxed)))))))
+    #!+x86 (setf (sb!vm::%code-fixups code)
+                 #.(!coerce-to-specialized #() '(unsigned-byte 32)))
+    code)
   #!-gencgc
   (%primitive allocate-code-object boxed unboxed))
 
@@ -60,7 +65,22 @@
         (let ((newval (logior (ash (the (mod #x8000) offset) 16) nfuns)))
           (aver (eql (ldb (byte 32 24) header-data) 0))
           (set-header-data code (dpb newval (byte 32 24) header-data)))))
-  (let ((fun (%primitive sb!c:compute-fun code offset)))
+  (let ((fun (truly-the function (%primitive sb!c:compute-fun code offset))))
+    ;; x86 backends store the address of the entrypoint in 'self'
+    #!+(or x86 x86-64)
+    (with-pinned-objects (fun)
+      #!+(and compact-instance-header x86-64)
+      (setf (sap-ref-32 (int-sap (get-lisp-obj-address fun))
+                        (- 4 sb!vm:fun-pointer-lowtag))
+            (truly-the (unsigned-byte 32)
+                       (get-lisp-obj-address #.(find-layout 'function))))
+      (setf (%simple-fun-self fun)
+            (%make-lisp-obj
+             (truly-the word (+ (get-lisp-obj-address fun)
+                                (ash sb!vm:simple-fun-code-offset sb!vm:word-shift)
+                                (- sb!vm:fun-pointer-lowtag))))))
+    ;; non-x86 backends store the function itself (what else?) in 'self'
+    #!-(or x86 x86-64)
     (setf (%simple-fun-self fun) fun)
     fun))
 
@@ -110,7 +130,7 @@
           (dolist (entry entries)
             (make-fun-entry (decf fun-index) entry code-obj object nfuns)))
 
-        #!-(or x86 x86-64)
+        #!-(or x86 (and x86-64 (not immobile-space)))
         (sb!vm:sanctify-for-execution code-obj)
 
         (push debug-info (core-object-debug-info object))
@@ -134,4 +154,17 @@
                  (:known-fun
                   (setf (code-header-ref code-obj index)
                         (%coerce-name-to-fun (cdr const))))))))))))
+  (values))
+
+;;; Backpatch all the DEBUG-INFOs dumped so far with the specified
+;;; SOURCE-INFO list. We also check that there are no outstanding
+;;; forward references to functions.
+(defun fix-core-source-info (info object &optional function)
+  (declare (type core-object object)
+           (type (or null function) function))
+  (aver (zerop (hash-table-count (core-object-patch-table object))))
+  (let ((source (debug-source-for-info info :function function)))
+    (dolist (info (core-object-debug-info object))
+      (setf (debug-info-source info) source)))
+  (setf (core-object-debug-info object) nil)
   (values))

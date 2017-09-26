@@ -32,33 +32,40 @@
 (in-package "SB-PCL")
 
 (defun allocate-standard-instance (wrapper)
-  (let* ((no-of-slots (wrapper-no-of-instance-slots wrapper))
-         (instance (%make-standard-instance (make-array no-of-slots
-                                                        :initial-element +slot-unbound+)
-                                            #-compact-instance-header 0)))
-    (setf (std-instance-wrapper instance) wrapper)
+  (let ((instance (%make-standard-instance
+                   (make-array (layout-length wrapper)
+                               :initial-element +slot-unbound+)
+                   #-compact-instance-header 0)))
+    (setf (%instance-layout instance) wrapper)
     instance))
-
-(defmacro allocate-standard-funcallable-instance-slots
-    (wrapper &optional slots-init-p slots-init)
-  `(let ((no-of-slots (wrapper-no-of-instance-slots ,wrapper)))
-     ,(if slots-init-p
-          `(if ,slots-init-p
-               (make-array no-of-slots :initial-contents ,slots-init)
-               (make-array no-of-slots :initial-element +slot-unbound+))
-          `(make-array no-of-slots :initial-element +slot-unbound+))))
 
 (define-condition unset-funcallable-instance-function
     (reference-condition simple-error)
   ()
   (:default-initargs
-   :references (list '(:amop :generic-function allocate-instance)
-                     '(:amop :function set-funcallable-instance-function))))
+   :references '((:amop :generic-function allocate-instance)
+                 (:amop :function set-funcallable-instance-function))))
 
-(defun allocate-standard-funcallable-instance
-    (wrapper &optional (slots-init nil slots-init-p))
-  (let ((fin (%make-standard-funcallable-instance
-              nil (sb-impl::new-instance-hash-code))))
+(defun allocate-standard-funcallable-instance (wrapper)
+  (declare (layout wrapper))
+  (let* ((slots (make-array (layout-length wrapper) :initial-element +slot-unbound+))
+         (fin (cond #+(and compact-instance-header immobile-code)
+                    ((not (eql (layout-bitmap wrapper) -1))
+                     (let ((f (truly-the funcallable-instance
+                               (sb-sys:%primitive sb-vm::alloc-generic-function slots))))
+                       ;; Set layout prior to writing raw slots
+                       (setf (%funcallable-instance-layout f) wrapper)
+                       (sb-vm::%set-fin-trampoline f)))
+                    (t
+                     (let ((f (truly-the funcallable-instance
+                               (%make-standard-funcallable-instance
+                                slots
+                                #-compact-instance-header (sb-impl::new-instance-hash-code)))))
+                       (setf (%funcallable-instance-layout f) wrapper)
+                       f)))))
+    #+compact-instance-header
+    (set-header-data slots
+                     (ash (logand (sb-impl::new-instance-hash-code) #xFFFFFFFF) 24))
     (set-funcallable-instance-function
      fin
      #'(lambda (&rest args)
@@ -67,10 +74,6 @@
                 :format-control "~@<The function of funcallable instance ~
                                  ~S has not been set.~@:>"
                 :format-arguments (list fin))))
-    (setf (fsc-instance-wrapper fin) wrapper
-          (fsc-instance-slots fin)
-          (allocate-standard-funcallable-instance-slots
-           wrapper slots-init-p slots-init))
     fin))
 
 (defun classify-slotds (slotds)
@@ -255,7 +258,7 @@
     (setq **standard-method-classes**
           (mapcar (lambda (name)
                     (symbol-value (make-class-symbol name)))
-                  *standard-method-class-names*))
+                  +standard-method-class-names+))
 
     (flet ((make-method-combination (class-name)
              (let* ((class (find-class class-name))
@@ -283,6 +286,18 @@
         (funcall set-slot '%documentation nil)
         (funcall set-slot 'options '(:most-specific-first))
         (setq *or-method-combination* method-combination)))))
+
+;;; I have no idea why we care so much about being able to create an instance
+;;; of STRUCTURE-OBJECT, when (almost) no other structure class in the system
+;;; begins life such that MAKE-INSTANCE works on it.
+;;; And ALLOCATE-INSTANCE seems to work fine anyway. e.g. you can call
+;;; (ALLOCATE-INSTANCE (FIND-CLASS 'HASH-TABLE)).
+;;; Anyway, see below in !BOOTSTRAP-INITIALIZE-CLASS where we refer to
+;;; the name of this seemingly useless constructor function.
+(defun |STRUCTURE-OBJECT class constructor| ()
+  (sb-kernel:%make-structure-instance
+   #.(sb-kernel:find-defstruct-description 'structure-object)
+   nil))
 
 ;;; Initialize a class metaobject.
 (defun !bootstrap-initialize-class
@@ -346,7 +361,7 @@
       (let* ((super (find-class super))
              (subclasses (!bootstrap-get-slot metaclass-name super
                                               'direct-subclasses)))
-        (cond ((eq +slot-unbound+ subclasses)
+        (cond ((unbound-marker-p subclasses)
                (!bootstrap-set-slot metaclass-name super 'direct-subclasses
                                     (list class)))
               ((not (memq class subclasses))
@@ -714,7 +729,7 @@
                 ~I~_when called with arguments ~2I~_~S.~:>"
              (no-primary-method-generic-function c)
              (no-primary-method-args c))))
-  (:default-initargs :references (list '(:ansi-cl :section (7 6 6 2)))))
+  (:default-initargs :references '((:ansi-cl :section (7 6 6 2)))))
 (defmethod no-primary-method (generic-function &rest args)
   (error 'no-primary-method :generic-function generic-function :args args))
 

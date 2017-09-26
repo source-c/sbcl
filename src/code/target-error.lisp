@@ -58,7 +58,6 @@
         (prin1 (restart-name restart) stream))
       (restart-report restart stream)))
 
-#!+sb-doc
 (setf (fdocumentation 'restart-name 'function)
       "Return the name of the given restart object.")
 
@@ -99,7 +98,6 @@
           (funcall function restart))))))
 
 (defun compute-restarts (&optional condition)
-  #!+sb-doc
   "Return a list of all the currently active restarts ordered from most recently
 established to less recently established. If CONDITION is specified, then only
 restarts associated with CONDITION (or with no condition) will be returned."
@@ -143,7 +141,6 @@ restarts associated with CONDITION (or with no condition) will be returned."
         (map-restarts #'named-restart-p condition call-test-p))))
 
 (defun find-restart (identifier &optional condition)
-  #!+sb-doc
   "Return the first restart identified by IDENTIFIER. If IDENTIFIER is a symbol,
 then the innermost applicable restart with that name is returned. If IDENTIFIER
 is a restart, it is returned if it is currently active. Otherwise NIL is
@@ -163,7 +160,6 @@ with that condition (or with no condition) will be returned."
              :format-arguments (list identifier condition))))
 
 (defun invoke-restart (restart &rest values)
-  #!+sb-doc
   "Calls the function associated with the given restart, passing any given
    arguments. If the argument restart is not a restart or a currently active
    non-nil restart name, then a CONTROL-ERROR is signalled."
@@ -202,7 +198,6 @@ with that condition (or with no condition) will be returned."
         '())))
 
 (defun invoke-restart-interactively (restart)
-  #!+sb-doc
   "Calls the function associated with the given restart, prompting for any
    necessary arguments. If the argument restart is not a restart or a
    currently active non-NIL restart name, then a CONTROL-ERROR is signalled."
@@ -215,12 +210,15 @@ with that condition (or with no condition) will be returned."
 
 ;;; To reduce expansion size of RESTART-CASE
 (defun with-simple-condition-restarts (function cerror-arg datum &rest arguments)
-  (let ((condition (coerce-to-condition datum arguments
-                                        (case function
-                                          (warn 'simple-warning)
-                                          (signal 'simple-condition)
-                                          (t 'simple-error))
-                                        function)))
+  (let ((sb!debug:*stack-top-hint* (or sb!debug:*stack-top-hint*
+                                       'with-simple-condition-restarts))
+        (condition (apply #'coerce-to-condition datum
+                          (case function
+                            (warn 'simple-warning)
+                            (signal 'simple-condition)
+                            (t 'simple-error))
+                          function
+                          arguments)))
     (with-condition-restarts condition (car *restart-clusters*)
       (if (eq function 'cerror)
           (cerror cerror-arg condition)
@@ -229,8 +227,8 @@ with that condition (or with no condition) will be returned."
 
 (defun assert-error (assertion &optional args-and-values places datum &rest arguments)
   (let ((cond (if datum
-                  (coerce-to-condition
-                   datum arguments 'simple-error 'error)
+                  (apply #'coerce-to-condition
+                         datum 'simple-error 'error arguments)
                   (make-condition
                    'simple-error
                    :format-control "~@<The assertion ~S failed~:[.~:; ~
@@ -257,6 +255,15 @@ with that condition (or with no condition) will be returned."
          prompt-args)
   (finish-output *query-io*)
   (list (eval (read *query-io*))))
+
+;;; Same as above but returns multiple values
+(defun mv-read-evaluated-form (&optional (prompt-control nil promptp)
+                            &rest prompt-args)
+  (apply #'format *query-io*
+         (if promptp prompt-control "~&Type a form to be evaluated: ")
+         prompt-args)
+  (finish-output *query-io*)
+  (multiple-value-list (eval (read *query-io*))))
 
 (defun check-type-error (place place-value type &optional type-string)
   (let ((condition

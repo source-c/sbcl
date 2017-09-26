@@ -119,7 +119,7 @@
 
 (when sb!c::*track-full-called-fnames*
   (let (possibly-suspicious likely-suspicious)
-    (sb!c::call-with-each-globaldb-name
+    (sb!int:call-with-each-globaldb-name
      (lambda (name)
        (let* ((cell (sb!int:info :function :emitted-full-calls name))
               (inlinep (eq (sb!int:info :function :inlinep name) :inline))
@@ -197,16 +197,13 @@ Sample output
 ;;; miscellaneous tidying up and saving results
 (let ((filename "output/object-filenames-for-genesis.lisp-expr"))
   (ensure-directories-exist filename :verbose t)
-  ;; save the initial-symbol-values before writing the object filenames.
-  (save-initial-symbol-values)
   (with-open-file (s filename :direction :output :if-exists :supersede)
     (write *target-object-file-names* :stream s :readably t)))
 
 ;;; Let's check that the type system was reasonably sane. (It's easy
 ;;; to spend a long time wandering around confused trying to debug
 ;;; cold init if it wasn't.)
-(when (position :sb-test *shebang-features*)
-  (load "tests/type.after-xc.lisp"))
+(load "tests/type.after-xc.lisp")
 
 ;;; If you're experimenting with the system under a cross-compilation
 ;;; host which supports CMU-CL-style SAVE-LISP, this can be a good

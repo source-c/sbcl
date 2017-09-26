@@ -13,15 +13,6 @@
 
 ;;;; Type frobbing VOPs
 
-(define-vop (lowtag-of)
-  (:translate lowtag-of)
-  (:policy :fast-safe)
-  (:args (object :scs (any-reg descriptor-reg)))
-  (:results (result :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 1
-    (inst and result object lowtag-mask)))
-
 (define-vop (widetag-of)
   (:translate widetag-of)
   (:policy :fast-safe)
@@ -102,7 +93,8 @@
   (:result-types positive-fixnum)
   (:generator 6
     (loadw res x 0 fun-pointer-lowtag)
-    (inst lsr res res n-widetag-bits)))
+    (inst ubfm res res n-widetag-bits
+          (+ -1 (integer-length short-header-max-words) n-widetag-bits))))
 
 (define-vop (set-header-data)
   (:translate set-header-data)

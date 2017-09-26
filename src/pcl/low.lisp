@@ -39,7 +39,7 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 (defvar *optimize-speed*
-  '(optimize (speed 3) (safety 0) (sb!ext:inhibit-warnings 3)))
+  '(optimize (speed 3) (safety 0) (sb!ext:inhibit-warnings 3) (debug 0)))
 ) ; EVAL-WHEN
 
 (defmacro dotimes-fixnum ((var count &optional (result nil)) &body body)
@@ -89,8 +89,6 @@
 (declaim (inline fsc-instance-p))
 (defun fsc-instance-p (fin)
   (funcallable-instance-p fin))
-(defmacro fsc-instance-wrapper (fin)
-  `(%funcallable-instance-layout ,fin))
 (defmacro fsc-instance-slots (fin)
   `(%funcallable-instance-info ,fin sb!vm:instance-data-start))
 
@@ -122,12 +120,11 @@
 ;; This is an absolutely terrible name for a function which both assigns
 ;; the name slot of a function, and _sometimes_ binds a name to a function.
 (defun set-fun-name (fun new-name)
-  #!+sb-doc
   "Set the name of a compiled function object. Return the function."
   (when (valid-function-name-p fun)
     (setq fun (fdefinition fun)))
   (typecase fun
-    (%method-function (setf (%method-function-name fun) new-name))
+    (%method-function fun)
     ;; a closure potentially becomes a different closure
     (closure (setq fun (sb!impl::set-closure-name fun new-name)))
     (t (setf (%fun-name fun) new-name)))
@@ -181,7 +178,6 @@
 ;;; FIXME: what does the preceding comment mean? You can't use instance-slots
 ;;; on a structure. (Consider especially a structure of 0 slots.)
 (defmacro std-instance-slots (x) `(%instance-ref ,x sb!vm:instance-data-start))
-(defmacro std-instance-wrapper (x) `(%instance-layout ,x))
 
 ;;; FIXME: These functions are called every place we do a
 ;;; CALL-NEXT-METHOD, and probably other places too. It's likely worth

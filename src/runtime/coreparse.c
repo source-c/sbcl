@@ -47,6 +47,7 @@
 #include "validate.h"
 #include "gc-internal.h"
 #include "runtime-options.h"
+#include "pseudo-atomic.h"
 
 #include <errno.h>
 
@@ -55,7 +56,7 @@
 #endif
 
 unsigned char build_id[] =
-#include "../../output/build-id.tmp"
+#include "../../output/build-id.inc"
 ;
 
 int
@@ -171,12 +172,15 @@ lose:
     return -1;
 }
 
-/* If more platforms doesn't support overlapping mmap rename this
+#ifndef LISP_FEATURE_HPUX
+#define load_core_bytes(fd, where, addr, len) os_map(fd, where, addr, len)
+#else
+#define load_core_bytes(fd, where, addr, len) copy_core_bytes(fd, where, addr, len)
+/* If more platforms don't support overlapping mmap rename this
  * def to something like ifdef nommapoverlap */
 /* currently hpux only */
-#ifdef LISP_FEATURE_HPUX
-os_vm_address_t copy_core_bytes(int fd, os_vm_offset_t offset,
-                                os_vm_address_t addr, int len)
+static void copy_core_bytes(int fd, os_vm_offset_t offset,
+                            os_vm_address_t addr, int len)
 {
   unsigned char buf[4096];
   int c,x;
@@ -202,17 +206,19 @@ os_vm_address_t copy_core_bytes(int fd, os_vm_offset_t offset,
     memcpy(addr+x, buf, 4096);
   }
   os_flush_icache(addr, len);
-  return addr;
 }
 #endif
 
-#ifdef LISP_FEATURE_SB_CORE_COMPRESSION
+#ifndef LISP_FEATURE_SB_CORE_COMPRESSION
+# define inflate_core_bytes(fd,offset,addr,len) \
+    lose("This runtime was not built with zlib-compressed core support... aborting\n")
+#else
 # define ZLIB_BUFFER_SIZE (1u<<16)
-os_vm_address_t inflate_core_bytes(int fd, os_vm_offset_t offset,
-                                   os_vm_address_t addr, int len)
+static void inflate_core_bytes(int fd, os_vm_offset_t offset,
+                               os_vm_address_t addr, int len)
 {
     z_stream stream;
-    unsigned char buf[ZLIB_BUFFER_SIZE];
+    unsigned char* buf = successful_malloc(ZLIB_BUFFER_SIZE);
     int ret;
 
 # ifdef LISP_FEATURE_WIN32
@@ -238,7 +244,7 @@ os_vm_address_t inflate_core_bytes(int fd, os_vm_offset_t offset,
     stream.next_out  = (void*)addr;
     stream.avail_out = len;
     do {
-        ssize_t count = read(fd, buf, sizeof(buf));
+        ssize_t count = read(fd, buf, ZLIB_BUFFER_SIZE);
         if (count < 0)
             lose("unable to read core file (errno = %i)\n", errno);
         stream.next_in = buf;
@@ -270,160 +276,496 @@ os_vm_address_t inflate_core_bytes(int fd, os_vm_offset_t offset,
     }
 
     inflateEnd(&stream);
-    return addr;
+    free(buf);
 }
 # undef ZLIB_BUFFER_SIZE
+#endif
+
+struct heap_adjust {
+    /* range[0] is immobile space, range [1] is dynamic space */
+    struct range {
+        lispobj start, end;
+        sword_t delta;
+    } range[2];
+};
+
+#ifndef LISP_FEATURE_RELOCATABLE_HEAP
+#define adjust_word(ignore,thing) thing
+#define relocate_heap(ignore)
+#else
+#include "genesis/gc-tables.h"
+#include "genesis/hash-table.h"
+#include "genesis/layout.h"
+#include "genesis/vector.h"
+
+static inline sword_t calc_adjustment(struct heap_adjust* adj, lispobj x)
+{
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    if (adj->range[0].start <= x && x < adj->range[0].end)
+        return adj->range[0].delta;
+#endif
+    if (adj->range[1].start <= x && x < adj->range[1].end)
+        return adj->range[1].delta;
+    return 0;
+}
+
+// Return the adjusted value of 'word' without testing whether it looks
+// like a pointer. But do test whether it points to a relocatable space.
+static inline lispobj adjust_word(struct heap_adjust* adj, lispobj word) {
+    return word + calc_adjustment(adj, word);
+}
+
+// Adjust the words in range [where,where+n_words)
+// skipping any words that have non-pointer nature.
+static void adjust_pointers(lispobj *where, sword_t n_words, struct heap_adjust* adj)
+{
+    long i;
+    for (i=0;i<n_words;++i) {
+        lispobj word = where[i];
+        sword_t adjustment;
+        if (is_lisp_pointer(word) && (adjustment = calc_adjustment(adj, word)) != 0) {
+            where[i] += adjustment;
+        }
+    }
+}
+
+#include "var-io.h"
+static void __attribute__((unused))
+adjust_code_refs(struct heap_adjust* adj, lispobj fixups, struct code* code)
+{
+    struct varint_unpacker unpacker;
+    varint_unpacker_init(&unpacker, fixups);
+    char* instructions = (char*)((lispobj*)code + code_header_words(code->header));
+    int prev_loc = 0, loc;
+    while (varint_unpack(&unpacker, &loc) && loc != 0) {
+        // For extra compactness, each loc is relative to the prior,
+        // so that the magnitudes are smaller.
+        loc += prev_loc;
+        prev_loc = loc;
+        int* fixup_where = (int*)(instructions + loc);
+        lispobj ptr = (lispobj)(*fixup_where);
+        *fixup_where = (int)(ptr + calc_adjustment(adj, ptr));
+    }
+}
+
+#if defined(LISP_FEATURE_COMPACT_INSTANCE_HEADER) && defined(LISP_FEATURE_64_BIT)
+#define FIX_FUN_HEADER_LAYOUT(fun) \
+  set_function_layout(fun, adjust_word(adj, function_layout(fun)))
+#else
+#define FIX_FUN_HEADER_LAYOUT(f) {}
+#endif
+
+static void relocate_space(uword_t start, lispobj* end, struct heap_adjust* adj)
+{
+    lispobj *where = (lispobj*)start;
+    lispobj header_word;
+    int widetag;
+    long nwords;
+    lispobj layout, adjusted_layout, bitmap;
+    struct code* code;
+    sword_t delta;
+
+    for ( ; where < end ; where += nwords ) {
+        header_word = *where;
+        if (is_cons_half(header_word)) {
+            adjust_pointers(where, 2, adj);
+            nwords = 2;
+            continue;
+        }
+        widetag = widetag_of(header_word);
+        nwords = sizetab[widetag](where);
+        switch (widetag) {
+        case FUNCALLABLE_INSTANCE_WIDETAG:
+            // Special note on the word at where[1] in funcallable instances:
+            // - If no immobile code, then the word points to read-only space,
+            ///  hence needs no adjustment.
+            // - Otherwise, the word might point to a relocated range,
+            //   either the instance itself, or a trampoline in immobile space.
+            where[1] = adjust_word(adj, where[1]);
+        case INSTANCE_WIDETAG:
+            layout = (widetag == FUNCALLABLE_INSTANCE_WIDETAG) ?
+                funinstance_layout(where) : instance_layout(where);
+            adjusted_layout = adjust_word(adj, layout);
+            // Do not alter the layout as stored in the instance if non-compact
+            // header. instance_scan() will do it if necessary.
+#ifdef LISP_FEATURE_COMPACT_INSTANCE_HEADER
+            if (adjusted_layout != layout)
+                instance_layout(where) = adjusted_layout;
+#endif
+            bitmap = LAYOUT(adjusted_layout)->bitmap;
+            gc_assert(fixnump(bitmap)
+                      || widetag_of(*native_pointer(bitmap))==BIGNUM_WIDETAG);
+            // If the post-adjustment address of 'layout' is higher than 'where',
+            // then the layout's pointer slots need adjusting.
+            // This is true regardless of whether the core was mapped at a higher
+            // or lower address than desired.
+            if (is_lisp_pointer(bitmap) && adjusted_layout > (lispobj)where) {
+                // Do not write back the adjusted bitmap pointer. Each heap word
+                // must be touched at most once. When the layout itself gets scanned,
+                // the bitmap slot will be rewritten if needed.
+                bitmap = adjust_word(adj, bitmap);
+            }
+
+            instance_scan((void(*)(lispobj*,sword_t,uword_t))adjust_pointers,
+                          where+1, nwords-1, bitmap, (uintptr_t)adj);
+            continue;
+        case FDEFN_WIDETAG:
+            adjust_pointers(where+1, 2, adj);
+            // 'raw_addr' doesn't satisfy is_lisp_pointer() for x86,
+            // so adjust_pointers() would ignore it. Therefore we need to
+            // forcibly adjust it.
+#ifndef LISP_FEATURE_IMMOBILE_CODE
+            where[3] = adjust_word(adj, where[3]);
+#elif defined(LISP_FEATURE_X86_64)
+            // static space to immobile space JMP needs adjustment
+            if (STATIC_SPACE_START <= (uintptr_t)where && (uintptr_t)where < STATIC_SPACE_END) {
+                delta = calc_adjustment(adj, fdefn_callee_lispobj((struct fdefn*)where));
+                if (delta != 0)
+                    *(int*)(1+(char*)(where+3)) += delta;
+            }
+#endif
+            continue;
+        case CODE_HEADER_WIDETAG:
+            // Fixup the constant pool. The word at where+1 is a fixnum.
+            adjust_pointers(where+2, code_header_words(header_word)-2, adj);
+            // Fixup all embedded simple-funs
+            code = (struct code*)where;
+            for_each_simple_fun(i, f, code, 1, {
+                FIX_FUN_HEADER_LAYOUT((lispobj*)f);
+                f->self = adjust_word(adj, f->self);
+                adjust_pointers(SIMPLE_FUN_SCAV_START(f), SIMPLE_FUN_SCAV_NWORDS(f), adj);
+            });
+            // Compute the address where the code "was" as the first argument
+            // by negating the adjustment for 'where'.
+            // Can't call calc_adjustment to get the negative of the adjustment!
+            gencgc_apply_code_fixups((struct code*)((char*)where - adj->range[1].delta),
+                                     code);
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+            // Now that the packed integer comprising the list of fixup locations
+            // has been fixed-up (if necessary), apply them to the code.
+            if (code->fixups != 0)
+                adjust_code_refs(adj, code->fixups, code);
+#endif
+            continue;
+        case CLOSURE_WIDETAG:
+            FIX_FUN_HEADER_LAYOUT(where);
+#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
+            // For x86[-64], the closure fun appears to be a fixnum,
+            // and might need adjustment unless pointing to immobile code.
+            // Then fall into the general case; where[1] won't get re-adjusted
+            // because it doesn't satisfy is_lisp_pointer().
+            where[1] = adjust_word(adj, where[1]);
+#endif
+            break;
+        // Vectors require extra care because of EQ-based hashing.
+        case SIMPLE_VECTOR_WIDETAG:
+          if ((HeaderValue(*where) & 0xFF) == subtype_VectorValidHashing) {
+              struct vector* v = (struct vector*)where;
+              gc_assert(v->length > 0 &&
+                        !(fixnum_value(v->length) & 1) &&  // length must be even
+                        lowtag_of(v->data[0]) == INSTANCE_POINTER_LOWTAG);
+              lispobj* data = (lispobj*)v->data;
+              adjust_pointers(&data[0], 1, adj); // adjust the hash-table structure
+              boolean needs_rehash = 0;
+              int i;
+              // Adjust the elements, checking for need to rehash.
+              // v->data[1] is the unbound marker (a non-pointer)
+              for (i = fixnum_value(v->length)-1 ; i>=2 ; --i) {
+                  lispobj ptr = data[i];
+                  if (is_lisp_pointer(ptr) && (delta = calc_adjustment(adj, ptr)) != 0) {
+                      data[i] += delta;
+                      needs_rehash = 1;
+                  }
+              }
+              if (needs_rehash) {
+                  struct hash_table *ht = (struct hash_table*)native_pointer(v->data[0]);
+                  ht->needs_rehash_p = T;
+              }
+              continue;
+          }
+        // All the array header widetags.
+        case SIMPLE_ARRAY_WIDETAG:
+#ifdef COMPLEX_CHARACTER_STRING_WIDETAG
+        case COMPLEX_CHARACTER_STRING_WIDETAG:
+#endif
+        case COMPLEX_BASE_STRING_WIDETAG:
+        case COMPLEX_VECTOR_NIL_WIDETAG:
+        case COMPLEX_BIT_VECTOR_WIDETAG:
+        case COMPLEX_VECTOR_WIDETAG:
+        case COMPLEX_ARRAY_WIDETAG:
+        // And the rest of the purely descriptor objects.
+        case SYMBOL_WIDETAG:
+        case VALUE_CELL_WIDETAG:
+        case WEAK_POINTER_WIDETAG:
+        case RATIO_WIDETAG:
+        case COMPLEX_WIDETAG:
+            break;
+
+        // Other
+        case SAP_WIDETAG:
+            if ((delta = calc_adjustment(adj, where[1])) != 0) {
+                fprintf(stderr,
+                        "WARNING: SAP at %p -> %p in relocatable core\n",
+                        where, (void*)where[1]);
+                where[1] += delta;
+            }
+            continue;
+        case BIGNUM_WIDETAG:
+#ifndef LISP_FEATURE_64_BIT
+        case SINGLE_FLOAT_WIDETAG:
+#endif
+        case DOUBLE_FLOAT_WIDETAG:
+        case COMPLEX_SINGLE_FLOAT_WIDETAG:
+        case COMPLEX_DOUBLE_FLOAT_WIDETAG:
+#ifdef SIMD_PACK_WIDETAG
+        case SIMD_PACK_WIDETAG:
+#endif
+            continue;
+        default:
+          if (other_immediate_lowtag_p(widetag)
+              && specialized_vector_widetag_p(widetag))
+              continue;
+          else
+              lose("Unrecognized heap object: @%p: %lx\n", where, header_word);
+        }
+        adjust_pointers(where+1, nwords-1, adj);
+    }
+}
+
+#define SHOW_SPACE_RELOCATION 0
+void relocate_heap(struct heap_adjust* adj)
+{
+    if (SHOW_SPACE_RELOCATION) {
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+        fprintf(stderr, "Relocating immobile space from [%p:%p] to [%p:%p]\n",
+                (char*)adj->range[0].start,
+                (char*)adj->range[0].end,
+                (char*)IMMOBILE_SPACE_START,
+                (char*)IMMOBILE_SPACE_START+(adj->range[0].end-adj->range[0].start));
+#endif
+        fprintf(stderr, "Relocating dynamic space from [%p:%p] to [%p:%p]\n",
+                (char*)adj->range[1].start,
+                (char*)adj->range[1].end,
+                (char*)DYNAMIC_SPACE_START,
+                (char*)DYNAMIC_SPACE_START+(adj->range[1].end-adj->range[1].start));
+    }
+    relocate_space(STATIC_SPACE_START, static_space_free_pointer, adj);
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    relocate_space(IMMOBILE_SPACE_START, immobile_fixedobj_free_pointer, adj);
+    relocate_space(IMMOBILE_VARYOBJ_SUBSPACE_START, immobile_space_free_pointer, adj);
+    SYMBOL(FUNCTION_LAYOUT)->value = \
+        adjust_word(adj, SYMBOL(FUNCTION_LAYOUT)->value >> 32) << 32;
+#endif
+    relocate_space(DYNAMIC_SPACE_START, (lispobj*)get_alloc_pointer(), adj);
+    lispobj asmroutines = SYMBOL(ASSEMBLER_ROUTINES)->value;
+    if (lowtag_of(asmroutines) == INSTANCE_POINTER_LOWTAG) {
+        /* Adjust the values in SB-FASL::*ASSEMBLER-ROUTINES*.
+         * No need to frob the 'needs_rehash_p' slot on account of this */
+        struct hash_table *ht = (struct hash_table*)native_pointer(asmroutines);
+        struct vector *table = (struct vector*)native_pointer(ht->table);
+        int i;
+        for (i=fixnum_value(table->length)-1; i>=3; i -= 2) {
+            if (fixnump(table->data[i]))
+                table->data[i] = make_fixnum(adjust_word(adj, fixnum_value(table->data[i])));
+        }
+    }
+}
 #endif
 
 int merge_core_pages = -1;
 
 static void
-process_directory(int fd, lispobj *ptr, int count, os_vm_offset_t file_offset)
+process_directory(int count, struct ndir_entry *entry,
+                  int fd, os_vm_offset_t file_offset,
+                  struct heap_adjust* adj)
 {
     extern void immobile_space_coreparse(uword_t,uword_t);
-    struct ndir_entry *entry;
-    int compressed;
 
-    FSHOW((stderr, "/process_directory(..), count=%d\n", count));
+    struct {
+        uword_t len; // length in bytes, as an integral multiple of os_vm_page_size
+        uword_t base;
+        lispobj** pfree_pointer; // pointer to x_free_pointer
+    } spaces[MAX_CORE_SPACE_ID+1] = {
+        {0, 0, 0}, // blank for space ID 0
+#ifdef LISP_FEATURE_GENCGC
+        {0, DYNAMIC_SPACE_START, 0},
+#else
+        {0, 0, 0},
+#endif
+        // This order is determined by constants in compiler/generic/genesis
+        {0, STATIC_SPACE_START, &static_space_free_pointer},
+        {0, READ_ONLY_SPACE_START, &read_only_space_free_pointer},
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+        {0, IMMOBILE_SPACE_START, &immobile_fixedobj_free_pointer},
+        {0, IMMOBILE_VARYOBJ_SUBSPACE_START, &immobile_space_free_pointer}
+#endif
+    };
 
-    for (entry = (struct ndir_entry *) ptr; --count>= 0; ++entry) {
-
-        compressed = 0;
+    for ( ; --count>= 0; ++entry) {
         sword_t id = entry->identifier;
-        if (id <= (MAX_CORE_SPACE_ID | DEFLATED_CORE_SPACE_ID_FLAG)) {
-            if (id & DEFLATED_CORE_SPACE_ID_FLAG)
-                compressed = 1;
-            id &= ~(DEFLATED_CORE_SPACE_ID_FLAG);
+        uword_t addr = (1024 * entry->address); // multiplier as per core.h
+        int compressed = id & DEFLATED_CORE_SPACE_ID_FLAG;
+        id -= compressed;
+        if (id < 1 || id > MAX_CORE_SPACE_ID)
+            lose("unknown space ID %ld addr %p\n", id, addr);
+
+#ifndef LISP_FEATURE_RELOCATABLE_HEAP
+        int enforce_address = 1;
+#elif defined(LISP_FEATURE_IMMOBILE_SPACE)
+        // Enforce address of readonly, static, immobile varyobj
+        int enforce_address = id != DYNAMIC_CORE_SPACE_ID
+          && id != IMMOBILE_FIXEDOBJ_CORE_SPACE_ID;
+#else
+        // Enforce address of readonly and static spaces.
+        int enforce_address = id != DYNAMIC_CORE_SPACE_ID;
+#endif
+        if (enforce_address) {
+            int fail;
+#ifdef LISP_FEATURE_CHENEYGC
+            if (id == DYNAMIC_CORE_SPACE_ID) {
+                if ((fail = (addr != DYNAMIC_0_SPACE_START) &&
+                            (addr != DYNAMIC_1_SPACE_START)) != 0)
+                    fprintf(stderr, "in core: %p; in runtime: %p or %p\n",
+                            (void*)addr,
+                            (void*)DYNAMIC_0_SPACE_START,
+                            (void*)DYNAMIC_1_SPACE_START);
+            } else
+#endif
+            if ((fail = (addr != spaces[id].base)) != 0)
+                fprintf(stderr, "in core: %p; in runtime: %p\n",
+                        (void*)addr, (void*)spaces[id].base);
+            char *names[] = {
+              "DYNAMIC", "STATIC", "READ_ONLY", "IMMOBILE", "IMMOBILE"
+            };
+            if (fail)
+                lose("core/runtime address mismatch: %s_SPACE_START", names[id-1]);
         }
-        sword_t offset = os_vm_page_size * (1 + entry->data_page);
-        os_vm_address_t addr =
-            (os_vm_address_t) (os_vm_page_size * entry->address);
-        lispobj *free_pointer = (lispobj *) addr + entry->nwords;
+        spaces[id].base = addr;
         uword_t len = os_vm_page_size * entry->page_count;
+        spaces[id].len = len;
+        if (id == DYNAMIC_CORE_SPACE_ID && len > dynamic_space_size) {
+            lose("dynamic space too small for core: %luKiB required, %luKiB available.\n",
+                 (unsigned long)len >> 10,
+                 (unsigned long)dynamic_space_size >> 10);
+        }
         if (len != 0) {
-            os_vm_address_t real_addr;
-            FSHOW((stderr, "/mapping %ld(0x%lx) bytes at 0x%lx\n",
-                   len, len, (uword_t)addr));
-            if (compressed) {
-#ifdef LISP_FEATURE_SB_CORE_COMPRESSION
-                real_addr = inflate_core_bytes(fd, offset + file_offset, addr, len);
-#else
-                lose("This runtime was not built with zlib-compressed core support... aborting\n");
-#endif
-            } else {
-#ifdef LISP_FEATURE_HPUX
-                real_addr = copy_core_bytes(fd, offset + file_offset, addr, len);
-#else
-                real_addr = os_map(fd, offset + file_offset, addr, len);
-#endif
+            uword_t __attribute__((unused)) aligned_start;
+#ifdef LISP_FEATURE_RELOCATABLE_HEAP
+            // Try to map at address requested by the core file.
+            if (id == DYNAMIC_CORE_SPACE_ID) {
+                addr = (uword_t)os_validate(MOVABLE, (os_vm_address_t)addr,
+                                            dynamic_space_size);
+                aligned_start = CEILING(addr, GENCGC_CARD_BYTES);
+                /* Misalignment can happen only if card size exceeds OS page.
+                 * Drop one card to avoid overrunning the allocated space */
+                if (aligned_start > addr) // not card-aligned
+                    dynamic_space_size -= GENCGC_CARD_BYTES;
+                DYNAMIC_SPACE_START = addr = aligned_start;
+# ifndef LISP_FEATURE_IMMOBILE_SPACE
             }
-            if (real_addr != addr) {
-                lose("file mapped in wrong place! "
-                     "(0x%08x != 0x%08lx)\n",
-                     real_addr,
-                     addr);
+# else
+                if (DYNAMIC_SPACE_START < IMMOBILE_SPACE_START)
+                    lose("Won't map dynamic space below immobile space");
+            /* Assume presence of linkage-table space for this platform.
+             * An unusable gap may exist between the linkage table and immobile space
+             * but it's not important whether it does or doesn't. So we don't bother
+             * unmapping the alleged gap */
+             } else if (id == IMMOBILE_FIXEDOBJ_CORE_SPACE_ID) {
+                addr = (uword_t)os_validate(MOVABLE_LOW, (os_vm_address_t)addr,
+                                            IMMOBILE_SPACE_SIZE);
+                IMMOBILE_SPACE_START = addr;
+                if (IMMOBILE_SPACE_START + IMMOBILE_SPACE_SIZE > 0x80000000)
+                    lose("Won't map immobile space above 2GB");
+                // varyobj subspace must be enforced to reside at a known offset
+                // from fixedobj subspace.
+                spaces[IMMOBILE_VARYOBJ_CORE_SPACE_ID].base =
+                  spaces[id].base + IMMOBILE_FIXEDOBJ_SUBSPACE_SIZE;
+                IMMOBILE_VARYOBJ_SUBSPACE_START = addr + IMMOBILE_FIXEDOBJ_SUBSPACE_SIZE;
+            } else if (id == IMMOBILE_VARYOBJ_CORE_SPACE_ID) {
+                /* Ignore what the core file said */
+                addr = IMMOBILE_VARYOBJ_SUBSPACE_START;
             }
+# endif
+
+#endif /* LISP_FEATURE_RELOCATABLE_HEAP */
+
+            sword_t offset = os_vm_page_size * (1 + entry->data_page);
+            if (compressed)
+                inflate_core_bytes(fd, offset + file_offset, (os_vm_address_t)addr, len);
+             else
+                load_core_bytes(fd, offset + file_offset, (os_vm_address_t)addr, len);
         }
 
 #ifdef MADV_MERGEABLE
         if ((merge_core_pages == 1)
             || ((merge_core_pages == -1) && compressed)) {
-                madvise(addr, len, MADV_MERGEABLE);
+            madvise((void *)addr, len, MADV_MERGEABLE);
         }
 #endif
-        FSHOW((stderr, "/space id = %ld, free pointer = %p\n",
-               id, (uword_t)free_pointer));
 
+        lispobj *free_pointer = (lispobj *) addr + entry->nwords;
         switch (id) {
-        case DYNAMIC_CORE_SPACE_ID:
-            if (len > dynamic_space_size) {
-                fprintf(stderr,
-                        "dynamic space too small for core: %luKiB required, %luKiB available.\n",
-                        (unsigned long)len >> 10,
-                        (unsigned long)dynamic_space_size >> 10);
-                exit(1);
-            }
-#ifdef LISP_FEATURE_GENCGC
-            if (addr != (os_vm_address_t)DYNAMIC_SPACE_START) {
-                fprintf(stderr, "in core: %p; in runtime: %p \n",
-                        (void*)addr, (void*)DYNAMIC_SPACE_START);
-                lose("core/runtime address mismatch: DYNAMIC_SPACE_START\n");
-            }
-#else
-            if ((addr != (os_vm_address_t)DYNAMIC_0_SPACE_START) &&
-                (addr != (os_vm_address_t)DYNAMIC_1_SPACE_START)) {
-                fprintf(stderr, "in core: %p; in runtime: %p or %p\n",
-                        (void*)addr,
-                        (void*)DYNAMIC_0_SPACE_START,
-                        (void*)DYNAMIC_1_SPACE_START);
-                lose("warning: core/runtime address mismatch: DYNAMIC_SPACE_START\n");
-            }
-#endif
-#if defined(ALLOCATION_POINTER)
-            SetSymbolValue(ALLOCATION_POINTER, (lispobj)free_pointer,0);
-#else
-            dynamic_space_free_pointer = free_pointer;
-#endif
-            /* For stop-and-copy GC, this will be whatever the GC was
-             * using at the time. With GENCGC, this will always be
-             * space 0. (We checked above that for GENCGC,
-             * addr==DYNAMIC_SPACE_START.) */
-            current_dynamic_space = (lispobj *)addr;
-            break;
-        case STATIC_CORE_SPACE_ID:
-            if (addr != (os_vm_address_t)STATIC_SPACE_START) {
-                fprintf(stderr, "in core: %p - in runtime: %p\n",
-                        (void*)addr, (void*)STATIC_SPACE_START);
-                lose("core/runtime address mismatch: STATIC_SPACE_START\n");
-            }
-            break;
-        case READ_ONLY_CORE_SPACE_ID:
-            if (addr != (os_vm_address_t)READ_ONLY_SPACE_START) {
-                fprintf(stderr, "in core: %p - in runtime: %p\n",
-                        (void*)addr, (void*)READ_ONLY_SPACE_START);
-                lose("core/runtime address mismatch: READ_ONLY_SPACE_START\n");
-            }
-            break;
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-         // Immobile space is subdivided into fixed-size and variable-size.
-         // There is no margin between the two, though for efficiency
-         // they are written separately to eliminate waste in the core file.
-        case IMMOBILE_FIXEDOBJ_CORE_SPACE_ID:
-            if (addr != (os_vm_address_t)IMMOBILE_SPACE_START) {
-                fprintf(stderr, "in core: %p - in runtime: %p\n",
-                        (void*)addr, (void*)IMMOBILE_SPACE_START);
-                lose("core/runtime address mismatch: IMMOBILE_SPACE_START\n");
-            }
-            immobile_space_coreparse(IMMOBILE_SPACE_START, len);
-            break;
-        case IMMOBILE_VARYOBJ_CORE_SPACE_ID:
-            if (addr != (os_vm_address_t)IMMOBILE_VARYOBJ_SUBSPACE_START) {
-                fprintf(stderr, "in core: %p - in runtime: %p\n",
-                        (void*)addr, (void*)IMMOBILE_VARYOBJ_SUBSPACE_START);
-                lose("core/runtime address mismatch: IMMOBILE_VARYOBJ_SUBSPACE_START\n");
-            }
-            immobile_space_coreparse(IMMOBILE_VARYOBJ_SUBSPACE_START, len);
-            break;
-#endif
         default:
-            lose("unknown space ID %ld addr %p\n", id, addr);
+            *spaces[id].pfree_pointer = free_pointer;
+            break;
+        case DYNAMIC_CORE_SPACE_ID:
+#ifdef LISP_FEATURE_CHENEYGC
+            /* 'addr' is the actual address if relocatable.
+             * For cheneygc, this will be whatever the GC was using
+             * at the time the core was saved.
+             * For gencgc this is #defined as DYNAMIC_SPACE_START */
+            current_dynamic_space = (lispobj *)addr;
+#endif
+            set_alloc_pointer((lispobj)free_pointer);
+
+            anon_dynamic_space_start = (os_vm_address_t)(addr + len);
+            /* This assertion safeguards the test in zero_pages_with_mmap()
+             * which trusts that if addr > anon_dynamic_space_start
+             * then addr did not come from any file mapping. */
+            gc_assert((lispobj)anon_dynamic_space_start > STATIC_SPACE_END);
         }
     }
+
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    if (IMMOBILE_SPACE_START != spaces[IMMOBILE_FIXEDOBJ_CORE_SPACE_ID].base) {
+        adj->range[0].start = spaces[IMMOBILE_FIXEDOBJ_CORE_SPACE_ID].base;
+        adj->range[0].end   = adj->range[0].start + IMMOBILE_FIXEDOBJ_SUBSPACE_SIZE
+            + spaces[IMMOBILE_VARYOBJ_CORE_SPACE_ID].len;
+        adj->range[0].delta = IMMOBILE_SPACE_START - adj->range[0].start;
+    }
+#endif
+    if (DYNAMIC_SPACE_START != spaces[DYNAMIC_CORE_SPACE_ID].base) {
+        adj->range[1].start = spaces[DYNAMIC_CORE_SPACE_ID].base;
+        adj->range[1].end   = adj->range[1].start + spaces[DYNAMIC_CORE_SPACE_ID].len;
+        adj->range[1].delta = DYNAMIC_SPACE_START - adj->range[1].start;
+    }
+    if (adj->range[0].delta | adj->range[1].delta)
+        relocate_heap(adj);
+
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    /* Now determine page characteristics (such as object spacing)
+     * after relocation, because we need to know which objects are layouts
+     * based on knowing layout-of-layout.  The test for that is dependent
+     * on what it's address should be, not what it was in the file */
+    immobile_space_coreparse(spaces[IMMOBILE_FIXEDOBJ_CORE_SPACE_ID].len,
+                             spaces[IMMOBILE_VARYOBJ_CORE_SPACE_ID].len);
+#endif
+#ifdef LISP_FEATURE_X86_64
+    tune_asm_routines_for_microarch(); // before WPing immobile space
+#endif
 }
 
 lispobj
 load_core_file(char *file, os_vm_offset_t file_offset)
 {
     void *header;
-#ifndef LISP_FEATURE_ALPHA
-    word_t val, *ptr;
-#else
-    u32 val, *ptr;
-#endif
+    core_entry_elt_t val, *ptr;
     os_vm_size_t len, remaining_len;
     int fd = open_binary(file, O_RDONLY);
     ssize_t count;
     lispobj initial_function = NIL;
+    struct heap_adjust adj;
+    memset(&adj, 0, sizeof adj);
 
     FSHOW((stderr, "/entering load_core_file(%s)\n", file));
     if (fd < 0) {
@@ -451,7 +793,8 @@ load_core_file(char *file, os_vm_offset_t file_offset)
     }
     SHOW("found CORE_MAGIC");
 
-    while (val != END_CORE_ENTRY_TYPE_CODE) {
+#define WORD_FMTX OS_VM_SIZE_FMTX
+    for ( ; val != END_CORE_ENTRY_TYPE_CODE ; ptr += remaining_len) {
         val = *ptr++;
         len = *ptr++;
         remaining_len = len - 2; /* (-2 to cancel the two ++ operations) */
@@ -467,20 +810,11 @@ load_core_file(char *file, os_vm_offset_t file_offset)
         case BUILD_ID_CORE_ENTRY_TYPE_CODE:
             SHOW("BUILD_ID_CORE_ENTRY_TYPE_CODE case");
             {
-                os_vm_size_t i;
-
-                FSHOW((stderr, "build_id[]=\"%s\"\n", build_id));
-                FSHOW((stderr, "remaining_len = %d\n", remaining_len));
-                if (remaining_len != strlen((const char *)build_id))
-                    goto losing_build_id;
-                for (i = 0; i < remaining_len; ++i) {
-                    FSHOW((stderr, "ptr[%d] = char = %d, expected=%d\n",
-                           i, ptr[i], build_id[i]));
-                    if (ptr[i] != build_id[i])
-                        goto losing_build_id;
-                }
-                break;
-            losing_build_id:
+                os_vm_size_t stringlen = *ptr++;
+                --remaining_len;
+                gc_assert(remaining_len * sizeof (core_entry_elt_t) >= stringlen);
+                if (sizeof build_id == stringlen+1 && !memcmp(ptr, build_id, stringlen))
+                    break;
                 /* .core files are not binary-compatible between
                  * builds because we can't easily detect whether the
                  * sources were patched between the time the
@@ -490,46 +824,51 @@ load_core_file(char *file, os_vm_offset_t file_offset)
                  * (We could easily detect whether version.lisp-expr
                  * was changed, but people experimenting with patches
                  * don't necessarily update version.lisp-expr.) */
-
+                fprintf(stderr,
+                        "core was built for runtime \"%.*s\" but this is \"%s\"\n",
+                        (int)stringlen, (char*)ptr, build_id);
                 lose("can't load .core for different runtime, sorry\n");
             }
 
         case NEW_DIRECTORY_CORE_ENTRY_TYPE_CODE:
             SHOW("NEW_DIRECTORY_CORE_ENTRY_TYPE_CODE case");
-            process_directory(fd,
-                              ptr,
-#ifndef LISP_FEATURE_ALPHA
-                              remaining_len / (sizeof(struct ndir_entry) /
-                                               sizeof(lispobj)),
-#else
-                              remaining_len / (sizeof(struct ndir_entry) /
-                                               sizeof(u32)),
-#endif
-                              file_offset);
+            process_directory(remaining_len / NDIR_ENTRY_LENGTH,
+                              (struct ndir_entry*)ptr, fd, file_offset,
+                              &adj);
             break;
 
         case INITIAL_FUN_CORE_ENTRY_TYPE_CODE:
             SHOW("INITIAL_FUN_CORE_ENTRY_TYPE_CODE case");
-            initial_function = (lispobj)*ptr;
+            initial_function = adjust_word(&adj, (lispobj)*ptr);
             break;
 
 #ifdef LISP_FEATURE_GENCGC
         case PAGE_TABLE_CORE_ENTRY_TYPE_CODE:
         {
-            os_vm_size_t size = *ptr;
+            extern void gc_allocate_ptes();
+            // Allocation of PTEs is delayed 'til now so that calloc() doesn't
+            // consume addresses that would have been taken by a mapped space.
+            gc_allocate_ptes();
+            os_vm_size_t remaining = *ptr;
             os_vm_size_t fdoffset = (*(ptr+1) + 1) * (os_vm_page_size);
-            page_index_t offset = 0;
+            page_index_t page = 0, npages;
             ssize_t bytes_read;
-            word_t data[4096];
-            word_t word;
+            char data[8192];
+            // A corefile_pte is 10 bytes for x86-64
+            // Process an integral number of ptes on each read.
+            os_vm_size_t chunksize = sizeof (struct corefile_pte)
+                * (sizeof data / sizeof (struct corefile_pte));
             lseek(fd, fdoffset + file_offset, SEEK_SET);
-            while ((bytes_read = read(fd, data, (size < 4096 ? size : 4096 )))
-                    > 0)
-            {
+            bytes_read = read(fd, &npages, sizeof npages);
+            gc_assert(bytes_read == sizeof npages);
+            remaining -= sizeof npages;
+            while ((bytes_read = read(fd, data,
+                                      remaining < chunksize ? remaining : chunksize)) > 0) {
+
                 int i = 0;
-                size -= bytes_read;
+                remaining -= bytes_read;
                 while (bytes_read) {
-                    bytes_read -= sizeof(word_t);
+                    bytes_read -= sizeof(struct corefile_pte);
                     /* Ignore all zeroes. The size of the page table
                      * core entry was rounded up to os_vm_page_size
                      * during the save, and might now have more
@@ -537,14 +876,17 @@ load_core_file(char *file, os_vm_offset_t file_offset)
                      *
                      * The low bits of each word are allocation flags.
                      */
-                    if ((word=data[i])) {
-                        page_table[offset].scan_start_offset = word & ~0x03;
-                        page_table[offset].allocated = word & 0x03;
-                    }
+                    struct corefile_pte pte;
+                    memcpy(&pte, data+i*sizeof (struct corefile_pte), sizeof pte);
+                    set_page_bytes_used(page, pte.bytes_used);
+                    set_page_scan_start_offset(page, pte.sso & ~0x03);
+                    page_table[page].allocated = pte.sso & 0x03;
+                    if (++page == npages) // break out of both loops
+                        goto done;
                     i++;
-                    offset++;
                 }
             }
+          done:
 
             gencgc_partial_pickup = 1;
             break;
@@ -553,9 +895,6 @@ load_core_file(char *file, os_vm_offset_t file_offset)
         default:
             lose("unknown core file entry: 0x%"WORD_FMTX"\n", val);
         }
-
-        ptr += remaining_len;
-        FSHOW((stderr, "/new ptr=0x%"WORD_FMTX"\n", ptr));
     }
     SHOW("about to free(header)");
     free(header);
@@ -571,16 +910,14 @@ os_vm_address_t get_asm_routine_by_name(const char* name)
     lispobj routines = SYMBOL(ASSEMBLER_ROUTINES)->value;
     if (lowtag_of(routines) == INSTANCE_POINTER_LOWTAG) {
         struct hash_table* ht = (struct hash_table*)native_pointer(routines);
-        struct vector* table = (struct vector*)native_pointer(ht->table);
+        struct vector* table = VECTOR(ht->table);
         lispobj sym;
         int i;
         for (i=2 ; i < fixnum_value(table->length) ; i += 2) {
           sym = table->data[i];
           if (lowtag_of(sym) == OTHER_POINTER_LOWTAG
-              && widetag_of(SYMBOL(sym)->header) == SYMBOL_HEADER_WIDETAG
-              && !strcmp(name,
-                         (char*)((struct vector*)
-                                 native_pointer(SYMBOL(sym)->name))->data))
+              && widetag_of(SYMBOL(sym)->header) == SYMBOL_WIDETAG
+              && !strcmp(name, (char*)(VECTOR(SYMBOL(sym)->name)->data)))
               return (os_vm_address_t)fixnum_value(table->data[i+1]);
         }
         // Something is wrong if we have a hashtable but find nothing.

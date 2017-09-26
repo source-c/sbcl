@@ -41,7 +41,6 @@
 
 (defmacro sb!xc:deftype (&whole form name lambda-list &body body
                          &environment env)
-  #!+sb-doc
   "Define a new type, with syntax like DEFMACRO."
   (declare (ignore env))
   (unless (symbolp name)
@@ -67,6 +66,8 @@
                                    lambda-list body 'deftype name
                                    :doc-string-allowed :external
                                    :environment :ignore))))
+    ;; Maybe kill docstring, but only under the cross-compiler.
+    #!+(and (not sb-doc) (host-feature sb-xc-host)) (setq doc nil)
     `(progn
        (eval-when (:compile-toplevel :load-toplevel :execute)
          (%compiler-deftype ',name ,expander-form ,source-location-form

@@ -14,11 +14,9 @@
 (in-package "SB!IMPL")
 
 (defvar *core-pathname* nil
-  #!+sb-doc
   "The absolute pathname of the running SBCL core.")
 
 (defvar *runtime-pathname* nil
-  #!+sb-doc
   "The absolute pathname of the running SBCL runtime.")
 
 ;;; something not EQ to anything we might legitimately READ
@@ -60,27 +58,26 @@
 (def!type index-or-minus-1 () `(integer -1 (,sb!xc:array-dimension-limit)))
 
 ;;; A couple of VM-related types that are currently used only on the
-;;; alpha platform. -- CSR, 2002-06-24
-(def!type unsigned-byte-with-a-bite-out (s bite)
-  (cond ((eq s '*) 'integer)
-        ((and (integerp s) (> s 0))
-         (let ((bound (ash 1 s)))
-           `(integer 0 ,(- bound bite 1))))
-        (t
-         (error "Bad size specified for UNSIGNED-BYTE type specifier: ~
-                  ~/sb!impl:print-type-specifier/."
-                s))))
+;;; alpha and mips platforms. -- CSR, 2002-06-24
+(def!type unsigned-byte-with-a-bite-out (size bite)
+  (unless (typep size '(integer 1))
+    (error "Bad size for the ~S type specifier: ~S."
+           'unsigned-byte-with-a-bite-out size))
+  (let ((bound (ash 1 size)))
+    `(integer 0 ,(- bound bite 1))))
 
-;;; Motivated by the mips port. -- CSR, 2002-08-22
-(def!type signed-byte-with-a-bite-out (s bite)
-  (cond ((eq s '*) 'integer)
-        ((and (integerp s) (> s 1))
-         (let ((bound (ash 1 (1- s))))
-           `(integer ,(- bound) ,(- bound bite 1))))
-        (t
-         (error "Bad size specified for SIGNED-BYTE type specifier: ~
-                  ~/sb!impl:print-type-specifier/."
-                s))))
+(def!type signed-byte-with-a-bite-out (size bite)
+  (unless (typep size '(integer 2))
+    (error "Bad size for ~S type specifier: ~S."
+            'signed-byte-with-a-bite-out size))
+  (let ((bound (ash 1 (1- size))))
+    `(integer ,(- bound) ,(- bound bite 1))))
+
+;;; The smallest power of two that is equal to or greater than X.
+(declaim (inline power-of-two-ceiling))
+(defun power-of-two-ceiling (x)
+  (declare (index x))
+  (ash 1 (integer-length (1- x))))
 
 (def!type load/store-index (scale lowtag min-offset
                                  &optional (max-offset min-offset))
@@ -156,39 +153,47 @@
 
 ;;;; type-ish predicates
 
-;;; X may contain cycles -- a conservative approximation. This
-;;; occupies a somewhat uncomfortable niche between being fast for
-;;; common cases (we don't want to allocate a hash-table), and not
-;;; falling down to exponential behaviour for large trees (so we set
-;;; an arbitrady depth limit beyond which we punt).
-(defun maybe-cyclic-p (x &optional (depth-limit 12))
-  (and (listp x)
-       (labels ((safe-cddr (cons)
-                  (let ((cdr (cdr cons)))
-                    (when (consp cdr)
-                      (cdr cdr))))
-                (check-cycle (object seen depth)
-                  (when (and (consp object)
-                             (or (> depth depth-limit)
-                                 (member object seen)
-                                 (circularp object seen depth)))
-                    (return-from maybe-cyclic-p t)))
-                (circularp (list seen depth)
-                  ;; Almost regular circular list detection, with a twist:
-                  ;; we also check each element of the list for upward
-                  ;; references using CHECK-CYCLE.
-                  (do ((fast (cons (car list) (cdr list)) (safe-cddr fast))
-                       (slow list (cdr slow)))
-                      ((not (consp fast))
-                       ;; Not CDR-circular, need to check remaining CARs yet
-                       (do ((tail slow (and (cdr tail))))
-                           ((not (consp tail))
-                            nil)
-                         (check-cycle (car tail) (cons tail seen) (1+ depth))))
-                    (check-cycle (car slow) (cons slow seen) (1+ depth))
-                    (when (eq fast slow)
-                      (return t)))))
-         (circularp x (list x) 0))))
+;;; This is used for coalescing constants, check that the tree doesn't
+;;; have cycles and isn't too large.
+(defun coalesce-tree-p (x)
+  (let ((depth-limit 12)
+        (size-limit (expt 2 25)))
+    (declare (fixnum size-limit))
+    (and (consp x)
+         (labels ((safe-cddr (cons)
+                    (let ((cdr (cdr cons)))
+                      (when (consp cdr)
+                        (cdr cdr))))
+                  (check-cycle (cdr seen depth)
+                    (let ((object (car cdr)))
+                      (when (and (consp object)
+                                 (or (= depth depth-limit)
+                                     (memq object seen)
+                                     (let ((seen (cons cdr seen)))
+                                       (declare (dynamic-extent seen))
+                                       (recurse object seen
+                                                (truly-the fixnum (1+ depth))))))
+                        (return-from coalesce-tree-p))))
+                  (recurse (list seen depth)
+                    ;; Almost regular circular list detection, with a twist:
+                    ;; we also check each element of the list for upward
+                    ;; references using CHECK-CYCLE.
+                    (do ((fast (cdr list) (safe-cddr fast))
+                         (slow list (cdr slow)))
+                        ((not (consp fast))
+                         ;; Not CDR-circular, need to check remaining CARs yet
+                         (do ((tail slow (cdr tail)))
+                             ((not (consp tail)))
+                           (check-cycle tail seen depth)))
+                      (check-cycle slow seen depth)
+                      (when (or (eq fast slow)
+                                (zerop (setf size-limit
+                                             (truly-the fixnum
+                                                        (1- size-limit)))))
+                        (return-from coalesce-tree-p)))))
+           (declare (inline check-cycle))
+           (recurse x (list x) 0)
+           t))))
 
 ;;; Is X a (possibly-improper) list of at least N elements?
 (declaim (ftype (function (t index)) list-of-length-at-least-p))
@@ -196,10 +201,6 @@
   (or (zerop n) ; since anything can be considered an improper list of length 0
       (and (consp x)
            (list-of-length-at-least-p (cdr x) (1- n)))))
-
-(declaim (inline ensure-list))
-(defun ensure-list (thing)
-  (if (listp thing) thing (list thing)))
 
 ;;; Is X is a positive prime integer?
 (defun positive-primep (x)
@@ -303,7 +304,6 @@
 
 ;;; like (MEMBER ITEM LIST :TEST #'EQ)
 (defun memq (item list)
-  #!+sb-doc
   "Return tail of LIST beginning with first element EQ to ITEM."
   (declare (explicit-check))
   ;; KLUDGE: These could be and probably should be defined as
@@ -444,6 +444,19 @@
              (setq ,val (pop ,tail))
              (progn ,@body)))))
 
+;;; Like GETHASH if HASH-TABLE contains an entry for KEY.
+;;; Otherwise, evaluate DEFAULT, store the resulting value in
+;;; HASH-TABLE and return two values: 1) the result of evaluating
+;;; DEFAULT 2) NIL.
+(defmacro ensure-gethash (key hash-table &optional default)
+  (with-unique-names (n-key n-hash-table value foundp)
+    `(let ((,n-key ,key)
+           (,n-hash-table ,hash-table))
+       (multiple-value-bind (,value ,foundp) (gethash ,n-key ,n-hash-table)
+         (if ,foundp
+             (values ,value t)
+             (values (setf (gethash ,n-key ,n-hash-table) ,default) nil))))))
+
 ;;; (binding* ({(names initial-value [flag])}*) body)
 ;;; FLAG may be NIL or :EXIT-IF-NULL
 ;;;
@@ -519,7 +532,6 @@
 ;;;; macro writing utilities
 
 (defmacro with-current-source-form ((&rest forms) &body body)
-  #!+sb-doc
   "In a macroexpander, indicate that FORMS are being processed by BODY.
 
 FORMS are usually sub-forms of the whole form passed to the expander.
@@ -787,9 +799,6 @@ NOTE: This interface is experimental and subject to change."
 ;;;   Manual control over memoization is useful if there are cases for
 ;;;   which it is undesirable to pollute the cache.
 
-;;; FIXME: this macro holds onto the DEFINE-HASH-CACHE macro,
-;;; but should not.
-;;;
 ;;; Possible FIXME: if the function has a type proclamation, it forces
 ;;; a type-check every time the cache finds something. Instead, values should
 ;;; be checked once only when inserted into the cache, and not when read out.
@@ -880,7 +889,11 @@ NOTE: This interface is experimental and subject to change."
 
 ;;;; various operations on names
 
-;;; Is NAME a legal function name?
+;;; Is NAME a legal variable/function name?
+(declaim (inline legal-variable-name-p))
+(defun legal-variable-name-p (name)
+  (typep name '(and symbol (not keyword) (not null))))
+
 (declaim (inline legal-fun-name-p))
 (defun legal-fun-name-p (name)
   (values (valid-function-name-p name)))
@@ -894,7 +907,7 @@ NOTE: This interface is experimental and subject to change."
     (error 'simple-type-error
            :datum name
            :expected-type 'function-name
-           :format-control "invalid function name: ~S"
+           :format-control "Invalid function name: ~S"
            :format-arguments (list name))))
 
 ;;; Given a function name, return the symbol embedded in it.
@@ -968,7 +981,6 @@ NOTE: This interface is experimental and subject to change."
 (declaim (ftype (function () #+(and sb-xc-host ccl) *
                              #-(and sb-xc-host ccl) nil) missing-arg))
 (defun missing-arg ()
-  #!+sb-doc
   (/show0 "entering MISSING-ARG")
   (error "A required &KEY or &OPTIONAL argument was not supplied."))
 
@@ -1184,7 +1196,6 @@ NOTE: This interface is experimental and subject to change."
            ,@(nreverse reversed-prints))))))
 
 (defun print-symbol-with-prefix (stream symbol &optional colon at)
-  #!+sb-doc
   "For use with ~/: Write SYMBOL to STREAM as if it is not accessible from
   the current package."
   (declare (ignore colon at))
@@ -1214,6 +1225,12 @@ NOTE: This interface is experimental and subject to change."
 
 (defun print-type (stream type &optional colon at)
   (print-type-specifier stream (type-specifier type) colon at))
+
+(declaim (ftype (sfunction (index &key (:comma-interval (and (integer 1) index))) index)
+                decimal-with-grouped-digits-width))
+(defun decimal-with-grouped-digits-width (value &key (comma-interval 3))
+  (let ((digits (length (write-to-string value :base 10))))
+    (+ digits (floor (1- digits) comma-interval))))
 
 
 ;;;; etc.
@@ -1276,6 +1293,9 @@ NOTE: This interface is experimental and subject to change."
                     (deprecation-info-version info))
               (deprecation-info-replacements info)))))
 
+;;; Without a proclaimed type, the call is "untrusted" and so the compiler
+;;; would generate a post-call check that the function did not return.
+(declaim (ftype (function (t t t t t) nil) deprecation-error))
 (defun deprecation-error (software version namespace name replacements)
   #-sb-xc-host(declare (optimize allow-non-returning-tail-call))
   (error 'deprecation-error
@@ -1406,11 +1426,11 @@ NOTE: This interface is experimental and subject to change."
   ;; I don't think this is callable during cross-compilation, is it?
   (apply #'format stream
          "~#[~;~
-             Use ~/sb-impl:print-symbol-with-prefix/ instead.~;~
-             Use ~/sb-impl:print-symbol-with-prefix/ or ~
-             ~/sb-impl:print-symbol-with-prefix/ instead.~:;~
+             Use ~/sb-ext:print-symbol-with-prefix/ instead.~;~
+             Use ~/sb-ext:print-symbol-with-prefix/ or ~
+             ~/sb-ext:print-symbol-with-prefix/ instead.~:;~
              Use~@{~#[~; or~] ~
-             ~/sb-impl:print-symbol-with-prefix/~^,~} instead.~
+             ~/sb-ext:print-symbol-with-prefix/~^,~} instead.~
            ~]"
          replacements))
 
@@ -1615,7 +1635,6 @@ NOTE: This interface is experimental and subject to change."
 (declaim (type (member :compile #!+(or sb-eval sb-fasteval) :interpret)
                *evaluator-mode*))
 (!defparameter *evaluator-mode* :compile
-  #!+sb-doc
   "Toggle between different evaluator implementations. If set to :COMPILE,
 an implementation of EVAL that calls the compiler will be used. If set
 to :INTERPRET, an interpreter will be used.")
@@ -1708,11 +1727,14 @@ to :INTERPRET, an interpreter will be used.")
         `(let ((,var (sb!impl::make-fill-pointer-output-stream ,string)))
            ,@decls
            ,@forms)
-        `(let ((,var (make-string-output-stream)))
+        `(let ((,var #+sb-xc-host (make-string-output-stream)
+                     #-sb-xc-host (sb!impl::%make-string-output-stream
+                                   (or #!-sb-unicode 'character :default)
+                                   #'sb!impl::string-ouch)))
+
            ,@decls
            ,@forms
-           (truly-the (simple-array character (*))
-                      (get-output-stream-string ,var))))))
+           (get-output-stream-string ,var)))))
 
 ;;; Ensure basicness if possible, and simplicity always
 (defun possibly-base-stringize (s)

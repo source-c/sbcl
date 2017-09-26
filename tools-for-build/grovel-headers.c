@@ -65,7 +65,7 @@
   #include <sys/sysctl.h>
 #endif
 
-#ifdef _WIN32
+#if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
   #include "pthreads_win32.h"
 #endif
 
@@ -154,6 +154,7 @@ main(int argc, char *argv[])
     DEFTYPE("nlink-t", nlink_t);
     DEFTYPE("off-t",   off_t);
     DEFTYPE("size-t",  size_t);
+    DEFTYPE("ssize-t", ssize_t);
     DEFTYPE("time-t",  time_t);
 #if !defined(LISP_FEATURE_OS_PROVIDES_SUSECONDS_T)
     /* Similar kludge in sb-posix. */
@@ -221,6 +222,12 @@ main(int argc, char *argv[])
     printf("\n");
 
     printf(";;; for wait3(2) in run-program.lisp\n");
+#ifdef WCONTINUED
+    defconstant("wcontinued", WCONTINUED);
+#else
+    defconstant("wcontinued", 0);
+#endif
+
     defconstant("wnohang", WNOHANG);
     defconstant("wuntraced", WUNTRACED);
     printf("\n");

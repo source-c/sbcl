@@ -91,7 +91,8 @@
   ;; constant, then the arguments will be swapped.
   commutative)
 
-(defstruct (fun-info #-sb-xc-host (:pure t))
+(defstruct (fun-info #-sb-xc-host (:pure t)
+                     (:copier nil))
   ;; boolean attributes of this function.
   (attributes (missing-arg) :type attributes)
   ;; TRANSFORM structures describing transforms for this function
@@ -159,15 +160,11 @@
   ;; If non-null, the index of the argument which becomes the result
   ;; of the function.
   (result-arg nil :type (or index null))
-  ;; For functions with attributes FOLDABLE & CALL check that the
-  ;; arguments declared as CALLABLE or FUNCTION are foldable as well.
-  (foldable-call-check nil :type (or function null))
-  ;; A function that is called with lvars to check that the functions
-  ;; passed to CALLABLE arguments have the right argument counts.
-  (callable-check nil :type (or function null))
+  ;; A function that maps over callable arguments,
+  ;; Used by MAP-CALLABLE-ARGUMENTS
+  (callable-map nil :type (or function null))
   ;; Customizing behavior of ASSERT-CALL-TYPE
-  (call-type-deriver nil :type (or function null))
-  (functional-args nil :type (or function null)))
+  (call-type-deriver nil :type (or function null)))
 
 (defprinter (fun-info)
   (attributes :test (not (zerop attributes))

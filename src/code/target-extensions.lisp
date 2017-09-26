@@ -26,14 +26,12 @@
 (declaim (type list *save-hooks* *init-hooks* *exit-hooks*))
 
 (defvar *save-hooks* nil
-  #!+sb-doc
   "A list of function designators which are called in an unspecified
 order before creating a saved core image.
 
 Unused by SBCL itself: reserved for user and applications.")
 
 (defvar *init-hooks* nil
-  #!+sb-doc
   "A list of function designators which are called in an unspecified
 order when a saved core image starts up, after the system itself has
 been initialized.
@@ -41,7 +39,6 @@ been initialized.
 Unused by SBCL itself: reserved for user and applications.")
 
 (defvar *exit-hooks* nil
-  #!+sb-doc
   "A list of function designators which are called in an unspecified
 order when SBCL process exits.
 
@@ -137,8 +134,3 @@ these hooks.")
                   (%shrink-vector string size)
                   string)))
          ,@body))))
-
-;;; The smallest power of two that is equal to or greater than X.
-(defun power-of-two-ceiling (x)
-  (declare (index x))
-  (ash 1 (integer-length (1- x))))

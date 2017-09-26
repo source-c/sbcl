@@ -267,16 +267,10 @@
           ((lvar-single-value-p lvar)
            ;; exactly one value is consumed
            (principal-lvar-single-valuify lvar)
-           (flet ((get-type (type)
-                    (acond ((args-type-required type)
-                            (car it))
-                           ((args-type-optional type)
-                            (car it))
-                           (t (bug "type ~S is too hairy" type)))))
-             (values :simple (maybe-negate-check value
-                                                 (list (get-type ctype))
-                                                 (list (get-type atype))
-                                                 n-required))))
+           (values :simple (maybe-negate-check value
+                                               (list (single-value-type ctype))
+                                               (list (single-value-type atype))
+                                               n-required)))
           ((and (mv-combination-p dest)
                 (eq (mv-combination-kind dest) :local)
                 (singleton-p (mv-combination-args dest)))
@@ -365,6 +359,16 @@
           (setf (gethash spec *checkgen-used-types*) (cons 1 answer)))
       answer)))
 
+(defun internal-type-error-call (var type &optional context)
+  (let* ((external-spec (if (ctype-p type)
+                            (type-specifier type)
+                            type))
+         (interr-symbol
+           (%interr-symbol-for-type-spec external-spec)))
+    (if interr-symbol
+        `(%type-check-error/c ,var ',interr-symbol ',context)
+        `(%type-check-error ,var ',external-spec ',context))))
+
 ;;; Return a lambda form that we can convert to do a type check
 ;;; of the specified TYPES. TYPES is a list of the format returned by
 ;;; CAST-CHECK-TYPES.
@@ -373,21 +377,16 @@
 ;;; unsupplied. Such checking is impossible to efficiently do at the
 ;;; source level because our fixed-values conventions are optimized
 ;;; for the common MV-BIND case.
-(defun make-type-check-form (types)
+(defun make-type-check-form (types &optional context)
   (let ((temps (make-gensym-list (length types))))
     `(multiple-value-bind ,temps 'dummy
        ,@(mapcar (lambda (temp type)
                    (let* ((spec
                             (let ((*unparse-fun-type-simplify* t))
                               (type-specifier (second type))))
-                          (test (if (first type) `(not ,spec) spec))
-                          (external-spec (type-specifier (third type)))
-                          (interr-symbol
-                            (%interr-symbol-for-type-spec external-spec)))
+                          (test (if (first type) `(not ,spec) spec)))
                      `(unless (typep ,temp ',test)
-                        ,(if interr-symbol
-                             `(%type-check-error/c ,temp ',interr-symbol)
-                             `(%type-check-error ,temp ',external-spec)))))
+                        ,(internal-type-error-call temp (third type) context))))
                  temps
                  types)
        (values ,@temps))))
@@ -399,7 +398,8 @@
   (declare (type cast cast) (type list types))
   (let ((value (cast-value cast))
         (length (length types)))
-    (filter-lvar value (make-type-check-form types))
+    (filter-lvar value (make-type-check-form types
+                                             (cast-context cast)))
     (reoptimize-lvar (cast-value cast))
     (setf (cast-type-to-check cast) *wild-type*)
     (setf (cast-%type-check cast) nil)
@@ -410,10 +410,10 @@
                          (single-value-type atype))
                         (t
                          (make-values-type
-                          :required (values-type-out atype length)))))
+                          :required (values-type-in atype length)))))
            (dtype (node-derived-type cast))
            (dtype (make-values-type
-                   :required (values-type-out dtype length))))
+                   :required (values-type-in dtype length))))
       (setf (cast-asserted-type cast) atype)
       (setf (node-derived-type cast) dtype)))
 

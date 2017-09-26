@@ -18,17 +18,6 @@
 ;;; The table is populated later in this file.
 (defparameter *undefined-fun-whitelist* (make-hash-table :test 'equal))
 
-(defvar *symbol-values-for-genesis*)
-(export '*symbol-values-for-genesis*)
-(let ((pathname "output/init-symbol-values.lisp-expr"))
-  (setq *symbol-values-for-genesis*
-        (and (probe-file pathname) (read-from-file pathname)))
-  (defun save-initial-symbol-values ()
-    (with-open-file (f pathname :direction :output :if-exists :supersede)
-      (write *symbol-values-for-genesis* :stream f :readably t))))
-
-(when (make-host-1-parallelism)
-  (require :sb-posix))
 #+#.(cl:if (cl:find-package "SB-POSIX") '(and) '(or))
 (defun parallel-make-host-1 (max-jobs)
   (let ((subprocess-count 0)
@@ -47,10 +36,7 @@
               (in-host-compilation-mode
                (lambda () (compile-stem stem flags :host-compile)))
               ;; FIXME: convey exit code based on COMPILE result.
-              #.(if (eq :external
-                        (nth-value 1 (find-symbol "OS-EXIT" :sb-sys)))
-                    `(,(find-symbol "OS-EXIT" :sb-sys) 0)
-                    `(sb-unix:unix-exit 0)))
+              (sb-cold::exit-process 0))
             (push pid subprocess-list)
             (incf subprocess-count)
             ;; Do not wait for the compile to finish. Just load as source.
@@ -72,7 +58,7 @@
   (do-all-symbols (s)
     (when (get s :sb-xc-globaldb-info)
       (remf (symbol-plist s) :sb-xc-globaldb-info)))
-  (fill (symbol-value 'sb!c::*info-types*) nil)
+  (fill (symbol-value 'sb!impl::*info-types*) nil)
   (clrhash (symbol-value 'sb!kernel::*forward-referenced-layouts*))
   (setf (symbol-value 'sb!kernel:*type-system-initialized*) nil)
   (makunbound 'sb!c::*backend-primitive-type-names*)
@@ -92,134 +78,7 @@
 ;;; Either load or compile-then-load the cross-compiler into the
 ;;; cross-compilation host Common Lisp.
 (defun load-or-cload-xcompiler (load-or-cload-stem)
-
   (declare (type function load-or-cload-stem))
-
-  ;; The running-in-the-host-Lisp Python cross-compiler defines its
-  ;; own versions of a number of functions which should not overwrite
-  ;; host-Lisp functions. Instead we put them in a special package.
-  ;;
-  ;; The common theme of the functions, macros, constants, and so
-  ;; forth in this package is that they run in the host and affect the
-  ;; compilation of the target.
-  (let ((package-name "SB-XC"))
-    (make-package package-name :use nil :nicknames nil)
-    (dolist (name '(;; the constants (except for T and NIL which have
-                    ;; a specially hacked correspondence between
-                    ;; cross-compilation host Lisp and target Lisp)
-                    "ARRAY-DIMENSION-LIMIT"
-                    "ARRAY-RANK-LIMIT"
-                    "ARRAY-TOTAL-SIZE-LIMIT"
-                    "BOOLE-1"
-                    "BOOLE-2"
-                    "BOOLE-AND"
-                    "BOOLE-ANDC1"
-                    "BOOLE-ANDC2"
-                    "BOOLE-C1"
-                    "BOOLE-C2"
-                    "BOOLE-CLR"
-                    "BOOLE-EQV"
-                    "BOOLE-IOR"
-                    "BOOLE-NAND"
-                    "BOOLE-NOR"
-                    "BOOLE-ORC1"
-                    "BOOLE-ORC2"
-                    "BOOLE-SET"
-                    "BOOLE-XOR"
-                    "CALL-ARGUMENTS-LIMIT"
-                    "CHAR-CODE-LIMIT"
-                    "DOUBLE-FLOAT-EPSILON"
-                    "DOUBLE-FLOAT-NEGATIVE-EPSILON"
-                    "INTERNAL-TIME-UNITS-PER-SECOND"
-                    "LAMBDA-LIST-KEYWORDS"
-                    "LAMBDA-PARAMETERS-LIMIT"
-                    "LEAST-NEGATIVE-DOUBLE-FLOAT"
-                    "LEAST-NEGATIVE-LONG-FLOAT"
-                    "LEAST-NEGATIVE-NORMALIZED-DOUBLE-FLOAT"
-                    "LEAST-NEGATIVE-NORMALIZED-LONG-FLOAT"
-                    "LEAST-NEGATIVE-NORMALIZED-SHORT-FLOAT"
-                    "LEAST-NEGATIVE-NORMALIZED-SINGLE-FLOAT"
-                    "LEAST-NEGATIVE-SHORT-FLOAT"
-                    "LEAST-NEGATIVE-SINGLE-FLOAT"
-                    "LEAST-POSITIVE-DOUBLE-FLOAT"
-                    "LEAST-POSITIVE-LONG-FLOAT"
-                    "LEAST-POSITIVE-NORMALIZED-DOUBLE-FLOAT"
-                    "LEAST-POSITIVE-NORMALIZED-LONG-FLOAT"
-                    "LEAST-POSITIVE-NORMALIZED-SHORT-FLOAT"
-                    "LEAST-POSITIVE-NORMALIZED-SINGLE-FLOAT"
-                    "LEAST-POSITIVE-SHORT-FLOAT"
-                    "LEAST-POSITIVE-SINGLE-FLOAT"
-                    "LONG-FLOAT-EPSILON"
-                    "LONG-FLOAT-NEGATIVE-EPSILON"
-                    "MOST-NEGATIVE-DOUBLE-FLOAT"
-                    "MOST-NEGATIVE-FIXNUM"
-                    "MOST-NEGATIVE-LONG-FLOAT"
-                    "MOST-NEGATIVE-SHORT-FLOAT"
-                    "MOST-NEGATIVE-SINGLE-FLOAT"
-                    "MOST-POSITIVE-DOUBLE-FLOAT"
-                    "MOST-POSITIVE-FIXNUM"
-                    "MOST-POSITIVE-LONG-FLOAT"
-                    "MOST-POSITIVE-SHORT-FLOAT"
-                    "MOST-POSITIVE-SINGLE-FLOAT"
-                    "MULTIPLE-VALUES-LIMIT"
-                    "PI"
-                    "SHORT-FLOAT-EPSILON"
-                    "SHORT-FLOAT-NEGATIVE-EPSILON"
-                    "SINGLE-FLOAT-EPSILON"
-                    "SINGLE-FLOAT-NEGATIVE-EPSILON"
-
-                    ;; everything else which needs a separate
-                    ;; existence in xc and target
-                    "BOOLE"
-                    "BUILT-IN-CLASS"
-                    "BYTE" "BYTE-POSITION" "BYTE-SIZE"
-                    "CHAR-CODE"
-                    "CLASS" "CLASS-NAME" "CLASS-OF"
-                    "CODE-CHAR"
-                    "COMPILE-FILE"
-                    "COMPILE-FILE-PATHNAME"
-                    "*COMPILE-FILE-PATHNAME*"
-                    "*COMPILE-FILE-TRUENAME*"
-                    "*COMPILE-PRINT*"
-                    "*COMPILE-VERBOSE*"
-                    "COMPILER-MACRO-FUNCTION"
-                    "CONSTANTP"
-                    "DEFCONSTANT"
-                    "DEFINE-MODIFY-MACRO"
-                    "DEFINE-SETF-EXPANDER"
-                    "DEFMACRO" "DEFSETF" "DEFSTRUCT" "DEFTYPE"
-                    "DEPOSIT-FIELD" "DPB"
-                    "FBOUNDP" "FDEFINITION" "FMAKUNBOUND"
-                    "FIND-CLASS"
-                    "GENSYM" "*GENSYM-COUNTER*"
-                    "GET-SETF-EXPANSION"
-                    "LDB" "LDB-TEST"
-                    "LISP-IMPLEMENTATION-TYPE" "LISP-IMPLEMENTATION-VERSION"
-                    "MACRO-FUNCTION"
-                    "MACROEXPAND" "MACROEXPAND-1" "*MACROEXPAND-HOOK*"
-                    "MAKE-LOAD-FORM"
-                    "MAKE-LOAD-FORM-SAVING-SLOTS"
-                    "MASK-FIELD"
-                    "PROCLAIM"
-                    "SPECIAL-OPERATOR-P"
-                    "STANDARD-CLASS"
-                    "STRUCTURE-CLASS"
-                    "SUBTYPEP"
-                    "TYPE-OF" "TYPEP"
-                    "UPGRADED-ARRAY-ELEMENT-TYPE"
-                    "UPGRADED-COMPLEX-PART-TYPE"
-                    "WITH-COMPILATION-UNIT"))
-      (export (intern name package-name) package-name)))
-  ;; don't watch:
-  (dolist (package (list-all-packages))
-    (when (= (mismatch (package-name package) "SB!") 3)
-      (shadowing-import
-       (mapcar (lambda (name) (find-symbol name "SB-XC"))
-               '("BYTE" "BYTE-POSITION" "BYTE-SIZE"
-                 "DPB" "LDB" "LDB-TEST"
-                 "DEPOSIT-FIELD" "MASK-FIELD"))
-       package)))
-
   ;; Build a version of Python to run in the host Common Lisp, to be
   ;; used only in cross-compilation.
   ;;
@@ -262,8 +121,9 @@
             slot-makunbound
             make-load-form-saving-slots
             sb!ext:run-program
-            sb!kernel::choose-code-component-order
-            sb!kernel:profile-deinit)
+            sb!vm::map-allocated-objects
+            sb!vm::map-objects-in-range
+            sb!kernel::choose-code-component-order)
           ;; CLOS implementation
           '(sb!mop:class-finalized-p
             sb!mop:class-prototype
@@ -279,6 +139,7 @@
             sb!pcl::class-wrapper
             sb!pcl::compute-gf-ftype
             sb!pcl::definition-source
+            sb!pcl::ensure-accessor
             sb!pcl:ensure-class-finalized)
           ;; CLOS-based packages
           '(sb!gray:stream-clear-input
@@ -369,5 +230,8 @@
             sb!impl::get-processes-status-changes
             sb!impl::step-form
             sb!impl::step-values
+            sb!impl::stringify-package-designator
+            sb!impl::stringify-string-designator
+            sb!impl::stringify-string-designators
             sb!impl::unencapsulate-generic-function)))
   (setf (gethash sym *undefined-fun-whitelist*) t))

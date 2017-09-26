@@ -179,11 +179,10 @@
       (let ((type (info :function :type it))
             (info (info :function :info it)))
         (when (and (not *lossage-detected*)
-                   info
-                   (fun-info-callable-check info))
+                   info)
           (let ((*valid-fun-use-name* it))
-            (apply (fun-info-callable-check info)
-                   (resolve-key-args args type))))
+            (map-callable-arguments #'valid-callable-argument call)
+            (validate-test-and-test-not call)))
         ;; One more check for structure constructors:
         (when (typep type 'defstruct-description)
           (awhen (assq it (dd-constructors type))
@@ -192,28 +191,39 @@
           (*unwinnage-detected* (values nil nil))
           (t (values t t)))))
 
+(defun map-key-lvars (function args type)
+  (when (fun-type-keyp type)
+    (do* ((non-key (+ (length (fun-type-required type))
+                      (length (fun-type-optional type))))
+          unknown
+          (key (nthcdr non-key args) (cddr key)))
+         ((null key) unknown)
+      (let ((key (first key))
+            (value (second key)))
+        (if (constant-lvar-p key)
+            (let* ((name (lvar-value key))
+                   (info (find name (fun-type-keywords type)
+                               :key #'key-info-name)))
+              (when info
+                (funcall function name value)))
+            (setf unknown t))))))
+
 ;;; Turn constant LVARs in keyword arg positions to constants so that
 ;;; they can be passed to FUN-INFO-CALLABLE-CHECK.
 (defun resolve-key-args (args type)
   (if (fun-type-keyp type)
-      (let ((non-key (+ (length (fun-type-required type))
-                        (length (fun-type-optional type))))
-            key-arguments)
-        (do ((key (nthcdr non-key args) (cddr key)))
-            ((null key))
-          (let ((k (first key))
-                (v (second key)))
-            (when (constant-lvar-p k)
-              (let* ((name (lvar-value k))
-                     (info (find name (fun-type-keywords type)
-                                 :key #'key-info-name)))
-                (when info
-                  (push name key-arguments)
-                  (push v key-arguments))))))
-
-        (nconc (subseq args 0 non-key)
-               (nreverse key-arguments)))
-      args))
+      (let* ((non-key (+ (length (fun-type-required type))
+                         (length (fun-type-optional type))))
+             key-arguments
+             (unknown (map-key-lvars (lambda (key value)
+                                       (push key key-arguments)
+                                       (push value key-arguments))
+                                     args
+                                     type)))
+        (values (nconc (subseq args 0 non-key)
+                       (nreverse key-arguments))
+                unknown))
+      (values args nil)))
 
 ;;; Return MIN, MAX, whether it contaions &optional/&key/&rest
 (defun fun-arg-limits (function)
@@ -234,7 +244,10 @@
              (let ((args (length (lambda-vars function))))
                (values args args))))
         ((not (optional-dispatch-p function))
-         (values nil nil nil))
+         (if (and (functional-p function)
+                  (entry-info-p (functional-info function)))
+             (fun-arg-limits (specifier-type (entry-info-type (functional-info function))))
+             (values nil nil nil)))
         ((optional-dispatch-more-entry function)
          (values (optional-dispatch-min-args function)
                  nil
@@ -244,70 +257,194 @@
                  (optional-dispatch-max-args function)
                  t))))
 
-(defun valid-callable-argument (lvar arg-count)
-  (when lvar
-    ;; Handle #'function,  'function and (lambda (x y))
-    (let* ((use (principal-lvar-use lvar))
-           (leaf (if (ref-p use)
-                     (ref-leaf use)
-                     (return-from valid-callable-argument nil)))
-           (defined-type (and (global-var-p leaf)
-                              (global-var-defined-type leaf)))
-           (lvar-type (or defined-type
-                          (lvar-type lvar)))
-           (fun-name (cond ((or (fun-type-p lvar-type)
-                                (functional-p leaf))
-                            (if (constant-lvar-p lvar)
-                                #+sb-xc-host (bug "Can't call %FUN-NAME")
-                                #-sb-xc-host (%fun-name (lvar-value lvar))
-                                (leaf-debug-name leaf)))
-                           ((constant-lvar-p lvar)
-                            (lvar-value lvar))
-                           (t
-                            (when *valid-callable-argument-assert-unknown-lvars*
-                              (assert-function-designator-lvar-type lvar
-                                                                    (specifier-type '(or function symbol))
-                                                                    arg-count
-                                                                    *valid-fun-use-name*
-                                                                    *policy*))
-                            (return-from valid-callable-argument nil))))
-           (type (cond ((fun-type-p lvar-type)
-                        lvar-type)
-                       ((symbolp fun-name)
-                        (proclaimed-ftype fun-name))
-                       (t
-                        leaf)))
-           (*lossage-fun* (if (and (not (eq (leaf-where-from leaf)
-                                            :defined-here))
-                                   (not (lambda-p leaf))
-                                   (or (not fun-name)
-                                       (not (info :function :info fun-name))))
-                              #'compiler-style-warn
-                              *lossage-fun*)))
-      (multiple-value-bind (min max optional)
-          (fun-arg-limits type)
-        (cond
-          ((and (not min) (not max)))
-          ((not optional)
-           (when (/= arg-count min)
-             (note-lossage
-              "The function ~S is called by ~S with ~R argument~:P, but wants exactly ~R."
-              fun-name
-              *valid-fun-use-name*
-              arg-count min)))
-          ((< arg-count min)
-           (note-lossage
-            "The function ~S is called by ~S with ~R argument~:P, but wants at least ~R."
-            fun-name
-            *valid-fun-use-name*
-            arg-count min))
-          ((not max))
-          ((> arg-count max)
-           (note-lossage
-            "The function ~S called by ~S with ~R argument~:P, but wants at most ~R."
-            fun-name
-            *valid-fun-use-name*
-            arg-count max)))))))
+(defun lvar-fun-type (lvar &optional arg-count)
+  ;; Handle #'function,  'function and (lambda (x y))
+  (let* ((use (principal-lvar-use lvar))
+         (leaf (if (ref-p use)
+                   (ref-leaf use)
+                   (return-from lvar-fun-type nil)))
+         (defined-type (and (global-var-p leaf)
+                            (global-var-defined-type leaf)))
+         (lvar-type (or defined-type
+                        (lvar-type lvar)))
+         (fun-name (cond ((or (fun-type-p lvar-type)
+                              (functional-p leaf))
+                          (cond ((constant-lvar-p lvar)
+                                 #+sb-xc-host (bug "Can't call %FUN-NAME")
+                                 #-sb-xc-host (%fun-name (lvar-value lvar)))
+                                ((and (lambda-p leaf)
+                                      (eq (lambda-kind leaf) :external))
+                                 (leaf-debug-name (lambda-entry-fun leaf)))
+                                (t
+                                 (leaf-debug-name leaf))))
+                         ((constant-lvar-p lvar)
+                          (lvar-value lvar))
+                         (t
+                          (when (and *valid-callable-argument-assert-unknown-lvars*
+                                     arg-count)
+                            (assert-function-designator-lvar-type lvar
+                                                                  (specifier-type '(or function symbol))
+                                                                  arg-count
+                                                                  *valid-fun-use-name*
+                                                                  *policy*))
+                          (return-from lvar-fun-type nil))))
+         (type (cond ((fun-type-p lvar-type)
+                      lvar-type)
+                     ((symbolp fun-name)
+                      (proclaimed-ftype fun-name))
+                     (t
+                      leaf))))
+    (values type fun-name leaf)))
+
+(defun valid-callable-argument (lvar &key arg-count args arg-lvars unknown-keys &allow-other-keys)
+  (when arg-count
+    (multiple-value-bind (type fun-name leaf) (lvar-fun-type lvar arg-count)
+      (when type
+        (let* ((*lossage-fun*
+                 (if (and (neq (leaf-where-from leaf) :defined-here)
+                          (not (and (functional-p leaf)
+                                    (or (lambda-p leaf)
+                                        (member (functional-kind leaf)
+                                                '(:toplevel-xep)))))
+                          (or (not fun-name)
+                              (not (info :function :info fun-name))))
+                     #'compiler-style-warn
+                     *lossage-fun*)))
+          (multiple-value-bind (min max optional)
+              (fun-arg-limits type)
+            (cond
+              ((and (not min) (not max)))
+              ((not optional)
+               (when (/= arg-count min)
+                 (note-lossage
+                  "The function ~S is called by ~S with ~R argument~:P, but wants exactly ~R."
+                  fun-name
+                  *valid-fun-use-name*
+                  arg-count min)
+                 (return-from valid-callable-argument)))
+              ((< arg-count min)
+               (note-lossage
+                "The function ~S is called by ~S with ~R argument~:P, but wants at least ~R."
+                fun-name
+                *valid-fun-use-name*
+                arg-count min)
+               (return-from valid-callable-argument))
+              ((not max))
+              ((> arg-count max)
+               (note-lossage
+                "The function ~S called by ~S with ~R argument~:P, but wants at most ~R."
+                fun-name
+                *valid-fun-use-name*
+                arg-count max)
+               (return-from valid-callable-argument))))
+          (when args
+            (valid-arguments-to-callable fun-name args arg-lvars
+                                         (fun-type-first-n-types type arg-count)
+                                         unknown-keys)))))))
+
+(defun validate-test-and-test-not (combination)
+  (let* ((comination-name (lvar-fun-name (combination-fun combination) t))
+         (info (info :function :info comination-name)))
+    (when (ir1-attributep (fun-info-attributes info) call)
+      (let (test
+            test-not
+            (null-type (specifier-type 'null)))
+        (map-key-lvars (lambda (key value)
+                         (when (and (not test)
+                                    (eq key :test))
+                           (setf test value))
+                         (when (and (not test-not)
+                                    (eq key :test-not))
+                           (setf test-not value)))
+                       (combination-args combination)
+                       (info :function :type comination-name))
+        (when (and test
+                   test-not
+                   (eq (type-intersection null-type (lvar-type test))
+                       *empty-type*)
+                   (eq (type-intersection null-type (lvar-type test-not))
+                       *empty-type*))
+          (note-lossage "~s: can't specify both :TEST and :TEST-NOT"
+                        *valid-fun-use-name*))))))
+
+(defun fun-type-first-n-types (type n)
+  (unless (or (not (fun-type-p type))
+              (fun-type-keyp type)
+              (fun-type-wild-args type))
+    (let (result)
+      (flet ((process (types)
+               (loop for x in types
+                     while (plusp n)
+                     do (decf n)
+                        (push x result))))
+        (process (fun-type-required type))
+        (process (fun-type-optional type))
+        (loop repeat n
+              do (push (fun-type-rest type) result)))
+      (nreverse result))))
+
+(defun valid-arguments-to-callable (fun args arg-lvars types
+                                    unknown-keys)
+  (if (typep args '(cons (cons (eql sequences))))
+      (loop for n in (cdar args)
+            do (valid-arguments-to-callable fun `((sequence ,n)) arg-lvars types unknown-keys))
+      (loop with key-fun
+            for arg in args
+            for expected-type in types
+            for sequencep = (and (consp arg)
+                                 (eql (car arg) 'sequence))
+            for n = (if sequencep
+                        (cadr arg)
+                        arg)
+            for lvar-type* = (lvar-type (nth n arg-lvars))
+            for lvar-type = (if sequencep
+                                (destructuring-bind (&key key) (cddr arg)
+                                  (let ((key (and (not unknown-keys)
+                                                  (or (not key)
+                                                      (loop for (key value) on (nthcdr key arg-lvars) by #'cddr
+                                                            unless (keywordp key) return nil
+                                                            when (eq key :key)
+                                                            return value
+                                                            finally (return t)))))
+                                        type)
+                                    (cond ((member key '(t identity))
+                                           (and (array-type-p lvar-type*)
+                                                (array-type-element-type lvar-type*)))
+                                          ((and (lvar-p key)
+                                                (setf (values type key-fun) (lvar-fun-type key))
+                                                (fun-type-p type)
+                                                (neq key-fun 'identity))
+                                           (single-value-type (fun-type-returns type))))))
+                                lvar-type*)
+            when (and lvar-type
+                      (neq lvar-type *wild-type*)
+                      (eq (type-intersection expected-type lvar-type)
+                          *empty-type*))
+            do (if sequencep
+                   (if (and key-fun
+                            (neq key-fun 'identity))
+                       (note-lossage
+                        "The function ~S called by ~S with the results~%of the :key function ~s of type ~S~%which conflict with ~S."
+                        fun
+                        *valid-fun-use-name*
+                        key-fun
+                        (type-specifier lvar-type)
+                        (type-specifier expected-type))
+                       (note-lossage
+                        "The function ~S called by ~S with the elements~%of the ~:R argument of type ~S~%which conflict with ~S."
+                        fun
+                        *valid-fun-use-name*
+                        n
+                        (type-specifier lvar-type*)
+                        (type-specifier expected-type)))
+                   (note-lossage
+                    "The function ~S called by ~S with the ~:R argument of type ~S,~%which conflicts with ~S."
+                    fun
+                    *valid-fun-use-name*
+                    n
+                    (type-specifier lvar-type*)
+                    (type-specifier expected-type)))
+               (return))))
 
 (defun check-structure-constructor-call (call dd ctor-ll-parts)
   (destructuring-bind (&optional req opt rest keys aux)
@@ -962,37 +1099,29 @@ and no value was provided for it." name))))))))))
              (dtype (when return
                       (lvar-derived-type (return-result return)))))
         (cond
-          ((and dtype (not (values-types-equal-or-intersect dtype
-                                                            type-returns)))
-           (note-lossage
-             "The result type from ~A:~%  ~
-              ~/sb!impl:print-type/~@
-              conflicts with the definition's result type:~%  ~
-              ~/sb!impl:print-type/"
-            where type-returns dtype)
-           nil)
-          (*lossage-detected* nil)
-          ((not really-assert) t)
-          (t
+          (really-assert
            ;; REALLY-ASSERT can be T or `(:NOT . ,vars) where the latter is
            ;; a list of vars for which compiling will *not* generate
            ;; an automatic check.
            (let ((policy (lexenv-policy (functional-lexenv functional))))
-             (when (and (policy policy (> type-check 0))
+             (when (and return
+                        (policy policy (> type-check 0))
                         (or (eq really-assert t)
                             (not (member :result (cdr really-assert)))))
                (assert-lvar-type (return-result return) type-returns
-                                 policy)))
-           (loop for var in vars and type in types do
+                                 policy
+                                 :ftype)))
+           (loop for var in vars
+                 for type in types do
                  (cond ((basic-var-sets var)
                         (when (and unwinnage-fun
                                    (not (csubtypep (leaf-type var) type)))
                           (funcall unwinnage-fun
                                    #.(#+sb-xc sb!impl::!xc-preprocess-format-control
                                       #-sb-xc identity
-                                    "Assignment to argument: ~S~%  ~
-                                     prevents use of assertion from function ~
-                                     type ~A:~% ~/sb!impl:print-type/~%")
+                                      "Assignment to argument: ~S~%  ~
+                                       prevents use of assertion from function ~
+                                       type ~A:~% ~/sb!impl:print-type/~%")
                                    (leaf-debug-name var) where type)))
                        ((and (listp really-assert) ; (:NOT . ,vars)
                              (member (lambda-var-%source-name var)
@@ -1002,6 +1131,18 @@ and no value was provided for it." name))))))))))
                         (let ((s-type (make-single-value-type type)))
                           (dolist (ref (leaf-refs var))
                             (derive-node-type ref s-type))))))
+           t)
+          ((and dtype
+                (not (values-types-equal-or-intersect dtype
+                                                      type-returns)))
+           (note-lossage
+            "The result type from ~A:~%  ~
+             ~/sb!impl:print-type/~@
+             conflicts with the definition's result type:~%  ~
+             ~/sb!impl:print-type/"
+            where type-returns dtype)
+           nil)
+          (t
            t))))))
 
 ;;; Manipulate the poorly-named :REALLY-ASSERT value.
@@ -1139,85 +1280,105 @@ and no value was provided for it." name))))))))))
                unportable because THROW and CATCH use EQ comparison)~@:>"
              (rest sources) (first sources) (lvar-type tag)))))))
 
-(defun %compile-time-type-error (values atype dtype detail context)
+(defun %compile-time-type-error (values atype dtype detail code-context cast-context)
   (declare (ignore dtype))
-  (if (and (consp atype) (eq (car atype) 'values))
-      (if (singleton-p detail)
-          (error 'simple-type-error
-                 :datum (car values)
-                 :expected-type atype
-                 :format-control
-                  "~@<Value set ~2I~_[~{~S~^ ~}] ~I~_from ~S in~_~A ~
-                   ~I~_is not of type ~
+  (cond ((eq cast-context :ftype)
+         (error 'simple-type-error
+                :datum (car values)
+                :expected-type atype
+                :format-control
+                "~@<Values ~2I~_[~{~S~^ ~}] ~I~_from ~S in~_~A ~
+                   ~I~_is not of the declared return type of the function ~
                    ~2I~_~/sb!impl:print-type-specifier/.~:>"
-                 :format-arguments (list values
-                                         (first detail) context
-                                         atype))
-          (error 'simple-type-error
-                 :datum (car values)
-                 :expected-type atype
-                 :format-control
-                  "~@<Value set ~2I~_[~{~S~^ ~}] ~
+                :format-arguments (list values
+                                        (first detail) code-context
+                                        atype)))
+        ((and (consp atype) (eq (car atype) 'values))
+         (if (singleton-p detail)
+             (error 'simple-type-error
+                    :datum (car values)
+                    :expected-type atype
+                    :format-control
+                    "~@<Values ~2I~_[~{~S~^ ~}] ~I~_from ~S in~_~A ~
+                     ~I~_is not of type ~
+                    ~2I~_~/sb!impl:print-type-specifier/.~:>"
+                    :format-arguments (list values
+                                            (first detail) code-context
+                                            atype))
+             (error 'simple-type-error
+                    :datum (car values)
+                    :expected-type atype
+                    :format-control
+                    "~@<Values ~2I~_[~{~S~^ ~}] ~
                    ~I~_from ~2I~_~{~S~^~#[~; or ~:;, ~]~} ~
                    ~I~_of ~2I~_~S ~I~_in~_~A ~I~_is not of type ~
                    ~2I~_~/sb!impl:print-type-specifier/.~:>"
-                 :format-arguments (list values
-                                         (rest detail) (first detail)
-                                         context
-                                         atype)))
-      (if (singleton-p detail)
-          (error 'simple-type-error
-                 :datum (car values)
-                 :expected-type atype
-                 :format-control
-                  "~@<Value of ~S in ~_~A ~I~_is ~2I~_~S, ~
+                    :format-arguments (list values
+                                            (rest detail) (first detail)
+                                            code-context
+                                            atype))))
+        ((singleton-p detail)
+         (error 'simple-type-error
+                :datum (car values)
+                :expected-type atype
+                :format-control
+                "~@<Value of ~S in ~_~A ~I~_is ~2I~_~S, ~
                    ~I~_not a ~2I~_~/sb!impl:print-type-specifier/.~:@>"
-                 :format-arguments (list (car detail) context
-                                         (car values)
-                                         atype))
-          (error 'simple-type-error
-                 :datum (car values)
-                 :expected-type atype
-                 :format-control
-                  "~@<Value from ~2I~_~{~S~^~#[~; or ~:;, ~]~} ~
+                :format-arguments (list (car detail) code-context
+                                        (car values)
+                                        atype)))
+        (t
+         (error 'simple-type-error
+                :datum (car values)
+                :expected-type atype
+                :format-control
+                "~@<Value from ~2I~_~{~S~^~#[~; or ~:;, ~]~} ~
                    ~I~_of ~2I~_~S ~I~_in~_~A ~I~_is ~2I~_~S, ~
                    ~I~_not a ~2I~_~/sb!impl:print-type-specifier/.~:@>"
-                 :format-arguments (list (rest detail) (first detail) context
-                                         (car values)
-                                         atype)))))
+                :format-arguments (list (rest detail) (first detail) code-context
+                                        (car values)
+                                        atype)))))
 
 (defoptimizer (%compile-time-type-error ir2-convert)
-    ((objects atype dtype detail context) node block)
-  (declare (ignore objects context))
+    ((objects atype dtype detail code-context cast-context) node block)
+  (declare (ignore objects code-context))
   (let ((*compiler-error-context* node))
     (setf (node-source-path node)
           (cdr (node-source-path node)))
     (let ((atype (lvar-value atype))
           (dtype (lvar-value dtype))
           (detail (lvar-value detail)))
-      (unless (eq atype nil)
-          (if (singleton-p detail)
-              (let ((detail (first detail)))
-                (if (constantp detail)
-                    (warn 'type-warning
-                          :format-control
-                           "~@<Constant ~2I~_~S ~Iconflicts with its ~
+      (cond ((eq atype nil))
+            ((eq (lvar-value cast-context) :ftype)
+             (warn 'type-warning
+                   :format-control
+                   "~@<Derived type of ~S is ~2I~_~S, ~
+                    ~I~_conflicting with the declared function return type ~
+                    ~2I~_~/sb!impl:print-type-specifier/.~@:>"
+                   :format-arguments (list detail dtype atype)))
+            ((singleton-p detail)
+             (let ((detail (first detail)))
+               (if (constantp detail)
+                   (warn 'type-warning
+                         :format-control
+                         "~@<Constant ~2I~_~S ~Iconflicts with its ~
                             asserted type ~
                             ~2I~_~/sb!impl::print-type-specifier/.~@:>"
-                          :format-arguments (list (eval detail) atype))
-                    (warn 'type-warning
-                          :format-control
-                           "~@<Derived type of ~S is ~2I~_~S, ~
+                         :format-arguments (list (eval detail) atype))
+                   (warn 'type-warning
+                         :format-control
+                         "~@<Derived type of ~S is ~2I~_~S, ~
                             ~I~_conflicting with its asserted type ~
                             ~2I~_~/sb!impl:print-type-specifier/.~@:>"
-                          :format-arguments (list detail dtype atype))))
-              (warn 'type-warning
-                    :format-control
-                     "~@<Derived type of ~2I~_~{~S~^~#[~; and ~:;, ~
+                         :format-arguments (list detail dtype atype)))))
+            (t
+             (warn 'type-warning
+                   :format-control
+                   "~@<Derived type of ~2I~_~{~S~^~#[~; and ~:;, ~
                       ~]~} ~I~_in ~2I~_~S ~I~_is ~
                       ~2I~_~/sb!impl:print-type-specifier/, ~
                       ~I~_conflicting with their asserted type ~
                       ~2I~_~/sb!impl:print-type-specifier/.~@:>"
-                    :format-arguments (list (rest detail) (first detail)
-                                            dtype atype)))))
+                   :format-arguments (list (rest detail) (first detail)
+                                           dtype atype)))))
     (ir2-convert-full-call node block)))

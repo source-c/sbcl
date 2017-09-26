@@ -14,15 +14,6 @@
 
 ;;;; Type frobbing VOPs
 
-(define-vop (lowtag-of)
-  (:translate lowtag-of)
-  (:policy :fast-safe)
-  (:args (object :scs (any-reg descriptor-reg)))
-  (:results (result :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 1
-    (inst and result object lowtag-mask)))
-
 (define-vop (widetag-of)
   (:translate widetag-of)
   (:policy :fast-safe)
@@ -103,7 +94,8 @@
   (:result-types positive-fixnum)
   (:generator 6
     (loadw res x 0 fun-pointer-lowtag)
-    (inst srl res res n-widetag-bits)))
+    (inst srl res res n-widetag-bits)
+    (inst and res res short-header-max-words)))
 
 (define-vop (set-header-data)
   (:translate set-header-data)
@@ -121,7 +113,12 @@
        (inst sll t2 data (- n-widetag-bits n-fixnum-tag-bits))
        (inst or t1 t2))
       (immediate
-       (inst or t1 (ash (tn-value data) n-widetag-bits)))
+       (let ((val (ash (tn-value data) n-widetag-bits)))
+         (cond ((typep val '(unsigned-byte 16))
+                (inst or t1 val))
+               (t
+                (inst li t2 val)
+                (inst or t1 t2)))))
       (zero))
     (storew t1 x 0 other-pointer-lowtag)
     (move res x)))

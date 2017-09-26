@@ -11,9 +11,6 @@
 
 (in-package "SB-KERNEL")
 
-(defun immobile-space-p (obj)
-  (<= sb-vm:immobile-space-start (get-lisp-obj-address obj) sb-vm:immobile-space-end))
-
 (defun order-by-in-degree ()
   (let ((compiler-stuff (make-hash-table :test 'eq))
         (other-stuff (make-hash-table :test 'eq)))
@@ -63,7 +60,7 @@
                       (when (and (fdefn-p ref)
                                  (simple-fun-p (fdefn-fun ref)))
                         (let ((code (fun-code-header (fdefn-fun ref))))
-                          (when (immobile-space-p code)
+                          (when (immobile-space-obj-p code)
                             (let ((ht (pick-table
                                        (%simple-fun-name
                                         (%code-entry-point code 0)))))
@@ -81,15 +78,10 @@
   (let ((ordering (make-array 10000 :adjustable t :fill-pointer 0))
         (hashset (make-hash-table :test 'eq)))
 
-    ;; Place static funs first so that their addresses are really permanent.
-    ;; This simplifies saving an image when dynamic space functions point to
-    ;; immobile space functions - the x86 call sequence requires two
-    ;; instructions, and the fixupper does not understand that.
-    ;; (It's not too hard to enhance it, but not worth the trouble)
-    (dolist (fun-name sb-vm:*static-funs*)
-      (let ((code (fun-code-header (symbol-function fun-name))))
-        (setf (gethash code hashset) t)
-        (vector-push-extend code ordering)))
+    ;; Place assembler routines first.
+    (dovector (code sb-fasl::*assembler-objects*)
+      (setf (gethash code hashset) t)
+      (vector-push-extend code ordering))
 
     (labels ((visit (thing)
                (typecase thing
@@ -101,7 +93,7 @@
                                     (not (macro-function thing)))
                            (visit (symbol-function thing))))))
              (visit-code (code-component)
-               (when (or (not (immobile-space-p code-component))
+               (when (or (not (immobile-space-obj-p code-component))
                          (gethash code-component hashset))
                  (return-from visit-code))
                (setf (gethash code-component hashset) t)

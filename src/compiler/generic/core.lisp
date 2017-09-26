@@ -11,13 +11,18 @@
 
 (in-package "SB!C")
 
+;;; This derived constant can defined only after compiler/target/backend-parms
+;;; is compiled. So for lack of a better place, here it is.
+#!+gencgc
+(defconstant sb!vm:gencgc-card-shift (1- (integer-length sb!vm:gencgc-card-bytes)))
+
 ;;; A CORE-OBJECT structure holds the state needed to resolve cross-component
 ;;; references during in-core compilation.
 (defstruct (core-object
             (:constructor make-core-object ())
             #-no-ansi-print-object
             (:print-object (lambda (x s)
-                             (print-unreadable-object (x s :type t))))
+                             (print-unreadable-object (x s :type t :identity t))))
             (:copier nil))
   ;; A hashtable translating ENTRY-INFO structures to the corresponding actual
   ;; FUNCTIONs for functions in this compilation.
@@ -72,13 +77,18 @@
                     (:code-object
                      (aver (null name))
                      (get-lisp-obj-address code))
+                    #!+immobile-space
+                    ((:immobile-object :layout)
+                     (get-lisp-obj-address (the (or layout symbol) name)))
+                    #!+immobile-code
+                    (:named-call
+                     (sb!vm::fdefn-entry-address name))
                     #!+immobile-code
                     (:static-call
                      (sb!vm::function-raw-address name))
                     (:symbol-tls-index
-                     (aver (symbolp name))
-                     (ensure-symbol-tls-index name)))))
-      (sb!vm:fixup-code-object code position value kind))))
+                     (ensure-symbol-tls-index (the symbol name))))))
+      (sb!vm:fixup-code-object code position value kind flavor))))
 
 ;;; Stick a reference to the function FUN in CODE-OBJECT at index I. If the
 ;;; function hasn't been compiled yet, make a note in the patch table.
@@ -102,36 +112,28 @@
                         (core-object-entry-table object))
                (error "Unresolved forward reference."))))
 
-;;; Backpatch all the DEBUG-INFOs dumped so far with the specified
-;;; SOURCE-INFO list. We also check that there are no outstanding
-;;; forward references to functions.
-(defun fix-core-source-info (info object &optional function)
-  (declare (type core-object object)
-           (type (or null function) function))
-  (aver (zerop (hash-table-count (core-object-patch-table object))))
-  (let ((source (debug-source-for-info info :function function)))
-    (dolist (info (core-object-debug-info object))
-      (setf (debug-info-source info) source)))
-  (setf (core-object-debug-info object) nil)
-  (values))
-
 #!+(and immobile-code (host-feature sb-xc))
 (progn
-(defvar *linker-fixups*)
-(defun sb!vm::function-raw-address (name &optional (fun (awhen (find-fdefn name)
-                                                          (fdefn-fun it))))
-  (let ((addr (and fun (get-lisp-obj-address fun))))
-    (cond (addr
-           (cond ((not (<= sb!vm:immobile-space-start addr sb!vm:immobile-space-end))
-                  (error "Can't statically link to ~S: code is movable" name))
-                 ((neq (fun-subtype fun) sb!vm:simple-fun-header-widetag)
-                  (error "Can't statically link to ~S: non-simple function" name))
-                 (t
-                  (sap-ref-word (int-sap addr)
-                                (- (ash sb!vm:simple-fun-self-slot sb!vm:word-shift)
-                                   sb!vm:fun-pointer-lowtag)))))
-          ((boundp '*linker-fixups*)
-           (warn "Deferring linkage to ~S" name)
-           (cons :defer name))
+  ;; Use FDEFINITION because it strips encapsulations - whether that's
+  ;; the right behavior for it or not is a separate concern.
+  ;; If somebody tries (TRACE LENGTH) for example, it should not cause
+  ;; compilations to fail on account of LENGTH becoming a closure.
+  (defun sb!vm::function-raw-address (name &aux (fun (fdefinition name)))
+    (cond ((not fun)
+           (error "Can't statically link to undefined function ~S" name))
+          ((not (immobile-space-obj-p fun))
+           (error "Can't statically link to ~S: code is movable" name))
+          ((neq (fun-subtype fun) sb!vm:simple-fun-widetag)
+           (error "Can't statically link to ~S: non-simple function" name))
           (t
-           (error "Can't statically link to undefined function ~S" name))))))
+           (let ((addr (get-lisp-obj-address fun)))
+             (sap-ref-word (int-sap addr)
+                           (- (ash sb!vm:simple-fun-self-slot sb!vm:word-shift)
+                              sb!vm:fun-pointer-lowtag))))))
+
+  ;; Return the address to which to jump when calling NAME through its fdefn.
+  (defun sb!vm::fdefn-entry-address (name)
+    (let ((fdefn (find-or-create-fdefn name)))
+      (+ (get-lisp-obj-address fdefn)
+         (ash sb!vm:fdefn-raw-addr-slot sb!vm:word-shift)
+         (- sb!vm:other-pointer-lowtag)))))

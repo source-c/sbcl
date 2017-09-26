@@ -164,10 +164,8 @@
                        (make-array 1 :element-type 'base-char)
                        (make-array 1 :element-type 'character)))
     (assert (multiple-value-bind (result error)
-                (ignore-errors (read-from-string
-                                (with-output-to-string (s)
-                                  (let ((*print-readably* t))
-                                    (print array s)))))
+                (read-from-string
+                 (write-to-string array :readably t))
               ;; it might not be readably-printable
               (or (typep error 'print-not-readable)
                   (and
@@ -664,10 +662,10 @@
   (assert (equal "ab" (format nil "a~0&b"))))
 
 (with-test (:name :print-unreadably-function)
-  (assert (equal "\"foo\""
-                 (handler-bind ((print-not-readable #'sb-ext:print-unreadably))
-                   (let ((*read-eval* nil))
-                     (write-to-string (coerce "foo" 'base-string) :readably t))))))
+  (assert (search "#<HASH-TABLE"
+                  (handler-bind ((print-not-readable #'sb-ext:print-unreadably))
+                    (let ((*read-eval* nil))
+                      (write-to-string (make-hash-table) :readably t))))))
 
 (with-test (:name :printing-specialized-arrays-readably)
   (let ((*read-eval* t)
@@ -759,6 +757,15 @@
   (assert (string/= (write-to-string (find-class 'fruit))
                     (write-to-string *fruit1*))))
 
+(defclass f-s-o-for-print-object (sb-mop:funcallable-standard-object)
+  ()
+  (:metaclass sb-mop:funcallable-standard-class))
+(with-test (:name (print-object sb-mop:funcallable-standard-object))
+  (let ((instance (make-instance 'f-s-o-for-print-object)))
+    (assert (eql 0 (search "#<F-S-O-FOR-PRINT-OBJECT"
+                           (with-output-to-string (stream)
+                             (print-object instance stream)))))))
+
 (with-test (:name :format-readably)
   (let ((*print-readably* t))
     (assert (format nil "~$" #'format))
@@ -817,3 +824,23 @@
 (with-test (:name :print-random-standard-object) ; lp# 1654550
   (assert (search "#<FOO2 {" (write-to-string (make-instance 'foo2) :pretty nil)))
   (assert (search "#<FOO2 {" (write-to-string (make-instance 'foo2) :pretty t))))
+
+;; STRINGIFY-OBJECT failed to use the pretty-print dispatch table
+;; for integers.
+(with-test (:name :stringify-pretty-integer)
+  (unwind-protect
+       (progn
+         (set-pprint-dispatch 'fixnum
+                              (lambda (stream obj)
+                                (format stream "#{Fixnum ")
+                                (write obj :stream stream :pretty nil)
+                                (write-char #\} stream)))
+         (assert (string= (write-to-string 92 :pretty t)
+                          "#{Fixnum 92}")))
+    (set-pprint-dispatch 'fixnum nil)))
+
+(with-test (:name :readable-vector-circularity)
+  (let ((x (make-array 1 :element-type 'base-char :initial-contents "x"))
+        (y (make-array 1 :element-type 'base-char :initial-contents "y")))
+    (assert (equal (read-from-string (write-to-string (list x y) :readably t :circle t))
+                   '("x" "y")))))

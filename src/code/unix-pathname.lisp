@@ -12,6 +12,7 @@
 (in-package "SB!IMPL")
 
 (defstruct (unix-host
+             (:copier nil)
              (:include host
                        (parse #'parse-unix-namestring)
                        (parse-native #'parse-native-unix-namestring)
@@ -131,10 +132,12 @@
                              collect (if (and (string= piece "..") rest)
                                          :up
                                          piece)))
-           (directory (if (and as-directory
-                               (string/= "" (car (last components))))
-                          components
-                          (butlast components)))
+           (directory (remove ""
+                              (if (and as-directory
+                                       (string/= "" (car (last components))))
+                                  components
+                                  (butlast components))
+                              :test #'equal))
            (name-and-type
             (unless as-directory
               (let* ((end (first (last components)))
@@ -151,7 +154,10 @@
                    (list end nil)))))))
       (values nil
               nil
-              (cons (if absolute :absolute :relative) directory)
+              (cond (absolute
+                     (cons :absolute directory))
+                    (directory
+                     (cons :relative directory)))
               (first name-and-type)
               (second name-and-type)
               nil))))

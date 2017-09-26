@@ -337,7 +337,6 @@
 ;;; callback wrapper
 #-sb-xc-host
 (defun alien-callback-assembler-wrapper (index result-type argument-types)
-  #!+sb-doc
   "Cons up a piece of code which calls enter-alien-callback with INDEX
 and a pointer to the arguments."
   (flet ((make-gpr (n)
@@ -436,7 +435,8 @@ and a pointer to the arguments."
             (inst sw ra sp (- n-frame-bytes n-word-bytes))
 
             ;; Setup the args and make the call.
-            (inst li a0 (get-lisp-obj-address #'enter-alien-callback))
+            (inst li a0 (static-fdefn-fun-addr 'enter-alien-callback))
+            (inst lw a0 a0)
             (inst li t9 (foreign-symbol-address "funcall3"))
             (inst li a1 (fixnumize index))
             (inst addu a2 sp n-frame-bytes)

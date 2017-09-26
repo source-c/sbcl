@@ -23,17 +23,20 @@
 (defun constant-lvar-p (thing)
   (declare (type (or lvar null) thing))
   (and (lvar-p thing)
-       (or (let ((use (principal-lvar-use thing)))
-             (and (ref-p use) (constant-p (ref-leaf use))))
-           ;; check for EQL types and singleton numeric types
-           (values (type-singleton-p (lvar-type thing))))))
-
-;;; Same as above except it doesn't consider EQL types
-(defun strictly-constant-lvar-p (thing)
-  (declare (type (or lvar null) thing))
-  (and (lvar-p thing)
-       (let ((use (principal-lvar-use thing)))
-         (and (ref-p use) (constant-p (ref-leaf use))))))
+       (let* ((type (lvar-type thing))
+              (principal-lvar (principal-lvar thing))
+              (principal-use (lvar-uses principal-lvar))
+              leaf)
+         (or (and (ref-p principal-use)
+                  (constant-p (setf leaf (ref-leaf principal-use)))
+                  ;; LEAF may be a CONSTANT behind a cast that will
+                  ;; later turn out to be of the wrong type.
+                  ;; And ir1-transforms suffer from this because
+                  ;; they expect LVAR-VALUE to be of a restricted type.
+                  (or (not (lvar-reoptimize principal-lvar))
+                      (ctypep (constant-value leaf) type)))
+             ;; check for EQL types and singleton numeric types
+             (values (type-singleton-p type))))))
 
 ;;; Return the constant value for an LVAR whose only use is a constant
 ;;; node.
@@ -313,13 +316,14 @@
 ;;; splitting off DEST a new CAST node; old LVAR will deliver values
 ;;; to CAST. If we improve the assertion, we set TYPE-CHECK and
 ;;; TYPE-ASSERTED to guarantee that the new assertion will be checked.
-(defun assert-lvar-type (lvar type policy)
+(defun assert-lvar-type (lvar type policy &optional context)
   (declare (type lvar lvar) (type ctype type))
   (unless (values-subtypep (lvar-derived-type lvar) type)
     (let ((internal-lvar (make-lvar))
           (dest (lvar-dest lvar)))
       (substitute-lvar internal-lvar lvar)
-      (let ((cast (insert-cast-before dest lvar type policy)))
+      (let ((cast (insert-cast-before dest lvar type policy
+                                      context)))
         (use-lvar cast internal-lvar)
         t))))
 
@@ -497,8 +501,15 @@
                        (or
                         ;; ... and a DX-allocator to end a block.
                         (lvar-dynamic-extent it)
-                        ;; FIXME: This is a partial workaround for bug 303.
-                        (consp (lvar-uses it)))))))
+                        ;; ... and for there to be no chance of there
+                        ;; being two successive USEs of the same
+                        ;; multi-valued LVAR in the same block (since
+                        ;; we can only insert cleanup code at block
+                        ;; boundaries, but need to discard
+                        ;; multi-valued LVAR contents before they are
+                        ;; overwritten).
+                        (and (consp (lvar-uses it))
+                             (not (lvar-single-value-p it))))))))
              nil)
             (t
              (join-blocks block next)
@@ -700,15 +711,24 @@
            (consequent  (if-consequent  node))
            (alternative (if-alternative node))
            (victim
-            (cond ((constant-lvar-p test)
-                   (if (lvar-value test) alternative consequent))
-                  ((not (types-equal-or-intersect type (specifier-type 'null)))
-                   alternative)
-                  ((type= type (specifier-type 'null))
-                   consequent)
-                  ((or (eq consequent alternative) ; Can this happen?
-                       (cblocks-equivalent-p alternative consequent))
-                   alternative))))
+             (cond ((constant-lvar-p test)
+                    (if (lvar-value test) alternative consequent))
+                   ((not (types-equal-or-intersect type (specifier-type 'null)))
+                    alternative)
+                   ((type= type (specifier-type 'null))
+                    consequent)
+                   ((or (eq consequent alternative) ; Can this happen?
+                        (cblocks-equivalent-p alternative consequent))
+                    ;; Even if the references are the same they can have
+                    ;; different derived types based on the TEST
+                    ;; Don't lose the second type when killing it.
+                    (let ((consequent-ref (block-start-node consequent)))
+                      (derive-node-type consequent-ref
+                                        (values-type-union
+                                         (node-derived-type consequent-ref)
+                                         (node-derived-type (block-start-node alternative)))
+                                        :from-scratch t))
+                    alternative))))
       (when victim
         (kill-if-branch-1 node test block victim)
         (return-from ir1-optimize-if (values))))
@@ -1148,27 +1168,24 @@
       ;;
       ;; FIXME: We also convert in :INLINE & FUNCTIONAL-KIND case below. What
       ;; is it for?
-      (flet ((frob ()
-               (let* ((name (leaf-source-name leaf))
-                      (res (ir1-convert-inline-expansion
-                            name
-                            (defined-fun-inline-expansion leaf)
-                            leaf
-                            inlinep
-                            (info :function :info name))))
-                 ;; Allow backward references to this function from following
-                 ;; forms. (Reused only if policy matches.)
-                 (push res (defined-fun-functionals leaf))
-                 (change-ref-leaf ref res))))
+      (with-ir1-environment-from-node call
         (let ((fun (defined-fun-functional leaf)))
           (if (or (not fun)
                   (and (eq inlinep :inline) (functional-kind fun)))
               ;; Convert.
-              (if ir1-converting-not-optimizing-p
-                  (frob)
-                  (with-ir1-environment-from-node call
-                    (frob)
-                    (locall-analyze-component *current-component*)))
+              (let* ((name (leaf-source-name leaf))
+                     (res (ir1-convert-inline-expansion
+                           name
+                           (defined-fun-inline-expansion leaf)
+                           leaf
+                           inlinep
+                           (info :function :info name))))
+                ;; Allow backward references to this function from following
+                ;; forms. (Reused only if policy matches.)
+                (push res (defined-fun-functionals leaf))
+                (change-ref-leaf ref res)
+                (unless ir1-converting-not-optimizing-p
+                  (locall-analyze-component *current-component*)))
               ;; If we've already converted, change ref to the converted
               ;; functional.
               (change-ref-leaf ref fun))))
@@ -1304,6 +1321,7 @@
 ;;; if either the transform succeeded or was aborted.
 (defun ir1-transform (node transform)
   (declare (type combination node) (type transform transform))
+  (declare (notinline warn)) ; See COMPILER-WARN for rationale
   (let* ((type (transform-type transform))
          (fun (transform-function transform))
          (constrained (fun-type-p type))
@@ -1452,24 +1470,21 @@
   (aver (and (legal-fun-name-p source-name)
              (not (eql source-name '.anonymous.))))
   (node-ends-block call)
-  ;; The internal variables of a transform are not going to be
-  ;; interesting to the debugger, so there's no sense in
-  ;; suppressing the substitution of variables with only one use
-  ;; (the extra variables can slow down constraint propagation).
-  ;;
-  ;; This needs to be done before the WITH-IR1-ENVIRONMENT-FROM-NODE,
-  ;; so that it will bind *LEXENV* to the right environment.
   (setf (combination-lexenv call)
         (make-lexenv :default (combination-lexenv call)
-                     :policy (process-optimize-decl
-                              '(optimize
-                                (preserve-single-use-debug-variables 0))
-                              (lexenv-policy
-                               (combination-lexenv call)))))
+                     :policy
+                     ;; The internal variables of a transform are not going to be
+                     ;; interesting to the debugger, so there's no sense in
+                     ;; suppressing the substitution of variables with only one use
+                     ;; (the extra variables can slow down constraint propagation).
+                     (augment-policy
+                      preserve-single-use-debug-variables
+                      0
+                      (lexenv-policy
+                       (combination-lexenv call)))))
   (with-ir1-environment-from-node call
     (with-component-last-block (*current-component*
                                 (block-next (node-block call)))
-
       (let ((new-fun (ir1-convert-inline-lambda
                       res
                       :debug-name (debug-name 'lambda-inlined source-name)
@@ -1501,13 +1516,15 @@
     (cond ((not (ir1-attributep attr foldable))
            nil)
           ((ir1-attributep attr call)
-           (apply (fun-info-foldable-call-check info)
-                  (mapcar (lambda (lvar)
-                            (or (lvar-fun-name lvar t)
-                                (if (constant-lvar-p lvar)
-                                    (lvar-value lvar)
-                                    (return-from constant-fold-call-p nil))))
-                          args)))
+           (and (every (lambda (lvar)
+                         (or (lvar-fun-name lvar t)
+                             (constant-lvar-p lvar)))
+                       args)
+                (map-callable-arguments
+                 (lambda (lvar &key &allow-other-keys)
+                   (constant-fold-arg-p (or (lvar-fun-name lvar t)
+                                            (lvar-value lvar))))
+                 combination)))
           (t
            (every #'constant-lvar-p args)))))
 
@@ -1907,15 +1924,16 @@
                                      ;; be better -- APD, 2003-05-15
                                      (leaf-type var)))
                  (propagate-to-refs var (lvar-type arg))
-                 (let ((use-component (node-component use)))
-                   (prog1 (substitute-leaf-if
-                           (lambda (ref)
-                             (cond ((eq (node-component ref) use-component)
-                                    t)
-                                   (t
-                                    (aver (lambda-toplevelish-p (lambda-home fun)))
-                                    nil)))
-                           leaf var)))
+                 (unless (preserve-single-use-debug-var-p call var)
+                   (let ((use-component (node-component use)))
+                     (substitute-leaf-if
+                      (lambda (ref)
+                        (cond ((eq (node-component ref) use-component)
+                               t)
+                              (t
+                               (aver (lambda-toplevelish-p (lambda-home fun)))
+                               nil)))
+                      leaf var)))
                  t)))))
         ((and (null (rest (leaf-refs var)))
               (not (preserve-single-use-debug-var-p call var))
@@ -2248,41 +2266,24 @@
       ;; RETURN-FROM.  We may delete them only when we can show that
       ;; there are no other code paths that use the entry LVAR that
       ;; are live from within the block that contained the deleted
-      ;; EXIT (our predecessor block) and that all uses of the entry
-      ;; LVAR have the same dynamic-extent environment.  The
-      ;; conservative version of this is that there are no EXITs for
-      ;; any ENTRY introduced between the LEXENV of the deleted EXIT
-      ;; and the LEXENV of the target ENTRY and that both the LEXENV
-      ;; of the deleted EXIT and the LEXENV of the ENTRY have the same
-      ;; set of :DYNAMIC-EXTENT variables and functions.
-      (let* ((entry-lexenv (cast-vestigial-exit-entry-lexenv cast))
-             (entry-blocks (lexenv-blocks entry-lexenv))
-             (entry-tags (lexenv-tags entry-lexenv)))
-        (do ((current-block (lexenv-blocks exit-lexenv) (cdr current-block)))
-            ((eq current-block entry-blocks))
-          (when (entry-exits (cadar current-block))
-            (return-from may-delete-vestigial-exit nil)))
-        (do ((current-tag (lexenv-tags exit-lexenv) (cdr current-tag)))
-            ((eq current-tag entry-tags))
-          (when (entry-exits (cadar current-tag))
-            (return-from may-delete-vestigial-exit nil)))
-        (do ((vars (lexenv-vars exit-lexenv) (cdr vars)))
-            ((eq vars (lexenv-vars entry-lexenv)))
-          ;; (CDAR VARS) is the actual variable we're looking at,
-          ;; except that if it's a symbol-macro then it's (MACRO
-          ;; . <form>), and that's not a leaf, so ignore the
-          ;; non-LEAF-P variables.
-          (when (and (leaf-p (cdar vars))
-                     (leaf-dynamic-extent (cdar vars)))
-            (return-from may-delete-vestigial-exit nil)))
-        (do ((funs (lexenv-funs exit-lexenv) (cdr funs)))
-            ((eq funs (lexenv-funs entry-lexenv)))
-          ;; Like with VARS, we can have FUNS of the form (MACRO
-          ;; . <something>), though in this case it's an expander
-          ;; function.  Again, ignore the non-LEAF-P functions.
-          (when (and (leaf-p (cdar funs))
-                     (leaf-dynamic-extent (cdar funs)))
-            (return-from may-delete-vestigial-exit nil))))))
+      ;; EXIT and that all uses of the entry LVAR have the same
+      ;; dynamic-extent environment.  The conservative version of this
+      ;; is that there are no EXITs for any ENTRY introduced between
+      ;; the LEXENV of the deleted EXIT and the LEXENV of the target
+      ;; ENTRY and that there is no :DYNAMIC-EXTENT cleanup between
+      ;; the deleted EXIT and the target ENTRY (which the CAST shares
+      ;; a lexenv with).  See ONLY-HARMLESS-CLEANUPS in locall.lisp
+      ;; for a similar analysis.
+      (let ((entry-cleanup (block-start-cleanup (node-block cast))))
+        (do-nested-cleanups (cleanup exit-lexenv)
+          (when (eq cleanup entry-cleanup)
+            (return))
+          (case (cleanup-kind cleanup)
+            ((:block :tagbody)
+             (when (entry-exits (cleanup-mess-up cleanup))
+               (return-from may-delete-vestigial-exit nil)))
+            ((:dynamic-extent)
+             (return-from may-delete-vestigial-exit nil)))))))
   (values t))
 
 (defun compile-time-type-error-context (context)
@@ -2307,11 +2308,13 @@
                        (bound-cast-derived cast))
                    (values-subtypep (lvar-derived-type value)
                                     (cast-asserted-type cast)))
-          (when (function-designator-cast-p cast)
+          (when (and (function-designator-cast-p cast)
+                     lvar)
             (let ((*valid-fun-use-name* (function-designator-cast-caller cast))
                   (*lossage-fun* #'compiler-warn)
                   (*compiler-error-context* cast))
               (valid-callable-argument lvar
+                                       :arg-count
                                        (function-designator-cast-arg-count cast))))
 
           (delete-cast cast)
@@ -2366,19 +2369,27 @@
              ;; FIXME: Do it in one step.
              (let ((context (node-source-form cast))
                    (detail (lvar-all-sources (cast-value cast))))
-               (filter-lvar
-                value
-                (if (cast-single-value-p cast)
-                    `(list 'dummy)
-                    `(multiple-value-call #'list 'dummy)))
+               (unless (cast-silent-conflict cast)
+                 (filter-lvar
+                  value
+                  (if (cast-single-value-p cast)
+                      `(list 'dummy)
+                      `(multiple-value-call #'list 'dummy))))
                (filter-lvar
                 (cast-value cast)
                 ;; FIXME: Derived type.
-                `(%compile-time-type-error 'dummy
-                                           ',(type-specifier atype)
-                                           ',(type-specifier value-type)
-                                           ',detail
-                                           ',(compile-time-type-error-context context))))
+                (if (cast-silent-conflict cast)
+                    (let ((dummy-sym (gensym)))
+                     `(let ((,dummy-sym 'dummy))
+                        ,(internal-type-error-call dummy-sym atype
+                                                   (cast-context cast))
+                        ,dummy-sym))
+                    `(%compile-time-type-error 'dummy
+                                               ',(type-specifier atype)
+                                               ',(type-specifier value-type)
+                                               ',detail
+                                               ',(compile-time-type-error-context context)
+                                               ',(cast-context cast)))))
              ;; KLUDGE: FILTER-LVAR does not work for non-returning
              ;; functions, so we declare the return type of
              ;; %COMPILE-TIME-TYPE-ERROR to be * and derive the real type
@@ -2400,4 +2411,3 @@
 
   (unless do-not-optimize
     (setf (node-reoptimize cast) nil)))
-

@@ -12,12 +12,15 @@
 
 (in-package "SB!VM")
 
+(defun symbol-slot-addr (symbol slot)
+  (make-ea :qword :disp
+           (let ((offset (- (* slot n-word-bytes) other-pointer-lowtag)))
+             (if (static-symbol-p symbol)
+                 (+ nil-value (static-symbol-offset symbol) offset)
+                 (make-fixup symbol :immobile-object offset)))))
+
 ;;; CELL-REF and CELL-SET are used to define VOPs like CAR, where the
 ;;; offset to be read or written is a property of the VOP used.
-;;; CELL-SETF is similar to CELL-SET, but delivers the new value as
-;;; the result. CELL-SETF-FUN takes its arguments as if it were a
-;;; SETF function (new value first, as apposed to a SETF macro, which
-;;; takes the new value last).
 (define-vop (cell-ref)
   (:args (object :scs (descriptor-reg)
                  :load-if (not (and (sc-is object immediate)
@@ -26,54 +29,32 @@
   (:variant-vars offset lowtag)
   (:policy :fast-safe)
   (:generator 4
-    (if (sc-is object immediate)
-        (inst mov value
-              (make-ea :qword :disp
-                       (+ nil-value (static-symbol-offset (tn-value object))
-                          (- (* offset n-word-bytes) lowtag))))
-        (loadw value object offset lowtag))))
+    (cond ((sc-is object immediate)
+           ;; this sanity-check is meta-compile-time statically assertable
+           (aver (eq offset symbol-value-slot))
+           (inst mov value (symbol-slot-addr (tn-value object) offset)))
+          (t
+           (loadw value object offset lowtag)))))
 (define-vop (cell-set)
-  (:args (object :scs (descriptor-reg))
-         (value :scs (descriptor-reg any-reg)))
+  (:args (object :scs (descriptor-reg)
+                 :load-if (not (and (sc-is object immediate)
+                                    (symbolp (tn-value object)))))
+         (value :scs (descriptor-reg any-reg)
+                :load-if (not (and (sc-is value immediate)
+                                   (typep (tn-value value)
+                                          '(or symbol
+                                               character
+                                               (signed-byte 32)))))))
   (:variant-vars offset lowtag)
   (:policy :fast-safe)
   (:generator 4
-    (storew value object offset lowtag)))
-(define-vop (cell-setf)
-  (:args (object :scs (descriptor-reg))
-         (value :scs (descriptor-reg any-reg) :target result))
-  (:results (result :scs (descriptor-reg any-reg)))
-  (:variant-vars offset lowtag)
-  (:policy :fast-safe)
-  (:generator 4
-    (storew value object offset lowtag)
-    (move result value)))
-(define-vop (cell-setf-fun)
-  (:args (value :scs (descriptor-reg any-reg) :target result)
-         (object :scs (descriptor-reg)))
-  (:results (result :scs (descriptor-reg any-reg)))
-  (:variant-vars offset lowtag)
-  (:policy :fast-safe)
-  (:generator 4
-    (storew value object offset lowtag)
-    (move result value)))
-
-;;; Define accessor VOPs for some cells in an object. If the operation
-;;; name is NIL, then that operation isn't defined. If the translate
-;;; function is null, then we don't define a translation.
-(defmacro define-cell-accessors (offset lowtag
-                                        ref-op ref-trans set-op set-trans)
-  `(progn
-     ,@(when ref-op
-         `((define-vop (,ref-op cell-ref)
-             (:variant ,offset ,lowtag)
-             ,@(when ref-trans
-                 `((:translate ,ref-trans))))))
-     ,@(when set-op
-         `((define-vop (,set-op cell-setf)
-             (:variant ,offset ,lowtag)
-             ,@(when set-trans
-                 `((:translate ,set-trans))))))))
+    (let ((value (encode-value-if-immediate value)))
+      (cond ((sc-is object immediate)
+             ;; this sanity-check is meta-compile-time statically assertable
+             (aver (eq offset symbol-value-slot))
+             (inst mov (symbol-slot-addr (tn-value object) offset) value))
+            (t
+             (storew value object offset lowtag))))))
 
 ;;; X86 special
 (define-vop (cell-xadd)
