@@ -9,20 +9,18 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; miscellaneous global variables
 
 ;;; ANSI: "the floating-point format that is to be used when reading a
 ;;; floating-point number that has no exponent marker or that has e or
 ;;; E for an exponent marker"
-(!defvar *read-default-float-format* 'single-float)
-(declaim (type (member short-float single-float double-float long-float)
-               *read-default-float-format*))
+(defparameter *read-default-float-format* 'single-float)
 
 (defvar *readtable*)
-(declaim (type readtable *readtable*))
-(setf (fdocumentation '*readtable* 'variable)
+
+(setf (documentation '*readtable* 'variable)
       "Variable bound to current readtable.")
 
 ;;; A standard Lisp readtable (once cold-init is through). This is for
@@ -30,7 +28,7 @@
 ;;; WITH-STANDARD-IO-SYNTAX), and should not normally be user-visible.
 ;;; If the initial value is changed from NIL to something more interesting,
 ;;; be sure to update the duplicated definition in "src/code/print.lisp"
-(defglobal *standard-readtable* nil)
+(define-load-time-global *standard-readtable* nil)
 
 ;;; In case we get an error trying to parse a symbol, we want to rebind the
 ;;; above stuff so it's cool.
@@ -117,7 +115,7 @@
       function
       (cond ((functionp x) x)
             ((null x) ,fallback)
-            (t (sb!c:safe-fdefn-fun x))))))
+            (t (sb-c:safe-fdefn-fun x))))))
 
 ;; Return a function-designator given a character-macro-table entry.
 (defmacro !cmt-entry-to-fun-designator (val)
@@ -170,7 +168,8 @@
 
 ;;; There are a number of "secondary" attributes which are constant
 ;;; properties of characters (as long as they are constituents).
-
+;;; FIXME: this initform is considered too hairy to assign (a constant array, really?)
+;;; if changed to DEFCONSTANT-EQX, which makes this file unslammable as-is. Oh well.
 (defconstant +constituent-trait-table+
   #.(let ((a (!make-specialized-array base-char-code-limit '(unsigned-byte 8))))
       (fill a +char-attr-constituent+)
@@ -550,11 +549,8 @@ standard Lisp readtable when NIL."
 (defvar *read-buffer*)
 
 ;; A list of available TOKEN-BUFs
-;; Should need no toplevel binding if multi-threaded,
-;; but doesn't really matter, as INITIAL-THREAD-FUNCTION-TRAMPOLINE
-;; rebinds to NIL.
 (declaim (type (or null token-buf) *token-buf-pool*))
-(defvar *token-buf-pool* nil)
+(!define-thread-local *token-buf-pool* nil)
 
 (defun reset-read-buffer (buffer)
   ;; Turn BUFFER into an empty read buffer.
@@ -569,7 +565,7 @@ standard Lisp readtable when NIL."
 (defun ouch-read-buffer (char buffer)
   ;; When buffer overflow
   (let ((op (token-buf-fill-ptr buffer)))
-    (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+    (declare (optimize (sb-c::insert-array-bounds-checks 0)))
     (when (>= op (length (token-buf-string buffer)))
     ;; an out-of-line call for the uncommon case avoids bloat.
     ;; Size should be doubled.
@@ -592,7 +588,7 @@ standard Lisp readtable when NIL."
 ;; Retun the next character from the buffered token, or NIL.
 (declaim (maybe-inline token-buf-getchar))
 (defun token-buf-getchar (b)
-  (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+  (declare (optimize (sb-c::insert-array-bounds-checks 0)))
   (let ((i (token-buf-cursor (truly-the token-buf b))))
     (and (< i (token-buf-fill-ptr b))
          (prog1 (elt (token-buf-string b) i)
@@ -682,14 +678,14 @@ standard Lisp readtable when NIL."
 ;;; On the other hand, it's probably very very seldom a problem in practice.
 ;;; On the third hand, it might be just as easy to use a hash table,
 ;;; so maybe we should. -- WHN 19991202
-(defvar *sharp-equal* ())
+(defvar *sharp-equal*)
 
 (declaim (ftype (sfunction (t t) (values bit t)) read-maybe-nothing))
 
 ;;; Like READ-PRESERVING-WHITESPACE, but doesn't check the read buffer
 ;;; for being set up properly.
 (defun %read-preserving-whitespace (stream eof-error-p eof-value recursive-p)
-  (declare (optimize (sb!c::check-tag-existence 0)))
+  (declare (optimize (sb-c::check-tag-existence 0)))
   (if recursive-p
       ;; a loop for repeating when a macro returns nothing
       (let* ((tracking-p (form-tracking-stream-p stream))
@@ -742,24 +738,22 @@ standard Lisp readtable when NIL."
 ;;; for functions that want comments to return so that they can look
 ;;; past them. CHAR must not be whitespace.
 (defun read-maybe-nothing (stream char)
-  (truly-the
-   (values bit t) ; avoid a type-check. M-V-CALL is lame
-   (multiple-value-call
-       (lambda (stream start-pos &optional (result nil supplied-p) &rest junk)
-         (declare (ignore junk)) ; is this ANSI-specified?
-         (when (and supplied-p start-pos)
-           (funcall (form-tracking-stream-observer stream)
-                    start-pos
-                    (form-tracking-stream-input-char-pos stream) result))
-         (values (if supplied-p 1 0) result))
-     ;; KLUDGE: not capturing anything in the lambda avoids closure consing
-     stream
-     (and (form-tracking-stream-p stream)
-          ;; Subtract 1 because the position points _after_ CHAR.
-          (1- (form-tracking-stream-input-char-pos stream)))
-     (funcall (!cmt-entry-to-function
-               (get-raw-cmt-entry char *readtable*) #'read-token)
-              stream char))))
+  (multiple-value-call
+      (lambda (stream start-pos &optional (result nil supplied-p) &rest junk)
+        (declare (ignore junk))         ; is this ANSI-specified?
+        (when (and supplied-p start-pos)
+          (funcall (form-tracking-stream-observer stream)
+                   start-pos
+                   (form-tracking-stream-input-char-pos stream) result))
+        (values (if supplied-p 1 0) result))
+    ;; KLUDGE: not capturing anything in the lambda avoids closure consing
+    stream
+    (and (form-tracking-stream-p stream)
+         ;; Subtract 1 because the position points _after_ CHAR.
+         (1- (form-tracking-stream-input-char-pos stream)))
+    (funcall (!cmt-entry-to-function
+              (get-raw-cmt-entry char *readtable*) #'read-token)
+             stream char)))
 
 (defun read (&optional (stream *standard-input*)
                        (eof-error-p t)
@@ -798,7 +792,7 @@ standard Lisp readtable when NIL."
         #'(lambda (decoding-error)
             (declare (ignorable decoding-error))
             (style-warn
-             'sb!kernel::character-decoding-error-in-macro-char-comment
+             'sb-kernel::character-decoding-error-in-macro-char-comment
              :position (file-position stream) :stream stream)
             (invoke-restart 'attempt-resync))))
     (let ((stream (in-stream-from-designator stream)))
@@ -916,7 +910,7 @@ standard Lisp readtable when NIL."
   (declare (character closech))
   (macrolet ((scan (read-a-char eofp &optional finish)
                `(loop (let ((char ,read-a-char))
-                        (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+                        (declare (optimize (sb-c::insert-array-bounds-checks 0)))
                         (cond (,eofp (error 'end-of-file :stream stream))
                               ((eql char closech)
                                (return ,finish))
@@ -1101,7 +1095,6 @@ standard Lisp readtable when NIL."
 
 (defvar *read-base* 10
   "the radix that Lisp reads numbers in")
-(declaim (type (integer 2 36) *read-base*))
 
 ;;; Normalize TOKEN-BUF to NFKC, returning a new TOKEN-BUF and the
 ;;; COLON value
@@ -1116,7 +1109,7 @@ standard Lisp readtable when NIL."
     (reset-read-buffer token-buf)
     (macrolet ((clear-str-to-normalize ()
                `(progn
-                  (loop for char across (sb!unicode:normalize-string
+                  (loop for char across (sb-unicode:normalize-string
                                          (subseq str-to-normalize 0 normalize-ptr)
                                          :nfkc) do
                        (ouch-read-buffer char token-buf))
@@ -1148,7 +1141,7 @@ standard Lisp readtable when NIL."
      ((and (zerop (length escapes)) (eq case :upcase))
       (let ((buffer (token-buf-string token-buf)))
         (dotimes (i (token-buf-fill-ptr token-buf))
-          (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+          (declare (optimize (sb-c::insert-array-bounds-checks 0)))
           (setf (schar buffer i) (char-upcase (schar buffer i))))))
      ((eq case :preserve))
      (t
@@ -1159,7 +1152,7 @@ standard Lisp readtable when NIL."
                                   -1 (vector-pop escapes))))
                         ((minusp i))
                       (declare (fixnum i)
-                               (optimize (sb!c::insert-array-bounds-checks 0)))
+                               (optimize (sb-c::insert-array-bounds-checks 0)))
                       (if (< esc i)
                           (let ((ch (schar buffer i)))
                             ,@body)
@@ -1604,7 +1597,7 @@ extended <package-name>::<form-in-package> syntax."
         ((> base 36) a)
       (do ((total (1- base) (+ (* total base) (1- base)))
            (n-digits 0 (1+ n-digits)))
-          ((sb!xc:typep total 'bignum)
+          ((sb-xc:typep total 'bignum)
            (setf (aref a (- base 2)) n-digits))
         ;; empty DO body
         )))
@@ -1617,14 +1610,14 @@ extended <package-name>::<form-in-package> syntax."
            (d (char (write-to-string (1- base) :base base) 0))
            (string (make-string (1+ n-digits) :initial-element d))) ; 1 extra
       (assert (not (typep (parse-integer string :radix base)
-                          `(unsigned-byte ,sb!vm:n-positive-fixnum-bits))))
+                          `(unsigned-byte ,sb-vm:n-positive-fixnum-bits))))
       (assert (typep (parse-integer string :end n-digits :radix base)
-                     `(unsigned-byte ,sb!vm:n-positive-fixnum-bits))))))
+                     `(unsigned-byte ,sb-vm:n-positive-fixnum-bits))))))
 
 (defmacro !setq-optional-leading-sign (sign-flag token-buf rewind)
   ;; guaranteed to have at least one character in buffer at the start
   ;; or immediately following [ESFDL] marker depending on 'rewind' flag.
-  `(locally (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+  `(locally (declare (optimize (sb-c::insert-array-bounds-checks 0)))
      (,(if rewind 'setf 'incf)
        (token-buf-cursor ,token-buf)
        (case (elt (token-buf-string ,token-buf)
@@ -1680,7 +1673,7 @@ extended <package-name>::<form-in-package> syntax."
   ;; can be larger than normalized.
   (let* ((max-exponent
           #!-long-float
-          (+ sb!vm:double-float-digits sb!vm:double-float-bias))
+          (+ sb-vm:double-float-digits sb-vm:double-float-bias))
          (number-magnitude (integer-length number))
          (divisor-magnitude (1- (integer-length divisor)))
          (magnitude (- number-magnitude divisor-magnitude)))
@@ -1747,7 +1740,7 @@ extended <package-name>::<form-in-package> syntax."
 (defun make-float-aux (number divisor float-format stream)
   (handler-case
       (coerce (/ number divisor) float-format)
-    (type-error (c)
+    (arithmetic-error (c)
       (error 'reader-impossible-number-error
              :error c :stream stream
              :format-control "failed to build float from ~a"

@@ -119,7 +119,11 @@ code:
     (as-c "#define CAST_SIGNED(x) ((sizeof(x) == 4)? (long long) (long) (x): (x))")
     #+(and (not win32) x86-64)
     (as-c "#define CAST_SIGNED(x) ((sizeof(x) == 4)? (long) (int) (x): (x))")
-    #-x86-64
+    ;; the C compiler on macOS warns that %ld is the wrong format for an int
+    ;; even though 'long' and 'int' are both 4 bytes.
+    #+x86
+    (as-c "#define CAST_SIGNED(x) ((long) (x))")
+    #-(or x86 x86-64)
     (as-c "#define CAST_SIGNED(x) ((int) (x))")
     (as-c "int main(int argc, char *argv[]) {")
     (as-c "    FILE *out;")
@@ -133,7 +137,7 @@ code:
     (as-c "        return 1;")
     (as-c "    }")
     (printf "(cl:in-package #:~A)" package-name)
-    (printf "(cl:eval-when (:compile-toplevel)")
+    (printf "(cl:eval-when (:compile-toplevel :execute)")
     (printf "  (cl:defparameter *integer-sizes* (cl:make-hash-table))")
     (dolist (type '("char" "short" "long long" "long" "int"))
       (printf "  (cl:setf (cl:gethash %ld *integer-sizes*) 'sb-alien:~A)" (substitute #\- #\Space type)
@@ -177,13 +181,37 @@ code:
     (as-c "return 0;")
     (as-c "}")))
 
-(defun c-constants-extract  (filename output-file package)
-  (with-open-file (f output-file :direction :output :if-exists :supersede)
-    (with-open-file (i filename :direction :input)
+;;; Extract constants as specified from INPUT, creating file OUTPUT.
+;;; Very important: This OUTPUT formal parameter should ** literally ** be
+;;; be named OUTPUT, and not OUTPUT-FILE.  WAT ???
+;;; Well, OUTPUT-FILE is the name of a class exported from ASDF and we might do
+;;; (USE-PACKAGE "ASDF") *after* having loaded our 'defpackage' without ASDF.
+;;; A subsequent USE-PACKAGE would cause a symbol conflict. How can there ever
+;;; be a subsequent USE-PACKAGE?  Because some _other_ system decides that it
+;;; wants to do the following actions:
+;;;  - load system "A" using a non-ASDF system loading tool
+;;;    that wants to use SB-GROVEL
+;;;  - load ASDF, which pushes :ASDF on *FEATURES*
+;;;  - use ASDF to load system "B" which claims to need ASDF to use SB-GROVEL
+;;;  - which re-loads SB-GROVEL, which loads our DEFPACKAGE
+;;;  - which causes the aforementioned failure.
+;;; Now you might think that pushing "SB-GROVEL" on to *MODULES* the first time
+;;; would fix things, but it doesn't - because we actually _do_ have to reload
+;;; this file, in order to pull in the CLOS stuff.  This problem can't be
+;;; fixed until the outside worlds' systems either all use ASDF or not.
+;;; Which translates to: this won't be fixed correctly, ever.
+;;;
+;;; TLDR: this stupid restriction on a variable's name makes
+;;; something work that didn't used to work. And victory is ours!
+(defun c-constants-extract  (input output package)
+  (with-open-file (f output :direction :output :if-exists :supersede)
+    (with-open-file (i input :direction :input)
       (let* ((headers (read i))
              (definitions (read i)))
         (print-c-source  f headers definitions package)))))
 
+#+asdf
+(progn
 (defclass grovel-constants-file (cl-source-file)
   ((package :accessor constants-package :initarg :package)
    (do-not-grovel :accessor do-not-grovel
@@ -238,12 +266,12 @@ code:
                       '("-D_LARGEFILE_SOURCE"
                         "-D_LARGEFILE64_SOURCE"
                         "-D_FILE_OFFSET_BITS=64")
-                      #+(and (or x86 ppc) (or linux freebsd)) '("-m32")
+                      #+(and (or x86 ppc sparc) (or linux freebsd)) '("-m32")
                       #+(and x86-64 darwin inode64)
                       `("-arch" "x86_64"
                         ,(format nil "-mmacosx-version-min=~A"
                                  (or (sb-ext:posix-getenv "SBCL_MACOSX_VERSION_MIN")
-                                     "10.5"))
+                                     "10.6"))
                         "-D_DARWIN_USE_64_BIT_INODE")
                       #+(and x86-64 darwin (not inode64))
                       '("-arch" "x86_64"
@@ -273,3 +301,4 @@ code:
     (multiple-value-bind (output warnings-p failure-p)
         (compile-file* tmp-constants :output-file output-file :warnings-file warnings-file)
       (check-lisp-compile-results output warnings-p failure-p context-format context-arguments)))))
+) ; end PROGN

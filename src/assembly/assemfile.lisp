@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; If non-NIL, emit assembly code. If NIL, emit VOP templates.
 (defvar *emit-assembly-code-not-vops-p* nil)
@@ -22,37 +22,44 @@
 ;;; COMPILE-FILE, but in fact it's arguably more like LOAD, even down
 ;;; to the return convention. It LOADs a file, then writes out any
 ;;; assembly code created by the process.
-(defun assemble-file (name
-                      &key
-                      (output-file (make-pathname :defaults name
-                                                  :type "assem")))
+(defun assemble-file (name &key (output-file (error "Missing keyword")))
   (when sb-cold::*compile-for-effect-only*
     (return-from assemble-file t))
-  ;; FIXME: Consider nuking the filename defaulting logic here.
   (let* ((*emit-assembly-code-not-vops-p* t)
          (name (pathname name))
          ;; the fasl file currently being output to
          (lap-fasl-output (open-fasl-output (pathname output-file) name))
          (*entry-points* nil)
          (won nil)
-         (*code-segment* nil)
-         (*elsewhere* nil)
-         (*assembly-optimize* nil)
-         (*fixup-notes* nil)
-         #!+immobile-code (*code-is-immobile* t)
-         #!+inline-constants (*unboxed-constants* nil))
+         (asmstream (make-asmstream))
+         (*asmstream* asmstream)
+         (*adjustable-vectors* nil))
     (unwind-protect
         (let ((*features* (cons :sb-assembling *features*)))
-          (init-assembler)
           (load (merge-pathnames name (make-pathname :type "lisp")))
-          (sb!assem:append-segment *code-segment* *elsewhere*)
-          (setf *elsewhere* nil)
-          #!+inline-constants
-          (emit-inline-constants)
-          (let ((length (sb!assem:finalize-segment *code-segment*)))
-            (dump-assembler-routines *code-segment*
-                                     length
-                                     *fixup-notes*
+          ;; Leave room for the indirect call table. relocate_heap() in
+          ;; 'coreparse' finds the end with a 0 word so add 1 extra word.
+          #!+(or x86 x86-64)
+          (emit (asmstream-data-section asmstream)
+                `(.skip ,(* (align-up (1+ (length *entry-points*)) 2)
+                            sb-vm:n-word-bytes)))
+          (when (emit-inline-constants)
+            ;; Ensure alignment to double-Lispword in case a raw constant
+            ;; causes misalignment, as actually happens on ARM64.
+            ;; You might think one Lispword is aligned enough, but it isn't,
+            ;; because to created a tagged pointer to an asm routine,
+            ;; the base address must have all 0s in the tag bits.
+            ;; Note that for code components that contain simple-funs,
+            ;; alignment is ensured by SIMPLE-FUN-HEADER-WORD.
+            (emit (asmstream-data-section asmstream)
+                  `(.align ,sb-vm:n-lowtag-bits)))
+          (let ((segment (assemble-sections
+                          asmstream nil
+                          (make-segment :inst-hook (default-segment-inst-hook)
+                                        :run-scheduler nil))))
+            (dump-assembler-routines segment
+                                     (segment-buffer segment)
+                                     (sb-assem::segment-fixup-notes segment)
                                      *entry-points*
                                      lap-fasl-output))
           (setq won t))
@@ -123,7 +130,7 @@
                         :offset ,(reg-spec-offset reg))))
                    regs)
        ,@(decls)
-       (sb!assem:assemble (*code-segment* ',name)
+       (assemble (:code 'nil)
          ,@(expand-align-option (cadr (assoc :align options)))
          ,name
          (push (list ',name ,name 0) *entry-points*)
@@ -131,7 +138,17 @@
          ,@code
          ,@(generate-return-sequence
             (or (cadr (assoc :return-style options)) :raw))
-         (emit-alignment sb!vm:n-lowtag-bits))
+         ;; Place elsewhere section following the regular code, except on 32-bit
+         ;; ARM. See the comment in arm/assem-rtns that says it expects THROW to
+         ;; drop through into UNWIND. That wouldn't work if the code emitted
+         ;; by GENERATE-ERROR-CODE were interposed between those.
+         #!-arm
+         (let ((asmstream *asmstream*))
+           (join-sections (asmstream-code-section asmstream)
+                          (asmstream-elsewhere-section asmstream)))
+         (emit-alignment sb-vm:n-lowtag-bits
+                         ;; EMIT-LONG-NOP does not exist for (not x86-64)
+                         #!+x86-64 :long-nop))
        (when *compile-print*
          (format *error-output* "~S assembled~%" ',name)))))
 

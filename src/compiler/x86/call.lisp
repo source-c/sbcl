@@ -9,10 +9,10 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
-(defconstant arg-count-sc (make-sc-offset any-reg-sc-number ecx-offset))
-(defconstant closure-sc (make-sc-offset descriptor-reg-sc-number eax-offset))
+(defconstant arg-count-sc (make-sc+offset any-reg-sc-number ecx-offset))
+(defconstant closure-sc (make-sc+offset descriptor-reg-sc-number eax-offset))
 
 ;;; Make a passing location TN for a local call return PC.
 ;;;
@@ -24,7 +24,7 @@
                  sap-stack-sc-number return-pc-save-offset))
 
 (defconstant return-pc-passing-offset
-  (make-sc-offset sap-stack-sc-number return-pc-save-offset))
+  (make-sc+offset sap-stack-sc-number return-pc-save-offset))
 
 ;;; This is similar to MAKE-RETURN-PC-PASSING-LOCATION, but makes a
 ;;; location to pass OLD-FP in.
@@ -33,13 +33,12 @@
 ;;; because we want to be able to assume it's always there. Besides,
 ;;; the x86 doesn't have enough registers to really make it profitable
 ;;; to pass it in a register.
-(defun make-old-fp-passing-location (standard)
-  (declare (ignore standard))
+(defun make-old-fp-passing-location ()
   (make-wired-tn *fixnum-primitive-type* control-stack-sc-number
                  ocfp-save-offset))
 
 (defconstant old-fp-passing-offset
-  (make-sc-offset control-stack-sc-number ocfp-save-offset))
+  (make-sc+offset control-stack-sc-number ocfp-save-offset))
 
 ;;; Make the TNs used to hold OLD-FP and RETURN-PC within the current
 ;;; function. We treat these specially so that the debugger can find
@@ -200,10 +199,10 @@
                                 (list (primitive-type-or-lose ',name)
                                       (sc-or-lose ',stack-sc)
                                       (lambda (node block fp value res)
-                                        (sb!c::vop ,ref node block
+                                        (sb-c::vop ,ref node block
                                                    fp value res))
                                       (lambda (node block fp new-val value)
-                                        (sb!c::vop ,set node block
+                                        (sb-c::vop ,set node block
                                                    fp new-val value)))))))))
     (foo (double-float double-stack
                        ancestor-frame-ref/double-float
@@ -233,13 +232,14 @@
 (define-vop (xep-allocate-frame)
   (:info start-lab)
   (:generator 1
-    (emit-alignment n-lowtag-bits)
+    (let ((nop-kind
+           (shiftf (sb-assem::asmstream-inter-function-padding sb-assem:*asmstream*)
+                   :nop)))
+      (emit-alignment n-lowtag-bits (if (eq nop-kind :nop) #x90 0)))
     (emit-label start-lab)
     ;; Skip space for the function header.
     (inst simple-fun-header-word)
-    (dotimes (i (1- simple-fun-code-offset))
-      (inst dword 0))
-
+    (inst .skip (* (1- simple-fun-code-offset) n-word-bytes))
     ;; The start of the actual code.
     ;; Save the return-pc.
     (popw ebp-tn (frame-word-offset return-pc-save-offset))))
@@ -298,7 +298,7 @@
 (defun default-unknown-values (vop values nvals node)
   (declare (type (or tn-ref null) values)
            (type unsigned-byte nvals))
-  (let ((type (sb!c::basic-combination-derived-type node)))
+  (let ((type (sb-c::basic-combination-derived-type node)))
     (cond
       ((<= nvals 1)
        (note-this-location vop :single-value-return)
@@ -389,7 +389,7 @@
            (move esp-tn ebx-tn)
            (let ((defaults (defaults)))
              (when defaults
-               (assemble (*elsewhere*)
+               (assemble (:elsewhere)
                  (emit-label default-stack-slots)
                  (dolist (default defaults)
                    (emit-label (car default))
@@ -505,7 +505,7 @@
 ;;; them.)
 (defun receive-unknown-values (args nargs start count node)
   (declare (type tn args nargs start count))
-  (let ((type (sb!c::basic-combination-derived-type node))
+  (let ((type (sb-c::basic-combination-derived-type node))
         (variable-values (gen-label))
         (stack-values (gen-label))
         (done (gen-label)))
@@ -558,13 +558,13 @@
 (defun check-ocfp-and-return-pc (old-fp return-pc)
   #+nil
   (format t "*known-return: old-fp ~S, tn-kind ~S; ~S ~S~%"
-          old-fp (tn-kind old-fp) (sb!c::tn-save-tn old-fp)
-          (tn-kind (sb!c::tn-save-tn old-fp)))
+          old-fp (tn-kind old-fp) (sb-c::tn-save-tn old-fp)
+          (tn-kind (sb-c::tn-save-tn old-fp)))
   #+nil
   (format t "*known-return: return-pc ~S, tn-kind ~S; ~S ~S~%"
           return-pc (tn-kind return-pc)
-          (sb!c::tn-save-tn return-pc)
-          (tn-kind (sb!c::tn-save-tn return-pc)))
+          (sb-c::tn-save-tn return-pc)
+          (tn-kind (sb-c::tn-save-tn return-pc)))
   (unless (and (sc-is old-fp control-stack)
                (= (tn-offset old-fp) ocfp-save-offset))
     (error "ocfp not on stack in standard save location?"))
@@ -757,7 +757,8 @@
 
                (:ignore
                ,@(unless (or variable (eq return :tail)) '(arg-locs))
-               ,@(unless variable '(args)))
+               ,@(unless variable '(args))
+               ,@(when (eq named :direct) '(step-instrumenting)))
 
                ;; We pass either the fdefn object (for named call) or
                ;; the actual function object (for unnamed call) in
@@ -862,8 +863,7 @@
                           ;; For tail call, we have to push the
                           ;; return-pc so that it looks like we CALLed
                           ;; despite the fact that we are going to JMP.
-                          (inst push return-pc)
-                          ))
+                          (inst push return-pc)))
                        (t
                         ;; For non-tail call, we have to save our
                         ;; frame pointer and install the new frame
@@ -891,11 +891,11 @@
                                   (frame-word-offset ocfp-save-offset))
 
                           (move ebp-tn new-fp))))  ; NB - now on new stack frame.
-
-               (when step-instrumenting
-                 (emit-single-step-test)
-                 (inst jmp :eq DONE)
-                 (inst break single-step-around-trap))
+               ,@(unless (eq named :direct)  ;; handle-single-step-around-trap can't handle it
+                   `((when step-instrumenting
+                       (emit-single-step-test)
+                       (inst jmp :eq DONE)
+                       (inst break single-step-around-trap))))
                DONE
 
                (note-this-location vop :call-site)
@@ -1268,7 +1268,7 @@
     DONE))
 
 (define-vop (more-kw-arg)
-  (:translate sb!c::%more-kw-arg)
+  (:translate sb-c::%more-kw-arg)
   (:policy :fast-safe)
   (:args (object :scs (descriptor-reg) :to (:result 1))
          (index :scs (any-reg immediate) :to (:result 1) :target keyword))
@@ -1288,7 +1288,7 @@
                                   :disp n-word-bytes))))))
 
 (define-vop (more-arg/c)
-  (:translate sb!c::%more-arg)
+  (:translate sb-c::%more-arg)
   (:policy :fast-safe)
   (:args (object :scs (descriptor-reg) :to (:result 1)))
   (:info index)
@@ -1300,7 +1300,7 @@
                                     :disp (- (* index n-word-bytes))))))
 
 (define-vop (more-arg)
-    (:translate sb!c::%more-arg)
+    (:translate sb-c::%more-arg)
   (:policy :fast-safe)
   (:args (object :scs (descriptor-reg) :to (:result 1))
          (index :scs (any-reg) :to (:result 1) :target value))
@@ -1336,7 +1336,7 @@
       (inst mov result nil-value)
       (inst jecxz done)
       (inst lea dst (make-ea :dword :base ecx :index ecx))
-      (maybe-pseudo-atomic stack-allocate-p
+      (pseudo-atomic (:elide-if stack-allocate-p)
        (allocation dst dst node stack-allocate-p list-pointer-lowtag)
        ;; Set decrement mode (successive args at lower addresses)
        (inst std)
@@ -1374,7 +1374,7 @@
 ;;; below the current stack top.
 (define-vop (more-arg-context)
   (:policy :fast-safe)
-  (:translate sb!c::%more-arg-context)
+  (:translate sb-c::%more-arg-context)
   (:args (supplied :scs (any-reg) :target count))
   (:arg-types positive-fixnum (:constant fixnum))
   (:info fixed)
@@ -1386,8 +1386,7 @@
     (move count supplied)
     ;; SP at this point points at the last arg pushed.
     ;; Point to the first more-arg, not above it.
-    (inst lea context (make-ea :dword :base esp-tn
-                               :index count :scale 1
+    (inst lea context (make-ea :dword :base esp-tn :index count
                                :disp (- (+ (fixnumize fixed) n-word-bytes))))
     (unless (zerop fixed)
       (inst sub count (fixnumize fixed)))))
@@ -1440,7 +1439,7 @@
       (inst cmp EA 0 :maybe-fs))
     #!+win32 (inst pop eax-tn))
   #!-sb-thread
-  (inst cmp (make-ea-for-symbol-value sb!impl::*stepping*) 0))
+  (inst cmp (make-ea-for-symbol-value sb-impl::*stepping*) 0))
 
 (define-vop (step-instrument-before-vop)
   (:policy :fast-safe)

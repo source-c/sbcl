@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
 ;;;; register specs
@@ -20,7 +20,7 @@
 (macrolet ((defreg (name offset)
              (let ((offset-sym (symbolicate name "-OFFSET")))
                `(eval-when (:compile-toplevel :load-toplevel :execute)
-                  (def!constant ,offset-sym ,offset)
+                  (defconstant ,offset-sym ,offset)
                   (setf (svref *register-names* ,offset-sym) ,(symbol-name name)))))
 
            (defregset (name &rest regs)
@@ -55,6 +55,10 @@
   (defregset non-descriptor-regs
       ocfp nfp nargs nl2 nl3)
 
+  ;; OAOOM: Same as runtime/arm-lispregs.h
+  (defregset boxed-regs
+      r0 r1 r2 lexenv r8 code)
+
   ;; registers used to pass arguments
   ;;
   ;; the number of arguments/return values passed in registers
@@ -66,6 +70,7 @@
 
 ;;;; SB and SC definition:
 
+(!define-storage-bases
 (define-storage-base registers :finite :size 16)
 (define-storage-base control-stack :unbounded :size 2 :size-increment 1)
 (define-storage-base non-descriptor-stack :unbounded :size 0)
@@ -78,6 +83,7 @@
 ;; {,COMPLEX-}{SINGLE,DOUBLE}-REG SCs below.
 #!-arm-vfp
 (error "Don't know how many float registers for non-VFP systems")
+)
 
 (!define-storage-classes
 
@@ -223,24 +229,24 @@
 (defun immediate-constant-sc (value)
   (typecase value
     (null
-     (sc-number-or-lose 'null))
-    ((or (integer #.sb!xc:most-negative-fixnum #.sb!xc:most-positive-fixnum)
+     null-sc-number)
+    ((or (integer #.sb-xc:most-negative-fixnum #.sb-xc:most-positive-fixnum)
          character)
-     (sc-number-or-lose 'immediate))
+     immediate-sc-number)
     (symbol
      (if (static-symbol-p value)
-         (sc-number-or-lose 'immediate)
+         immediate-sc-number
          nil))))
 
 (defun boxed-immediate-sc-p (sc)
-  (or (eql sc (sc-number-or-lose 'null))
-      (eql sc (sc-number-or-lose 'immediate))))
+  (or (eql sc null-sc-number)
+      (eql sc immediate-sc-number)))
 
 ;;;; function call parameters
 
 ;;; the SC numbers for register and stack arguments/return values
-(defconstant immediate-arg-scn (sc-number-or-lose 'any-reg))
-(defconstant control-stack-arg-scn (sc-number-or-lose 'control-stack))
+(defconstant immediate-arg-scn any-reg-sc-number)
+(defconstant control-stack-arg-scn control-stack-sc-number)
 
 ;;; offsets of special stack frame locations
 (defconstant ocfp-save-offset 0)
@@ -278,10 +284,10 @@
 
 (defun combination-implementation-style (node)
   (flet ((valid-funtype (args result)
-           (sb!c::valid-fun-use node
-                                (sb!c::specifier-type
+           (sb-c::valid-fun-use node
+                                (sb-c::specifier-type
                                  `(function ,args ,result)))))
-    (case (sb!c::combination-fun-source-name node)
+    (case (sb-c::combination-fun-source-name node)
       (logtest
        (cond
          ((valid-funtype '(fixnum fixnum) '*)

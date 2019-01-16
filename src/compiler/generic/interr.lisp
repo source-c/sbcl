@@ -11,7 +11,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 ;;; This is for generating runtime/genesis/constants.h
 ;;; (The strings are only used in C code and are relatively unimportant)
@@ -26,7 +26,7 @@
                 ;; Given a string "OBJECT-NOT-foo-ERROR", pull out the "foo"
                 (subseq (string symbol) 11 (- (length (string symbol)) 6))))))
 
-;; Define SB!C:+BACKEND-INTERNAL-ERRORS+ as a vector of pairs.
+;; Define SB-C:+BACKEND-INTERNAL-ERRORS+ as a vector of pairs.
 ;; General errors have the form ("description-of-foo" . foo-ERROR)
 ;; and type errors are (type-spec . OBJECT-NOT-<type-spec>-ERRROR)
 (macrolet
@@ -45,19 +45,19 @@
                      (list
                       (type-specifier
                        (specifier-type
-                        `(simple-array ,(sb!vm:saetp-specifier saetp) (*))))
+                        `(simple-array ,(sb-vm:saetp-specifier saetp) (*))))
                       (symbolicate "OBJECT-NOT-"
-                                   (sb!vm:saetp-primitive-type-name saetp))))
-                   sb!vm:*specialized-array-element-type-properties*)
+                                   (sb-vm:saetp-primitive-type-name saetp))))
+                   sb-vm:*specialized-array-element-type-properties*)
               (let ((unboxed-vectors
                      (map 'list
                           (lambda (saetp)
                             (type-specifier
                              (specifier-type
-                              `(simple-array ,(sb!vm:saetp-specifier saetp) (*)))))
-                          (remove t sb!vm:*specialized-array-element-type-properties*
-                                  :key 'sb!vm:saetp-specifier))))
-                `(((integer 0 ,sb!xc:array-dimension-limit)
+                              `(simple-array ,(sb-vm:saetp-specifier saetp) (*)))))
+                          (remove t sb-vm:*specialized-array-element-type-properties*
+                                  :key 'sb-vm:saetp-specifier))))
+                `(((integer 0 ,sb-xc:array-dimension-limit)
                    object-not-array-dimension)
                   ;; Union of all unboxed array specializations,
                   ;; for type-checking the argument to VECTOR-SAP
@@ -71,7 +71,7 @@
               type-errors)))
         ;; Error number must be of type (unsigned-byte 8).
         (assert (<= (length list) 256))
-        `(defconstant-eqx sb!c:+backend-internal-errors+
+        `(defconstant-eqx sb-c:+backend-internal-errors+
                ,(map 'vector
                      (lambda (x)
                        (if (symbolp x)
@@ -107,7 +107,8 @@
    ("A function with declared result type NIL returned." nil-fun-returned 1)
    ("An array with element-type NIL was accessed." nil-array-accessed 1)
    ("Object layout is invalid. (indicates obsolete instance)" layout-invalid 2)
-   ("Thread local storage exhausted." tls-exhausted 0))
+   ("Thread local storage exhausted." tls-exhausted 0)
+   ("Failed aver" failed-aver 1))
 
   ;; (II) All the type specifiers X for which there is a unique internal
   ;;      error code corresponding to a primitive object-not-X-error.
@@ -151,6 +152,7 @@
   ((complex double-float) object-not-complex-double-float)
   #!+long-float ((complex long-float) object-not-complex-long-float)
   #!+sb-simd-pack simd-pack
+  #!+sb-simd-pack-256 simd-pack-256
   weak-pointer
   instance
   #!+sb-unicode
@@ -165,68 +167,78 @@
   ;; rather than using the strange type name. The INTERNAL-ERROR function
   ;; receives the trap number as if it were a type error,
   ;; but prints a better message than "is not a (not satisfies)"
-  ((not (satisfies sb!vm::unbound-marker-p)) slot-not-initialized)
+  ((not (satisfies sb-vm::unbound-marker-p)) slot-not-initialized)
 
   ;; Now, in approximate order of descending popularity.
   ;; If we exceed 255 error numbers, trailing ones can be deleted arbitrarily.
-  (sb!c:sc object-not-storage-class) ; the single most popular type
-  sb!c:tn-ref
+  sb-c:storage-class ; the single most popular type
+  sb-c:tn-ref
   index
   ctype
-  sb!impl::buffer
-  sb!c::vop
-  sb!c::basic-combination
-  sb!sys:fd-stream
+  sb-impl::buffer
+  sb-c::vop
+  sb-c::basic-combination
+  sb-sys:fd-stream
   layout
-  (sb!assem:segment object-not-assem-segment)
-  sb!c::cblock
-  sb!disassem:disassem-state
-  sb!c::ctran
-  sb!c::clambda
-  sb!c:tn
+  (sb-assem:segment object-not-assem-segment)
+  sb-c::cblock
+  sb-disassem:disassem-state
+  sb-c::ctran
+  sb-c::clambda
+  sb-c:tn
   ((or function symbol) object-not-callable)
-  sb!c:component
+  sb-c:component
   ((or index null) object-not-index-or-null)
   stream
-  sb!c::ir2-block
-  sb!c::ir2-component
+  sb-c::ir2-block
+  sb-c::ir2-component
   type-class
-  sb!c::lvar
-  sb!c::vop-info
-  (sb!disassem:instruction object-not-disassembler-instruction)
+  sb-c::lvar
+  sb-c::vop-info
+  (sb-disassem:instruction object-not-disassembler-instruction)
   ((mod 1114112) object-not-unicode-code-point)
-  (sb!c::node object-not-compiler-node)
+  (sb-c::node object-not-compiler-node)
   sequence
-  sb!c::functional
+  sb-c::functional
   ((member t nil) object-not-boolean)
-  sb!c::lambda-var
-  sb!alien::alien-type-class
+  sb-c::lambda-var
+  sb-alien::alien-type-class
   lexenv
   ;; simple vector-of-anything is called a "rank-1-array"
   ;; because "simple-vector" means (simple-array t (*))
   ((simple-array * (*)) object-not-simple-rank-1-array)
   hash-table
-  sb!c::combination
+  sb-c::combination
   numeric-type
   defstruct-description
-  sb!format::format-directive
+  sb-format::format-directive
   package
   form-tracking-stream
   ansi-stream))
 
 (defun error-number-or-lose (name)
-  (or (position name sb!c:+backend-internal-errors+
+  (or (position name sb-c:+backend-internal-errors+
                 :key #'cadr :test #'eq)
       (error "unknown internal error: ~S" name)))
 
 (defun error-length (error-number)
-  (if (array-in-bounds-p sb!c:+backend-internal-errors+ error-number)
-      (cddr (svref sb!c:+backend-internal-errors+ error-number))
+  (if (array-in-bounds-p sb-c:+backend-internal-errors+ error-number)
+      (cddr (svref sb-c:+backend-internal-errors+ error-number))
       0))
 
-#-sb-xc-host ; no SB!C:SAP-READ-VAR-INTEGERF
-(defun decode-internal-error-args (sap error-number)
-  (let ((length (sb!kernel::error-length error-number)))
-    (declare (type (unsigned-byte 8) length))
-    (loop repeat length with index = 0
-       collect (sb!c:sap-read-var-integerf sap index))))
+#-sb-xc-host ; no SB-C:SAP-READ-VAR-INTEGERF
+(defun decode-internal-error-args (sap trap-number &optional error-number)
+  (let ((error-number (cond (error-number)
+                            ((>= trap-number sb-vm:error-trap)
+                             (prog1
+                                 (- trap-number sb-vm:error-trap)
+                               (setf trap-number sb-vm:error-trap)))
+                            (t
+                             (prog1 (sap-ref-8 sap 0)
+                               (setf sap (sap+ sap 1)))))))
+    (let ((length (sb-kernel::error-length error-number)))
+      (declare (type (unsigned-byte 8) length))
+      (values error-number
+              (loop repeat length with index = 0
+                    collect (sb-c:sap-read-var-integerf sap index))
+              trap-number))))

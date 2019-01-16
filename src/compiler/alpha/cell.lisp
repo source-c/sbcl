@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; data object ref/set stuff
 
@@ -243,11 +243,19 @@
   funcallable-instance-info-offset fun-pointer-lowtag
   (descriptor-reg any-reg) * %funcallable-instance-info)
 
-(define-vop (closure-ref slot-ref)
-  (:variant closure-info-offset fun-pointer-lowtag))
+(define-vop (closure-ref)
+  (:args (object :scs (descriptor-reg)))
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:info offset)
+  (:generator 4
+    (loadw value object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
-(define-vop (closure-init slot-set)
-  (:variant closure-info-offset fun-pointer-lowtag))
+(define-vop (closure-init)
+  (:args (object :scs (descriptor-reg))
+         (value :scs (descriptor-reg any-reg)))
+  (:info offset)
+  (:generator 4
+    (storew value object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
 (define-vop (closure-init-from-fp)
   (:args (object :scs (descriptor-reg)))
@@ -299,7 +307,7 @@
   ;; would probably be nice to restore GENGC support so that the Alpha
   ;; doesn't have to crawl along with stop'n'copy. When we do, the CMU
   ;; CL code below will need updating to the SBCL way of looking at
-  ;; things, e.g. at least using "SB-KERNEL" or "SB!KERNEL" instead of
+  ;; things, e.g. at least using "SB-KERNEL" or "SB-KERNEL" instead of
   ;; :KERNEL. -- WHN 2001-05-08
   (error "This code is stale as of sbcl-0.6.12."))
 

@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;; Heap (for the priority queue)
 
@@ -132,7 +132,7 @@
              (:conc-name %timer-)
              (:constructor
               make-timer
-              (function &key name (thread sb!thread:*current-thread*)))
+              (function &key name (thread sb-thread:*current-thread*)))
              (:copier nil))
   "Timer type. Do not rely on timers being structs as it may change in
 future versions."
@@ -141,7 +141,7 @@ future versions."
   (expire-time        1   :type (or null real))
   (repeat-interval    nil :type (or null (real 0)))
   (catch-up           nil :type boolean)
-  (thread             nil :type (or sb!thread:thread boolean))
+  (thread             nil :type (or sb-thread:thread boolean))
   (interrupt-function nil :type (or null function))
   (cancel-function    nil :type (or null function)))
 
@@ -155,7 +155,7 @@ future versions."
           ;; identity
           ))))
 
-(setf (fdocumentation 'make-timer 'function)
+(setf (documentation 'make-timer 'function)
       "Create a timer that runs FUNCTION when triggered.
 
 If a THREAD is supplied, FUNCTION is run in that thread. If THREAD is
@@ -182,15 +182,15 @@ from now. For timers with a repeat interval it returns true."
 
 ;;; The scheduler
 
-(define-load-time-global *scheduler-lock* (sb!thread:make-mutex :name "Scheduler lock"))
+(define-load-time-global *scheduler-lock* (sb-thread:make-mutex :name "Scheduler lock"))
 
 (defmacro with-scheduler-lock ((&optional) &body body)
   ;; Don't let the SIGALRM handler mess things up.
-  `(sb!thread::with-system-mutex (*scheduler-lock*)
+  `(sb-thread::with-system-mutex (*scheduler-lock*)
      ,@body))
 
 (defun under-scheduler-lock-p ()
-  (sb!thread:holding-mutex-p *scheduler-lock*))
+  (sb-thread:holding-mutex-p *scheduler-lock*))
 
 (define-load-time-global *schedule* (make-priority-queue :key #'%timer-expire-time))
 
@@ -210,7 +210,7 @@ from now. For timers with a repeat interval it returns true."
 (defun make-cancellable-interruptor (timer)
   ;; return a list of two functions: one that does the same as
   ;; FUNCTION until the other is called, from when it does nothing.
-  (let ((mutex (sb!thread:make-mutex))
+  (let ((mutex (sb-thread:make-mutex))
         (cancelledp nil)
         (function (if (%timer-repeat-interval timer)
                       (lambda ()
@@ -223,12 +223,12 @@ from now. For timers with a repeat interval it returns true."
        ;; Use WITHOUT-INTERRUPTS for the acquiring lock to avoid
        ;; unblocking deferrables unless it's inevitable.
        (without-interrupts
-         (sb!thread:with-recursive-lock (mutex)
+         (sb-thread:with-recursive-lock (mutex)
            (unless cancelledp
              (allow-with-interrupts
                (funcall function))))))
      (lambda ()
-       (sb!thread:with-recursive-lock (mutex)
+       (sb-thread:with-recursive-lock (mutex)
          (setq cancelledp t))))))
 
 (defun %schedule-timer (timer)
@@ -317,8 +317,8 @@ triggers."
                     (catch-up (%timer-catch-up timer))
                     (thread (%timer-thread timer)))
     (when expire-time
-      (if (and (sb!thread::thread-p thread)
-               (not (sb!thread:thread-alive-p thread)))
+      (if (and (sb-thread::thread-p thread)
+               (not (sb-thread:thread-alive-p thread)))
           (unschedule-timer timer)
           (with-scheduler-lock ()
             ;; Schedule at regular intervals. If TIMER has not finished
@@ -363,12 +363,12 @@ triggers."
   (defvar *timer-thread* nil)
 
   (defun get-waitable-timer ()
-    (assert (under-scheduler-lock-p))
+    (aver (under-scheduler-lock-p))
     (or *waitable-timer-handle*
         (prog1
             (setf *waitable-timer-handle* (os-create-wtimer))
           (setf *timer-thread*
-                (sb!thread:make-thread
+                (sb-thread:make-thread
                  (lambda ()
                    (loop while
                         (or (zerop
@@ -381,8 +381,8 @@ triggers."
   (defun itimer-emulation-deinit ()
     (with-scheduler-lock ()
       (when *timer-thread*
-        (sb!thread:terminate-thread *timer-thread*)
-        (sb!thread:join-thread *timer-thread* :default nil))
+        (sb-thread:terminate-thread *timer-thread*)
+        (sb-thread:join-thread *timer-thread* :default nil))
       (when *waitable-timer-handle*
         (os-close-wtimer *waitable-timer-handle*)
         (setf *waitable-timer-handle* nil))))
@@ -412,14 +412,14 @@ triggers."
 #!-(or sb-wtimer win32)
 (progn
   (defun %set-system-timer (sec nsec)
-    (sb!unix:unix-setitimer :real 0 0 sec (ceiling nsec 1000)))
+    (sb-unix:unix-setitimer :real 0 0 sec (ceiling nsec 1000)))
 
   (defun %clear-system-timer ()
-    (sb!unix:unix-setitimer :real 0 0 0 0)))
+    (sb-unix:unix-setitimer :real 0 0 0 0)))
 
 (defun set-system-timer ()
-  (assert (under-scheduler-lock-p))
-  (assert (not *interrupts-enabled*))
+  (aver (under-scheduler-lock-p))
+  (aver (not *interrupts-enabled*))
   (let ((next-timer (peek-schedule)))
     (if next-timer
         (let ((delta (- (%timer-expire-time next-timer)
@@ -432,12 +432,16 @@ triggers."
   (let ((function (%timer-interrupt-function timer))
         (thread (%timer-thread timer)))
     (if (eq t thread)
-        (sb!thread:make-thread function :name (format nil "Timer ~A"
+        (sb-thread:make-thread function :name (format nil "Timer ~A"
                                                       (%timer-name timer)))
-        (let ((thread (or thread sb!thread:*current-thread*)))
+        ;; Don't run the timer directly in the current thread.
+        ;; The signal that interrupt-thread sends is blocked so it'll get queued
+        ;; and processed after exiting from SIGALRM-HANDLER.
+        ;; That way we process all pending signals and release the *SCHEDULER-LOCK*.
+        (let ((thread (or thread sb-thread:*current-thread*)))
           (handler-case
-              (sb!thread:interrupt-thread thread function)
-            (sb!thread:interrupt-thread-error (c)
+              (sb-thread:interrupt-thread thread function)
+            (sb-thread:interrupt-thread-error (c)
               (declare (ignore c))
               (warn "Timer ~S failed to interrupt thread ~S."
                     timer thread)))))))
@@ -459,7 +463,7 @@ triggers."
                    (set-system-timer)
                    (return-from run-expired-timers nil)
                 else
-                do (assert (eq timer (priority-queue-extract-maximum *schedule*)))
+                do (aver (eq timer (priority-queue-extract-maximum *schedule*)))
                    (push timer timers)))
         (run-timers)))))
 

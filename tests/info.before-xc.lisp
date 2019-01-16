@@ -13,18 +13,16 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 (/show "beginning tests/info.before-xc.lisp")
 
-(assert (eq (sb!int:info :variable :kind 'sb!vm:vector-data-offset)
-            :constant))
 ;;; It's possible in general for a constant to have the value NIL, but
 ;;; not for vector-data-offset, which must be a number:
-(assert (boundp 'sb!vm:vector-data-offset))
-(assert (integerp (symbol-value 'sb!vm:vector-data-offset)))
+(assert (constantp 'sb-vm:vector-data-offset))
+(assert (integerp (symbol-value 'sb-vm:vector-data-offset)))
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 (let ((foo-iv (packed-info-insert +nil-packed-infos+ +no-auxilliary-key+
                                   5 "hi 5"))
@@ -127,9 +125,5 @@
     (verify `(((SETF ,s) (,+fdefn-info-num+ . "fdefn"))
               ((CAS ,s) (3 . "CAS-info#3"))
               ((FROB ,s) (15 . "FROB-info#15"))))))
-
-(let ((ht (make-info-hashtable)))
-  (setf (info-gethash '(hairy name) ht) :whatever)
-  (assert (eq (info-gethash (list 'hairy 'name) ht) :whatever)))
 
 (/show "done with tests/info.before-xc.lisp")

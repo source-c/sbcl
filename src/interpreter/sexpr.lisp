@@ -496,18 +496,20 @@
 (defun err-too-few-args (fun n-args)
   (declare (explicit-check))
   (let ((frame (interpreted-function-frame fun)))
-    (ip-error "~S received ~D argument~:P but expects~:[ at least~;~] ~D."
-           (name-for-fun fun) n-args
-           (eql (lambda-frame-min-args frame) (lambda-frame-max-args frame))
-           (lambda-frame-min-args frame))))
+    (%program-error "~S received ~D argument~:P but expects~:[ at least~;~] ~D."
+                    (name-for-fun fun) n-args
+                    (eql (lambda-frame-min-args frame)
+                         (lambda-frame-max-args frame))
+                    (lambda-frame-min-args frame))))
 
 (defun err-too-many-args (fun n-args)
   (declare (explicit-check))
   (let ((frame (interpreted-function-frame fun)))
-    (ip-error "~S received ~D argument~:P but expects~:[ at most~;~] ~D"
-           (name-for-fun fun) n-args
-           (eql (lambda-frame-min-args frame) (lambda-frame-max-args frame))
-           (lambda-frame-max-args frame))))
+    (%program-error "~S received ~D argument~:P but expects~:[ at most~;~] ~D"
+                    (name-for-fun fun) n-args
+                    (eql (lambda-frame-min-args frame)
+                         (lambda-frame-max-args frame))
+                    (lambda-frame-max-args frame))))
 
 (defmacro with-lambda-frame ((frame-var fun if-invalid) &body if-valid)
   ;; If any global variable has changed its :KIND, this function's lambda
@@ -530,7 +532,7 @@
                (if (oddp n-more)
                    (fail-odd-length (+ n-seen n-more)))))
            (fail-odd-length (n)
-             (ip-error "odd number of &KEY arguments: ~D" n))
+             (%program-error "odd number of &KEY arguments: ~D" n))
            (fail-other-key ()
              (let ((n-allowed (keyword-bits-n-keys control-bits)) bad)
                (loop for (key val) on list by #'cddr ; rescan to collect them
@@ -538,10 +540,11 @@
                                 (find key allowed :end n-allowed))
                      do (pushnew key bad))
                (let ((plural (cdr bad)))
-                 (ip-error "Keyword~*~:[~;s~]~2:* ~{~S~^,~} ~:[is~;are~] not ~
-                            ~:[allowed.~;in the allowed set ~:*~S~]"
-                           (nreverse bad) plural
-                           (replace (make-list n-allowed) allowed))))))
+                 (%program-error "Keyword~*~:[~;s~]~2:* ~{~S~^,~} ~
+                                  ~:[is~;are~] not ~:[allowed.~;in the ~
+                                  allowed set ~:*~S~]"
+                                 (nreverse bad) plural
+                                 (replace (make-list n-allowed) allowed))))))
     (if (keyword-bits-allowp control-bits)
         (check-odd-length list 0)
         (let ((n-allowed (keyword-bits-n-keys control-bits))
@@ -578,7 +581,7 @@
   (setf (values (interpreted-function-frame fun)
                 (interpreted-function-cookie fun))
         (proto-fn-frame (fun-proto-fn fun) (interpreted-function-env fun)))
-  (apply (setf (funcallable-instance-fun fun) (interpreted-applicator fun))
+  (apply (setf (%funcallable-instance-fun fun) (interpreted-applicator fun))
          args))
 
 ;;; The most general case of interpreted function application.
@@ -706,7 +709,7 @@
                     (frame fun (interpreter-trampoline fun ,@args))
                   (dispatch (lambda-frame-sexpr frame)
                             (new-env make-var-env
-                                     ,(if (zerop n) nil `(vector ,@args))))))
+                                     ,(if (zerop n) #() `(vector ,@args))))))
               (named-lambda (.apply. ,n) ,args
                 (declare #.+handler-optimize+ (optimize sb-c:verify-arg-count))
                 (with-lambda-frame
@@ -715,7 +718,7 @@
                     (catch exit
                       (dispatch (lambda-frame-sexpr frame)
                                 (new-env make-lambda-env
-                                         ,(if (zerop n) nil `(vector ,@args))
+                                         ,(if (zerop n) #() `(vector ,@args))
                                          exit)))))))))
     (case (lambda-frame-min-args (interpreted-function-frame fun))
       (5 (invoke 5))
@@ -950,7 +953,7 @@ Test case.
 
 (defun arglist-to-sexprs (args)
   (let ((argc (or (list-length args)
-                  (ip-error "Malformed function call"))))
+                  (%program-error "Malformed function call"))))
     (values (mapcar #'%sexpr args) argc)))
 
 ;;; Return a handler which decides whether its supplied SEXPR needs
@@ -1157,16 +1160,32 @@ Test case.
       (let ((f (symbol-function fname)))
         (when (and (interpreted-function-p f)
                    (structure-instance-accessor-p fname))
-          ;: Compile the accessor. If it was defined in a non-null environment,
-          ;; conversion to a lexenv could say "too complex", so we want to
-          ;; force it. Passing two arguments to COMPILE achieves this.
+          ;: Compile the accessor using an explicit call to COMPILE with a
+          ;; lambda expression. Don't simply call (COMPILE FNAME) because
+          ;; if it was defined in a non-null environment, conversion to a
+          ;; lexenv could say "too complex". Additionally the debug source
+          ;; info would be misleading.
           ;; We can be confident that the expression doesn't need a lexenv,
           ;; because if the function were incompatible with the source-transform,
           ;; %DEFUN would have cleared the :source-transform, and fname would not
           ;; satisfy STRUCTURE-INSTANCE-ACCESSOR-P.
           #+nil (format t "~&; Interpreter: Compiling ~S~%" fname)
           ;; FIXME: ensure that the compiled function is safe.
-          (compile fname (function-lambda-expression f)))))
+          (let* ((compiled-fun (compile nil (function-lambda-expression f)))
+                 (code (fun-code-header compiled-fun))
+                 (cdi (%code-debug-info code))
+                 (source (sb-c::compiled-debug-info-source cdi)))
+            ;; Ensure that the debug-source-namestring of the compiled thing
+            ;; reflects the source file of the original interpreted function.
+            (setf (debug-source-namestring source)
+                  (sb-kernel::function-file-namestring f)
+                  (debug-source-created source) nil) ; = unknown
+            ;; Clobber the TLF-NUM + OFFSET. We should do better that that,
+            ;; but interpreted functions do not track their file offset,
+            ;; so the conservative thing is to plug in NILs, not bogus values
+            ;; from whatever file (if any) is currently being loaded.
+            (setf (sb-c::compiled-debug-info-tlf-num+offset cdi) 0)
+            (setf (symbol-function fname) compiled-fun)))))
 
     (when (fluid-def-p fname)
       ;; Return a handler that calls FNAME very carefully

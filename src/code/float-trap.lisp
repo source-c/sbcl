@@ -12,7 +12,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 
@@ -181,14 +181,14 @@ sets the floating point modes to their current values (and thus is a no-op)."
 #!-win32
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defconstant-eqx +sigfpe-code-error-alist+
-    `((,sb!unix::fpe-intovf . floating-point-overflow)
-      (,sb!unix::fpe-intdiv . division-by-zero)
-      (,sb!unix::fpe-fltdiv . division-by-zero)
-      (,sb!unix::fpe-fltovf . floating-point-overflow)
-      (,sb!unix::fpe-fltund . floating-point-underflow)
-      (,sb!unix::fpe-fltres . floating-point-inexact)
-      (,sb!unix::fpe-fltinv . floating-point-invalid-operation)
-      (,sb!unix::fpe-fltsub . floating-point-exception))
+    `((,sb-unix::fpe-intovf . floating-point-overflow)
+      (,sb-unix::fpe-intdiv . division-by-zero)
+      (,sb-unix::fpe-fltdiv . division-by-zero)
+      (,sb-unix::fpe-fltovf . floating-point-overflow)
+      (,sb-unix::fpe-fltund . floating-point-underflow)
+      (,sb-unix::fpe-fltres . floating-point-inexact)
+      (,sb-unix::fpe-fltinv . floating-point-invalid-operation)
+      (,sb-unix::fpe-fltsub . floating-point-exception))
     #'equal))
 
 ;;; Signal the appropriate condition when we get a floating-point error.
@@ -196,13 +196,13 @@ sets the floating point modes to their current values (and thus is a no-op)."
 (defun sigfpe-handler (signal info context)
   (declare (ignore signal))
   (declare (type system-area-pointer info))
-  (let ((code (sb!unix::siginfo-code info)))
-    (multiple-value-bind (op operands) (sb!di::decode-arithmetic-error-operands context)
+  (let ((code (sb-unix::siginfo-code info)))
+    (multiple-value-bind (op operands) (sb-di::decode-arithmetic-error-operands context)
      (with-interrupts
        ;; Reset the accumulated exceptions, may be needed on other
        ;; platforms too, at least Linux doesn't seem to require it.
        #!+(or sunos (and hppa linux))
-       (setf (ldb sb!vm::float-sticky-bits (floating-point-modes)) 0)
+       (setf (ldb sb-vm:float-sticky-bits (floating-point-modes)) 0)
        (error (or (cdr (assoc code +sigfpe-code-error-alist+))
                   'floating-point-exception)
               :operation op

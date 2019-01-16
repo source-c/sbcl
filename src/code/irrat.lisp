@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 ;;;; miscellaneous constants, utility functions, and macros
 
@@ -18,34 +18,35 @@
   #!+long-float 3.14159265358979323846264338327950288419716939937511l0
   #!-long-float 3.14159265358979323846264338327950288419716939937511d0)
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defun handle-reals (function var)
+    `((((foreach fixnum single-float bignum ratio))
+       (coerce (,function (coerce ,var 'double-float)) 'single-float))
+      ((double-float)
+       (,function ,var))))
+
+  (defun handle-complex (form)
+    `((((foreach (complex double-float) (complex single-float) (complex rational)))
+       ,form))))
+
 ;;; Make these INLINE, since the call to C is at least as compact as a
 ;;; Lisp call, and saves number consing to boot.
-(eval-when (:compile-toplevel :execute)
-
-(sb!xc:defmacro def-math-rtn (name num-args &optional wrapper)
+(defmacro def-math-rtn (name num-args &optional wrapper)
   (let ((function (symbolicate "%" (string-upcase name)))
         (args (loop for i below num-args
                     collect (intern (format nil "ARG~D" i)))))
     `(progn
        (declaim (inline ,function))
        (defun ,function ,args
-         (alien-funcall
-          (extern-alien ,(format nil "~:[~;sb_~]~a" wrapper name)
-                        (function double-float
-                                  ,@(loop repeat num-args
-                                          collect 'double-float)))
-          ,@args)))))
+         (truly-the ;; avoid checking the result
+          ,(type-specifier (fun-type-returns (info :function :type function)))
+          (alien-funcall
+           (extern-alien ,(format nil "~:[~;sb_~]~a" wrapper name)
+                         (function double-float
+                                   ,@(loop repeat num-args
+                                           collect 'double-float)))
+           ,@args))))))
 
-(defun handle-reals (function var)
-  `((((foreach fixnum single-float bignum ratio))
-     (coerce (,function (coerce ,var 'double-float)) 'single-float))
-    ((double-float)
-     (,function ,var))))
-
-(defun handle-complex (form)
-  `((((foreach (complex double-float) (complex single-float) (complex rational)))
-     ,form)))
-) ; EVAL-WHEN
 
 #!+x86 ;; for constant folding
 (macrolet ((def (name ll)
@@ -347,13 +348,13 @@
   ;;
   ;; Motivated by an attempt to get LOG to work better on bignums.
   (let ((n (integer-length x)))
-    (if (< n sb!vm:double-float-digits)
+    (if (< n sb-vm:double-float-digits)
         (log (coerce x 'double-float) 2.0d0)
-        (let ((f (ldb (byte sb!vm:double-float-digits
-                            (- n sb!vm:double-float-digits))
+        (let ((f (ldb (byte sb-vm:double-float-digits
+                            (- n sb-vm:double-float-digits))
                       x)))
           (+ n (log (scale-float (coerce f 'double-float)
-                                 (- sb!vm:double-float-digits))
+                                 (- sb-vm:double-float-digits))
                     2.0d0))))))
 
 (defun log (number &optional (base nil base-p))
@@ -705,7 +706,7 @@
 ;;;;   Raymond Toy at <email address deleted during 2002 spam avalanche>.
 
 ;;; FIXME: In SBCL, the floating point infinity constants like
-;;; SB!EXT:DOUBLE-FLOAT-POSITIVE-INFINITY aren't available as
+;;; SB-EXT:DOUBLE-FLOAT-POSITIVE-INFINITY aren't available as
 ;;; constants at cross-compile time, because the cross-compilation
 ;;; host might not have support for floating point infinities. Thus,
 ;;; they're effectively implemented as special variable references,
@@ -763,7 +764,7 @@
          x)
         ((float-infinity-p x)
          ;; DOUBLE-FLOAT-POSITIVE-INFINITY
-         (double-from-bits 0 (1+ sb!vm:double-float-normal-exponent-max) 0))
+         (double-from-bits 0 (1+ sb-vm:double-float-normal-exponent-max) 0))
         ((zerop x)
          ;; The answer is negative infinity, but we are supposed to
           ;; signal divide-by-zero, so do the actual division
@@ -796,7 +797,7 @@
 #!+long-float (eval-when (:compile-toplevel :load-toplevel :execute)
                 (error "needs work for long float support"))
 (defun cssqs (z)
-  (declare (muffle-conditions t))
+  (declare (muffle-conditions compiler-note))
   (let ((x (float (realpart z) 1d0))
         (y (float (imagpart z) 1d0)))
     ;; Would this be better handled using an exception handler to
@@ -812,7 +813,7 @@
                       (float-infinity-p (abs y))))
              ;; DOUBLE-FLOAT-POSITIVE-INFINITY
              (values
-              (double-from-bits 0 (1+ sb!vm:double-float-normal-exponent-max) 0)
+              (double-from-bits 0 (1+ sb-vm:double-float-normal-exponent-max) 0)
               0))
             ((let ((threshold
                     ;; (/ least-positive-double-float double-float-epsilon)
@@ -821,12 +822,12 @@
                      (make-double-float #x1fffff #xfffffffe)
                      #!+long-float
                      (error "(/ least-positive-long-float long-float-epsilon)")))
-                   (traps (ldb sb!vm::float-sticky-bits
-                               (sb!vm:floating-point-modes))))
+                   (traps (ldb sb-vm:float-sticky-bits
+                               (sb-vm:floating-point-modes))))
                 ;; Overflow raised or (underflow raised and rho <
                 ;; lambda/eps)
-               (or (not (zerop (logand sb!vm:float-overflow-trap-bit traps)))
-                   (and (not (zerop (logand sb!vm:float-underflow-trap-bit
+               (or (not (zerop (logand sb-vm:float-overflow-trap-bit traps)))
+                   (and (not (zerop (logand sb-vm:float-underflow-trap-bit
                                             traps)))
                         (< rho threshold))))
               ;; If we're here, neither x nor y are infinity and at
@@ -887,7 +888,7 @@
 ;;;
 ;;; Z may be any number, but the result is always a complex.
 (defun complex-log (z)
-  (declare (muffle-conditions t))
+  (declare (muffle-conditions compiler-note))
   (declare (type (or rational complex) z))
   ;; The constants t0, t1, t2 should be evaluated to machine
   ;; precision.  In addition, Kahan says the accuracy of log1p
@@ -936,7 +937,7 @@
 ;;; i*y is never 0 since we have positive and negative zeroes. -- rtoy
 ;;; Compute atanh z = (log(1+z) - log(1-z))/2.
 (defun complex-atanh (z)
-  (declare (muffle-conditions t))
+  (declare (muffle-conditions compiler-note))
   (declare (type (or rational complex) z))
   (let* (;; constants
          (theta (/ (sqrt most-positive-double-float) 4.0d0))
@@ -994,7 +995,7 @@
 
 ;;; Compute tanh z = sinh z / cosh z.
 (defun complex-tanh (z)
-  (declare (muffle-conditions t))
+  (declare (muffle-conditions compiler-note))
   (declare (type (or rational complex) z))
   (let ((x (float (realpart z) 1.0d0))
         (y (float (imagpart z) 1.0d0)))

@@ -10,7 +10,10 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
+
+(declaim (type fixnum *compiler-sset-counter*))
+(defvar *compiler-sset-counter* 0)
 
 ;;; The front-end data structure (IR1) is composed of nodes,
 ;;; representing actual evaluations. Linear sequences of nodes in
@@ -90,8 +93,62 @@
   ;; if the LVAR value is DYNAMIC-EXTENT, CLEANUP protecting it.
   (dynamic-extent nil :type (or null cleanup))
   ;; something or other that the back end annotates this lvar with
-  (info nil))
+  (info nil)
+  (dependent-casts nil)
+  (annotations nil)
+  (dependent-annotations nil))
 (!set-load-form-method lvar (:xc :target) :ignore-it)
+
+;;; These are used for annottating a LVAR with information that can't
+;;; be expressed using types.
+;;; Right now it's basically used for tracking constants and checking
+;;; them for things like proper sequence, or valid type specifier.
+(defstruct lvar-annotation
+  (source-path nil :type list)
+  lexenv
+  fired)
+
+(defprinter (lvar-annotation)
+  fired)
+
+(defstruct (lvar-modified-annotation
+            (:include lvar-annotation)
+            (:copier nil))
+  caller)
+
+(defstruct (lvar-hook
+            (:include lvar-annotation)
+            (:copier nil))
+  (hook #'missing-arg :type function))
+
+(defstruct (lvar-type-spec-annotation
+            (:include lvar-hook)
+            (:copier nil)))
+
+(defstruct (lvar-proper-sequence-annotation
+            (:include lvar-annotation)
+            (:copier nil))
+  (kind 'proper-sequence :type (member proper-list proper-sequence
+                                       proper-or-circular-list proper-or-dotted-list)))
+
+(defstruct (lvar-dependent-annotation
+             (:include lvar-annotation)
+             (:copier nil))
+    (deps nil :type list))
+
+(defstruct (lvar-function-designator-annotation
+             (:include lvar-dependent-annotation)
+             (:copier nil))
+  (caller nil :type symbol)
+  (arg-specs nil :type list)
+  (result-specs nil :type list)
+  type)
+
+(defstruct (lvar-function-annotation
+             (:include lvar-annotation)
+             (:copier nil))
+  type
+  context)
 
 (defmethod print-object ((x lvar) stream)
   (print-unreadable-object (x stream :type t :identity t)
@@ -120,7 +177,9 @@
   (setf (lvar-%externally-checkable-type lvar) nil))
 
 (def!struct (node (:constructor nil)
-                  (:include sset-element (number (incf *compiler-sset-counter*)))
+                  (:include sset-element
+                            (number (unless (eql *compiler-sset-counter* 0)
+                                      (incf *compiler-sset-counter*))))
                   (:copier nil))
   ;; unique ID for debugging
   #!+sb-show (id (new-object-id) :read-only t)
@@ -177,6 +236,7 @@
 
 (defun %with-ir1-environment-from-node (node fun)
   (declare (type node node) (type function fun))
+  #-sb-xc-host (declare (dynamic-extent fun)) ; "unable"
   (let ((*current-component* (node-component node))
         (*lexenv* (node-lexenv node))
         (*current-path* (node-source-path node)))
@@ -214,14 +274,8 @@
 ;;;    set, since they may:
 ;;;     - be in the process of being deleted, or
 ;;;     - have no successors.
-;;; -- TYPE-ASSERTED, TEST-MODIFIED
-;;;    These flags are used to indicate that something in this block
-;;;    might be of interest to constraint propagation. TYPE-ASSERTED
-;;;    is set when an lvar type assertion is strengthened.
-;;;    TEST-MODIFIED is set whenever the test for the ending IF has
-;;;    changed (may be true when there is no IF.)
 (!def-boolean-attribute block
-  reoptimize flush-p type-check delete-p type-asserted test-modified)
+  reoptimize flush-p type-check delete-p)
 
 (macrolet ((defattr (block-slot)
              `(defmacro ,block-slot (block)
@@ -231,9 +285,7 @@
   (defattr block-reoptimize)
   (defattr block-flush-p)
   (defattr block-type-check)
-  (defattr block-delete-p)
-  (defattr block-type-asserted)
-  (defattr block-test-modified))
+  (defattr block-delete-p))
 
 (def!struct (cloop (:conc-name loop-)
                    (:predicate loop-p)
@@ -290,13 +342,13 @@
                     (:copier nil)
                     (:conc-name block-)
                     (:predicate block-p))
-  ;; a list of all the blocks that are predecessors/successors of this
-  ;; block. In well-formed IR1, most blocks will have one successor.
-  ;; The only exceptions are:
-  ;;  1. component head blocks (any number)
-  ;;  2. blocks ending in an IF (1 or 2)
-  ;;  3. blocks with DELETE-P set (zero)
-  (pred nil :type list)
+    ;; a list of all the blocks that are predecessors/successors of this
+    ;; block. In well-formed IR1, most blocks will have one successor.
+    ;; The only exceptions are:
+    ;;  1. component head blocks (any number)
+    ;;  2. blocks ending in an IF (1 or 2)
+    ;;  3. blocks with DELETE-P set (zero)
+    (pred nil :type list)
   (succ nil :type list)
   ;; the ctran which heads this block (a :BLOCK-START), or NIL when we
   ;; haven't made the start ctran yet (and in the dummy component head
@@ -311,8 +363,7 @@
   (next nil :type (or null cblock))
   (prev nil :type (or null cblock))
   ;; This block's attributes: see above.
-  (flags (block-attributes reoptimize flush-p type-check type-asserted
-                           test-modified)
+  (flags (block-attributes reoptimize flush-p type-check)
          :type attributes)
   ;; in constraint propagation: list of LAMBDA-VARs killed in this block
   ;; in copy propagation: list of killed TNs
@@ -386,7 +437,7 @@
   ;; During make-host-2, the solution to this is the same hack
   ;; as for everything else: use DEF!STRUCT for IR2-COMPONENT.
   #!+(and (host-feature sb-xc-host) (host-feature sbcl))
-  (declare (sb-ext:muffle-conditions style-warning))
+  (declare (host-sb-ext:muffle-conditions style-warning))
 (def!struct (component (:copier nil)
                        (:constructor
                         make-component
@@ -396,6 +447,10 @@
                          (outer-loop (make-loop :kind :outer :head head)))))
   ;; unique ID for debugging
   #!+sb-show (id (new-object-id) :read-only t)
+  ;; space where this component will be allocated in
+  ;; :auto won't make any codegen optimizations pertinent to immobile space,
+  ;; but will place the code there given sufficient available space.
+  (%mem-space nil :type (member nil :dynamic :immobile :auto))
   ;; the kind of component
   ;;
   ;; (The terminology here is left over from before
@@ -538,7 +593,8 @@
   ;; the kind of thing that has to be cleaned up
   (kind (missing-arg)
         :type (member :special-bind :catch :unwind-protect
-                      :block :tagbody :dynamic-extent))
+                      :block :tagbody :dynamic-extent
+                      #!-c-stack-is-control-stack :restore-nsp))
   ;; the node that messes things up. This is the last node in the
   ;; non-messed-up environment. Null only temporarily. This could be
   ;; deleted due to unreachability.
@@ -680,7 +736,9 @@
 ;;; structures. A reference to a LEAF is indicated by a REF node. This
 ;;; allows us to easily substitute one for the other without actually
 ;;; hacking the flow graph.
-(def!struct (leaf (:include sset-element (number (incf *compiler-sset-counter*)))
+(def!struct (leaf (:include sset-element
+                            (number (unless (eql *compiler-sset-counter* 0)
+                                      (incf *compiler-sset-counter*))))
                   (:copier nil)
                   (:constructor nil))
   ;; unique ID for debugging
@@ -740,8 +798,6 @@
       extent)))
 
 ;;; LEAF name operations
-;;;
-;;; KLUDGE: wants CLOS..
 (defun leaf-has-source-name-p (leaf)
   (not (eq (leaf-%source-name leaf)
            '.anonymous.)))
@@ -763,7 +819,17 @@
   ;; kind of variable described
   (kind (missing-arg)
         :type (member :special :global-function :global :unknown)))
-(defprinter (global-var :identity t)
+
+(defun pretty-print-global-var (var stream)
+  (let ((name (leaf-source-name var)))
+    (princ (if (eq (global-var-kind var) :global-function)
+               `(function ,name)
+               name)
+           stream)))
+
+(defprinter (global-var :identity t
+             :pretty-ir-printer
+             (pretty-print-global-var structure stream))
   %source-name
   #!+sb-show id
   (type :test (not (eq type *universal-type*)))
@@ -775,8 +841,8 @@
   (typecase env
     (null nil)
     #!+(and sb-fasteval (host-feature sb-xc))
-    (sb!interpreter:basic-env
-     (values (sb!interpreter:find-lexical-fun env name)))
+    (sb-interpreter:basic-env
+     (values (sb-interpreter:find-lexical-fun env name)))
     (t
      (let ((fun (cdr (assoc name (lexenv-funs env) :test #'equal))))
        (and fun (not (global-var-p fun)))))))
@@ -799,7 +865,8 @@
   ;; RECOGNIZE-KNOWN-CALL) - we need separate functionals for each policy in
   ;; which the function is used.
   (functionals nil :type list))
-(defprinter (defined-fun :identity t)
+(defprinter (defined-fun :identity t
+             :pretty-ir-printer (pretty-print-global-var structure stream))
   %source-name
   #!+sb-show id
   inlinep
@@ -959,8 +1026,20 @@
   (xref () :type list)
   ;; True if this functional was created from an inline expansion. This
   ;; is either T, or the GLOBAL-VAR for which it is an expansion.
-  (inline-expanded nil))
-(defprinter (functional :identity t)
+  (inline-expanded nil)
+  ;; Is it coming from a top-level NAMED-LAMBDA?
+  (top-level-defun-p nil))
+
+(defun pretty-print-functional (functional stream)
+  (let ((name (functional-debug-name functional)))
+    (princ `(function
+             ,(if (typep name '(cons (member xep tl-xep)))
+                  (cadr name)
+                  name))
+           stream)))
+
+(defprinter (functional :identity t
+             :pretty-ir-printer (pretty-print-functional structure stream))
   %source-name
   %debug-name
   #!+sb-show id)
@@ -1080,7 +1159,8 @@
   ;; the lambda itself is not, and the bindings introduced by it are considered
   ;; transparent by the nested DX analysis.
   (system-lambda-p nil :type boolean))
-(defprinter (clambda :conc-name lambda- :identity t)
+(defprinter (clambda :conc-name lambda- :identity t
+             :pretty-ir-printer (pretty-print-functional structure stream))
   %source-name
   %debug-name
   #!+sb-show id
@@ -1161,7 +1241,8 @@
   ;; be used by callers that supply at least MAX-ARGS arguments and
   ;; know what they are doing.
   (main-entry nil :type (or clambda null)))
-(defprinter (optional-dispatch :identity t)
+(defprinter (optional-dispatch :identity t
+             :pretty-ir-printer (pretty-print-functional structure stream))
   %source-name
   %debug-name
   #!+sb-show id
@@ -1267,8 +1348,6 @@
   (eql-var-constraints     nil :type (or null (array t 1)))
   (inheritable-constraints nil :type (or null (array t 1)))
   (private-constraints     nil :type (or null (array t 1)))
-  ;; Initial type of a LET variable as last seen by PROPAGATE-FROM-SETS.
-  (last-initial-type *universal-type* :type ctype)
   ;; The FOP handle of the lexical variable represented by LAMBDA-VAR
   ;; in the fopcompiler.
   (fop-value nil))
@@ -1309,7 +1388,9 @@
   ;; CONSTANT nodes are always anonymous, since we wish to coalesce named and
   ;; unnamed constants that are equivalent, we need to keep track of the
   ;; reference name for XREF.
-  (%source-name (missing-arg) :type symbol :read-only t))
+  (%source-name (missing-arg) :type symbol :read-only t)
+  ;; Constraints that cannot be expressed as NODE-DERIVED-TYPE
+  constraints)
 (defprinter (ref :identity t)
   #!+sb-show id
   (%source-name :test (neq %source-name '.anonymous.))
@@ -1371,12 +1452,14 @@
   ;; NOTINLINE. :ERROR is like :FULL, but means that we have
   ;; discovered that the call contains an error, and should not be
   ;; reconsidered for optimization.
-  (kind :full :type (member :local :full :error :known))
+  (kind :full :type (member :local :full :error :known
+                            :unknown-keys))
   ;; if a call to a known global function, contains the FUN-INFO.
   (fun-info nil :type (or fun-info null))
   ;; Untrusted type we have asserted for this combination.
   (type-validated-for-leaf nil)
   ;; some kind of information attached to this node by the back end
+  ;; or by CHECK-IMPORTANT-RESULT
   (info nil)
   (step-info))
 
@@ -1458,26 +1541,24 @@
   ;; T
   ;;    A type check is needed.
   (%type-check t :type (member t :external nil))
-  ;; the LEXENV for the deleted EXIT node for which this is the
-  ;; remaining value semantics. If NULL, we do not have exit value
-  ;; semantics and may be deleted based on type information.
-  (vestigial-exit-lexenv nil :type (or lexenv null))
-  ;; the LEXENV for the ENTRY node for the deleted EXIT node mentioned
-  ;; above. NULL if we do not have exit value semantics.
-  (vestigial-exit-entry-lexenv nil :type (or lexenv null))
   ;; the lvar which is checked
   (value (missing-arg) :type lvar)
   (context nil)
   ;; Avoid compile time type conflict warnings.
   ;; Used by things that expand into ETYPECASE.
-  (silent-conflict nil :type boolean))
+  (silent-conflict nil :type (or boolean (eql :style-warning))))
 (defprinter (cast :identity t)
   %type-check
   value
   asserted-type
-  type-to-check
-  vestigial-exit-lexenv
-  vestigial-exit-entry-lexenv)
+  type-to-check)
+
+;;; A filter to help order the value semantics of MULTIPLE-VALUE-PROG1
+(def!struct (vestigial-exit-cast (:include cast
+                                           (%type-check nil)
+                                           (asserted-type *wild-type*)
+                                           (type-to-check *wild-type*))
+                                 (:copier nil)))
 
 ;;; A cast that always follows %check-bound and they are deleted together.
 ;;; Created via BOUND-CAST ir1-translator by chaining it together with %check-bound.
@@ -1495,14 +1576,8 @@
   (array (missing-arg) :type lvar)
   (bound (missing-arg) :type lvar))
 
-;;; Used for marking CALLABLE arguments with unrecognizable LVARS in
-;;; VALID-CALLABLE-ARGUMENT so that it can be rerun in
-;;; IR1-OPTIMIZE-CAST with better information.
-;;; Also used by CALLABLE-CAST
-(def!struct (function-designator-cast (:include cast) (:copier nil))
-  (arg-count (missing-arg) :type index)
-  (caller nil :type symbol))
-
+;;; Inserted by ARRAY-CALL-TYPE-DERIVER so that it can be later deleted
+(def!struct (array-index-cast (:include cast) (:copier nil)))
 
 ;;;; non-local exit support
 ;;;;
@@ -1561,7 +1636,7 @@
   (typecase thing
     (policy thing)
     #!+(and sb-fasteval (host-feature sb-xc))
-    (sb!interpreter:basic-env (sb!interpreter:env-policy thing))
+    (sb-interpreter:basic-env (sb-interpreter:env-policy thing))
     (null **baseline-policy**)
     (t (lexenv-policy (etypecase thing
                         (lexenv thing)
@@ -1573,7 +1648,7 @@
 ;; FIXME: the frozen-ness can't actually help optimize anything
 ;; until this file is compiled by the cross-compiler.
 ;; Anything compiled prior to then uses the non-frozen classoid as existed
-;; at load-time of the cross-compiler. SB!XC:PROCLAIM would likely work here.
+;; at load-time of the cross-compiler. SB-XC:PROCLAIM would likely work here.
 #!-sb-fluid
 (declaim (freeze-type node lexenv ctran lvar cblock component cleanup
                       physenv tail-set nlx-info))

@@ -9,59 +9,61 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; exported printer control variables
 
-(!defvar *print-readably* nil
+;; NB: all of the following are initialized during genesis
+(defparameter *print-readably* nil
   "If true, all objects will be printed readably. If readable printing
   is impossible, an error will be signalled. This overrides the value of
   *PRINT-ESCAPE*.")
-(!defvar *print-escape* t
+(defparameter *print-escape* t
   "Should we print in a reasonably machine-readable way? (possibly
   overridden by *PRINT-READABLY*)")
-(!defvar *print-pretty* nil ; (set later when pretty-printer is initialized)
+(defparameter *print-pretty* nil ; (set later when pretty-printer is initialized)
   "Should pretty printing be used?")
-(!defvar *print-base* 10.
+(defparameter *print-base* 10.
   "The output base for RATIONALs (including integers).")
-(!defvar *print-radix* nil
+(defparameter *print-radix* nil
   "Should base be verified when printing RATIONALs?")
-(!defvar *print-level* nil
+(defparameter *print-level* nil
   "How many levels should be printed before abbreviating with \"#\"?")
-(!defvar *print-length* nil
+(defparameter *print-length* nil
   "How many elements at any level should be printed before abbreviating
   with \"...\"?")
-(!defvar *print-circle* nil
+(defparameter *print-circle* nil
   "Should we use #n= and #n# notation to preserve uniqueness in general (and
   circularity in particular) when printing?")
-(!defvar *print-case* :upcase
+(defparameter *print-case* :upcase
   "What case should the printer should use default?")
-(!defvar *print-array* t
+(defparameter *print-array* t
   "Should the contents of arrays be printed?")
-(!defvar *print-gensym* t
+(defparameter *print-gensym* t
   "Should #: prefixes be used when printing symbols with null SYMBOL-PACKAGE?")
-(!defvar *print-lines* nil
+(defparameter *print-lines* nil
   "The maximum number of lines to print per object.")
-(!defvar *print-right-margin* nil
+(defparameter *print-right-margin* nil
   "The position of the right margin in ems (for pretty-printing).")
-(!defvar *print-miser-width* nil
+(defparameter *print-miser-width* nil
   "If the remaining space between the current column and the right margin
    is less than this, then print using ``miser-style'' output. Miser
    style conditional newlines are turned on, and all indentations are
    turned off. If NIL, never use miser mode.")
 (defvar *print-pprint-dispatch*
-  (sb!pretty::make-pprint-dispatch-table) ; for type-correctness
+  (sb-pretty::make-pprint-dispatch-table) ; for type-correctness
   "The pprint-dispatch-table that controls how to pretty-print objects.")
-(!defvar *suppress-print-errors* nil
+(defparameter *suppress-print-errors* nil
   "Suppress printer errors when the condition is of the type designated by this
 variable: an unreadable object representing the error is printed instead.")
 
 ;; duplicate defglobal because this file is compiled before "reader"
-(defglobal *standard-readtable* nil)
+(define-load-time-global *standard-readtable* nil)
 
 (defun %with-standard-io-syntax (function)
   (declare (type function function))
-  (let ((*package* (load-time-value (find-package "COMMON-LISP-USER") t))
+  (declare (dynamic-extent function))
+  (let ((*package* #.(find-package "COMMON-LISP-USER"))
         (*print-array* t)
         (*print-base* 10)
         (*print-case* :upcase)
@@ -72,7 +74,7 @@ variable: an unreadable object representing the error is printed instead.")
         (*print-level* nil)
         (*print-lines* nil)
         (*print-miser-width* nil)
-        (*print-pprint-dispatch* sb!pretty::*standard-pprint-dispatch-table*)
+        (*print-pprint-dispatch* sb-pretty::*standard-pprint-dispatch-table*)
         (*print-pretty* nil)
         (*print-radix* nil)
         (*print-readably* t)
@@ -82,7 +84,8 @@ variable: an unreadable object representing the error is printed instead.")
         (*read-eval* t)
         (*read-suppress* nil)
         (*readtable* *standard-readtable*)
-        (*suppress-print-errors* nil))
+        (*suppress-print-errors* nil)
+        (*print-vector-length* nil))
     (funcall function)))
 
 ;;;; routines to print objects
@@ -188,7 +191,7 @@ variable: an unreadable object representing the error is printed instead.")
          (and *print-pretty* (pprint-dispatch object))
        (if pretty
            (with-simple-output-to-string (stream)
-              (sb!pretty::with-pretty-stream (stream)
+              (sb-pretty::with-pretty-stream (stream)
                 (funcall fun stream object)))
            (let ((buffer-size (approx-chars-in-repr object)))
              (let* ((string (make-string buffer-size :element-type 'base-char))
@@ -223,8 +226,8 @@ variable: an unreadable object representing the error is printed instead.")
     (+ (if (minusp object) 1 0) ; leading sign
        (if *print-radix* 4 0) ; #rNN or trailing decimal
        (ceiling (if (fixnump object)
-                    sb!vm:n-positive-fixnum-bits
-                    (* (%bignum-length object) sb!bignum::digit-size))
+                    sb-vm:n-positive-fixnum-bits
+                    (* (%bignum-length object) sb-bignum::digit-size))
                 bits-per-char))))
 
 ;;;; support for the PRINT-UNREADABLE-OBJECT macro
@@ -246,11 +249,12 @@ variable: an unreadable object representing the error is printed instead.")
       o)))
 
 ;;; guts of PRINT-UNREADABLE-OBJECT
-(defun %print-unreadable-object (object stream type identity &optional body)
+(defun %print-unreadable-object (object stream flags &optional body)
   (declare (type (or null function) body))
   (if *print-readably*
       (print-not-readable-error object stream)
-      (flet ((print-description ()
+      (flet ((print-description (&aux (type (logbitp 0 (truly-the (mod 4) flags)))
+                                      (identity (logbitp 1 flags)))
                (when type
                  (write (type-of object) :stream stream :circle nil
                                          :level nil :length nil)
@@ -288,7 +292,7 @@ variable: an unreadable object representing the error is printed instead.")
   (or (numberp x)
       (characterp x)
       (and (symbolp x)
-           (symbol-package x))))
+           (sb-xc:symbol-package x))))
 
 (defvar *in-print-error* nil)
 
@@ -303,7 +307,7 @@ variable: an unreadable object representing the error is printed instead.")
              (multiple-value-bind (fun pretty)
                  (and *print-pretty* (pprint-dispatch object))
                (if pretty
-                   (sb!pretty::with-pretty-stream (stream)
+                   (sb-pretty::with-pretty-stream (stream)
                      (funcall fun stream object))
                    (output-ugly-object stream object))))
            (handle-it (stream)
@@ -369,7 +373,7 @@ variable: an unreadable object representing the error is printed instead.")
       ;; If an instance has no layout, it has no PRINT-OBJECT method.
       ;; Additionally, if the object is an obsolete CONDITION, don't crash.
       ;; (There is no update-instance protocol for conditions)
-      (when (or (sb!kernel::undefined-classoid-p classoid)
+      (when (or (sb-kernel::undefined-classoid-p classoid)
                 (and (layout-invalid layout)
                      (logtest (layout-%flags layout) +condition-layout-flag+)))
         ;; not only is this unreadable, it's unprintable too.
@@ -383,7 +387,7 @@ variable: an unreadable object representing the error is printed instead.")
 (defmethod print-object ((object symbol) stream)
   (if (or *print-escape* *print-readably*)
       ;; Write so that reading back works
-      (output-symbol object (symbol-package object) stream)
+      (output-symbol object (sb-xc:symbol-package object) stream)
       ;; Write only the characters of the name, never the package
       (let ((rt *readtable*))
         (funcall (truly-the function
@@ -397,7 +401,7 @@ variable: an unreadable object representing the error is printed instead.")
     (flet ((output-token (name)
              (declare (type simple-string name))
              (cond ((or (and (readtable-normalization readtable)
-                             (not (sb!unicode:normalized-p name :nfkc)))
+                             (not (sb-unicode:normalized-p name :nfkc)))
                         (symbol-quotep name readtable))
                     ;; Output NAME surrounded with |'s,
                     ;; and with any embedded |'s or \'s escaped.
@@ -455,7 +459,7 @@ variable: an unreadable object representing the error is printed instead.")
 ;;; fixnum with bits set corresponding to attributes that the
 ;;; character has. At characters have at least one bit set, so we can
 ;;; search for any character with a positive test.
-(defvar *character-attributes*
+(define-load-time-global *character-attributes*
   (make-array 160 ; FIXME
               :element-type '(unsigned-byte 16)
               :initial-element 0))
@@ -490,14 +494,14 @@ variable: an unreadable object representing the error is printed instead.")
 ;;; lowest base in which that character is a digit.
 (declaim (type (simple-array (unsigned-byte 8) (128)) ; FIXME: range?
                *digit-bases*))
-(defvar *digit-bases*
+(define-load-time-global *digit-bases*
   (make-array 128 ; FIXME
               :element-type '(unsigned-byte 8)))
 
 (defun !printer-cold-init ()
 ;; The dispatch table will be changed later, so this doesn't really matter
 ;; except if a full call to WRITE wants to read the current binding.
-(setq *print-pprint-dispatch* (sb!pretty::make-pprint-dispatch-table))
+(setq *print-pprint-dispatch* (sb-pretty::make-pprint-dispatch-table))
 (setq *digit-bases* (make-array 128 ; FIXME
                                 :element-type '(unsigned-byte 8)
                                 :initial-element 36)
@@ -823,35 +827,49 @@ variable: an unreadable object representing the error is printed instead.")
 
 (defmethod print-object ((vector vector) stream)
   (let ((readably *print-readably*))
-    (cond ((stringp vector)
-           (cond ((and readably (not (typep vector '(vector character))))
-                  (output-unreadable-array-readably vector stream))
-                 ((or *print-escape* readably)
-                  (write-char #\" stream)
-                  (quote-string vector stream)
-                  (write-char #\" stream))
-                 (t
-                  (write-string vector stream))))
-          ((not (or *print-array* readably))
-           (output-terse-array vector stream))
-          ((bit-vector-p vector)
-           (write-string "#*" stream)
-           (dovector (bit vector)
-             ;; (Don't use OUTPUT-OBJECT here, since this code
-             ;; has to work for all possible *PRINT-BASE* values.)
-             (write-char (if (zerop bit) #\0 #\1) stream)))
-          ((or (not readably) (array-readably-printable-p vector))
-           (descend-into (stream)
-             (write-string "#(" stream)
-             (dotimes (i (length vector))
-               (unless (zerop i)
-                 (write-char #\space stream))
-               (punt-print-if-too-long i stream)
-               (output-object (aref vector i) stream))
-             (write-string ")" stream)))
+    (flet ((cut-length ()
+             (when (and (not readably)
+                        *print-vector-length*
+                        (> (length vector) *print-vector-length*))
+               (print-unreadable-object (vector stream :type t :identity t)
+                 (format stream "~A..."
+                         (make-array *print-vector-length*
+                                     :element-type (array-element-type vector)
+                                     :displaced-to vector)))
+               t)))
+      (cond ((stringp vector)
+             (cond ((and readably (not (typep vector '(vector character))))
+                    (output-unreadable-array-readably vector stream))
+                   ((and *print-escape*
+                         (cut-length)))
+                   ((or *print-escape* readably)
+                    (write-char #\" stream)
+                    (quote-string vector stream)
+                    (write-char #\" stream))
+                   (t
+                    (write-string vector stream))))
+            ((not (or *print-array* readably))
+             (output-terse-array vector stream))
+            ((bit-vector-p vector)
+             (cond ((cut-length))
+                   (t
+                    (write-string "#*" stream)
+                    (dovector (bit vector)
+                      ;; (Don't use OUTPUT-OBJECT here, since this code
+                      ;; has to work for all possible *PRINT-BASE* values.)
+                      (write-char (if (zerop bit) #\0 #\1) stream)))))
+            ((or (not readably) (array-readably-printable-p vector))
+             (descend-into (stream)
+               (write-string "#(" stream)
+               (dotimes (i (length vector))
+                 (unless (zerop i)
+                   (write-char #\space stream))
+                 (punt-print-if-too-long i stream)
+                 (output-object (aref vector i) stream))
+               (write-string ")" stream)))
 
-          (t
-           (output-unreadable-array-readably vector stream)))))
+            (t
+             (output-unreadable-array-readably vector stream))))))
 
 ;;; This function outputs a string quoting characters sufficiently
 ;;; so that someone can read it in again. Basically, put a slash in
@@ -995,7 +1013,7 @@ variable: an unreadable object representing the error is printed instead.")
 ;;;
 ;;; It doesn't need a lock, but if you work on SCRUB-POWER-CACHE or
 ;;; POWERS-FOR-BASE, see that you don't break the assumptions!
-(defglobal *power-cache* (make-array 37 :initial-element nil))
+(define-load-time-global *power-cache* (make-array 37 :initial-element nil))
 (declaim (type (simple-vector 37) *power-cache*))
 
 (defconstant +power-cache-integer-length-limit+ 2048)
@@ -1078,7 +1096,7 @@ variable: an unreadable object representing the error is printed instead.")
   ;; certainly quite platform dependent: this gives 87 for 32 bit
   ;; SBCL, which is about right at least for x86/Darwin.
   (if (or (fixnump integer)
-          (< (integer-length integer) (* 3 sb!vm:n-positive-fixnum-bits)))
+          (< (integer-length integer) (* 3 sb-vm:n-positive-fixnum-bits)))
       (%output-reasonable-integer-in-base integer base stream)
       (%output-huge-integer-in-base integer base stream)))
 
@@ -1170,9 +1188,6 @@ variable: an unreadable object representing the error is printed instead.")
 
 (defun flonum-to-string (x &optional width fdigits scale fmin)
   (declare (type float x))
-  ;; FIXME: I think only FORMAT-DOLLARS calls FLONUM-TO-STRING with
-  ;; possibly-negative X.
-  (setf x (abs x))
   (multiple-value-bind (e string)
       (if fdigits
           (flonum-to-digits x (min (- (+ fdigits (or scale 0)))
@@ -1243,9 +1258,9 @@ variable: an unreadable object representing the error is printed instead.")
 ;;; possible extension for the enthusiastic: printing floats in bases
 ;;; other than base 10.
 (defconstant single-float-min-e
-  (- 2 sb!vm:single-float-bias sb!vm:single-float-digits))
+  (- 2 sb-vm:single-float-bias sb-vm:single-float-digits))
 (defconstant double-float-min-e
-  (- 2 sb!vm:double-float-bias sb!vm:double-float-digits))
+  (- 2 sb-vm:double-float-bias sb-vm:double-float-digits))
 #!+long-float
 (defconstant long-float-min-e
   (nth-value 1 (decode-float least-positive-long-float)))
@@ -1518,21 +1533,20 @@ variable: an unreadable object representing the error is printed instead.")
          (%output-integer-in-base exp 10 stream))))
 
 (defun output-float-infinity (x stream)
-  (declare (float x) (stream stream))
-  (cond (*read-eval*
-         (write-string "#." stream))
-        (*print-readably*
-         (return-from output-float-infinity
-           (print-not-readable-error x stream)))
-        (t
-         (write-string "#<" stream)))
-  (write-string "SB-EXT:" stream)
-  (write-string (symbol-name (float-format-name x)) stream)
-  (write-string (if (plusp x) "-POSITIVE-" "-NEGATIVE-")
-                stream)
-  (write-string "INFINITY" stream)
-  (unless *read-eval*
-    (write-string ">" stream)))
+  (declare (stream stream))
+  (let ((symbol (etypecase x
+                  (single-float (if (minusp x)
+                                    'single-float-negative-infinity
+                                    'single-float-positive-infinity))
+                  (double-float (if (minusp x)
+                                    'double-float-negative-infinity
+                                    'double-float-positive-infinity)))))
+    (cond (*read-eval*
+           (write-string "#." stream)
+           (output-symbol symbol (sb-xc:symbol-package symbol) stream))
+          (t
+           (print-unreadable-object (x stream)
+             (output-symbol symbol (sb-xc:symbol-package symbol) stream))))))
 
 (defun output-float-nan (x stream)
   (print-unreadable-object (x stream)
@@ -1601,20 +1615,27 @@ variable: an unreadable object representing the error is printed instead.")
 
 (defmethod print-object ((component code-component) stream)
   (print-unreadable-object (component stream :identity t)
-    (let ((dinfo (%code-debug-info component)))
-      (cond ((eq dinfo :bogus-lra)
+    (let (dinfo)
+      (cond ((code-obj-is-filler-p component)
+             (format stream "filler ~dw"
+                     (ash (code-object-size component) (- sb-vm:word-shift))))
+            ((eq (setq dinfo (%code-debug-info component)) :bogus-lra)
              (write-string "bogus code object" stream))
+            ((functionp dinfo)
+             (format stream "trampoline ~S" dinfo))
             (t
-             (format stream "code object [~D]" (code-n-entries component))
+             (format stream "code~@[ id=~x~] [~D]"
+                     (%code-serialno component)
+                     (code-n-entries component))
              (let ((fun-name (awhen (%code-entry-point component 0)
                                (%simple-fun-name it))))
                (when fun-name
                  (write-char #\Space stream)
                  (write fun-name :stream stream))
-               (cond ((not (typep dinfo 'sb!c::debug-info)))
-                     ((neq (sb!c::debug-info-name dinfo) fun-name)
+               (cond ((not (typep dinfo 'sb-c::debug-info)))
+                     ((neq (sb-c::debug-info-name dinfo) fun-name)
                       (write-string ", " stream)
-                      (output-object (sb!c::debug-info-name dinfo) stream)))))))))
+                      (output-object (sb-c::debug-info-name dinfo) stream)))))))))
 
 #!-(or x86 x86-64)
 (defmethod print-object ((lra lra) stream)
@@ -1645,16 +1666,18 @@ variable: an unreadable object representing the error is printed instead.")
                 (values "#.(~S #X~16,'0X #X~16,'0X)"
                         '%make-simd-pack-ub64 #'%simd-pack-ub64s)))
            (multiple-value-call
-            #'format stream format maker (funcall extractor pack))))
+               #'format stream format maker (funcall extractor pack))))
+        (*print-readably*
+         (print-not-readable-error pack stream))
         (t
          (print-unreadable-object (pack stream)
            (flet ((all-ones-p (value start end &aux (mask (- (ash 1 end) (ash 1 start))))
-                      (= (logand value mask) mask))
+                    (= (logand value mask) mask))
                   (split-num (value start)
-                      (loop
-                         for i from 0 to 3
-                         and v = (ash value (- start)) then (ash v -8)
-                         collect (logand v #xFF))))
+                    (loop
+                       for i from 0 to 3
+                       and v = (ash value (- start)) then (ash v -8)
+                       collect (logand v #xFF))))
              (multiple-value-bind (low high)
                  (%simd-pack-ub64s pack)
                (etypecase pack
@@ -1677,6 +1700,42 @@ variable: an unreadable object representing the error is printed instead.")
                           'simd-pack
                           (split-num low 0) (split-num low 32)
                           (split-num high 0) (split-num high 32))))))))))
+
+#!+sb-simd-pack-256
+(defmethod print-object ((pack simd-pack-256) stream)
+  (cond ((and *print-readably* *read-eval*)
+         (multiple-value-bind (format maker extractor)
+             (etypecase pack
+               ((simd-pack-256 double-float)
+                (values "#.(~@{~S~^ ~})"
+                        '%make-simd-pack-256-double #'%simd-pack-256-doubles))
+               ((simd-pack-256 single-float)
+                (values "#.(~@{~S~^ ~})"
+                        '%make-simd-pack-256-single #'%simd-pack-256-singles))
+               (t
+                (values "#.(~S~@{ #X~16,'0X~})"
+                        '%make-simd-pack-256-ub64 #'%simd-pack-256-ub64s)))
+           (multiple-value-call
+               #'format stream format maker (funcall extractor pack))))
+        (*print-readably*
+         (print-not-readable-error pack stream))
+        (t
+         (print-unreadable-object (pack stream)
+           (etypecase pack
+             ((simd-pack-256 double-float)
+              (multiple-value-call #'format stream "~S~@{ ~,13E~}"
+                'simd-pack-256
+                (%simd-pack-256-doubles pack)))
+             ((simd-pack-256 single-float)
+              (multiple-value-call #'format stream "~S~@{ ~,7E~}"
+                'simd-pack-256
+                (%simd-pack-256-singles pack)))
+             (t
+              (multiple-value-bind (p0 p1 p2 p3)
+                  (%simd-pack-256-ub64s pack)
+                (format stream "~S~@{ ~16,'0X~}"
+                        'simd-pack-256
+                        p0 p1 p2 p3))))))))
 
 ;;;; functions
 
@@ -1694,41 +1753,42 @@ variable: an unreadable object representing the error is printed instead.")
 
 ;;;; catch-all for unknown things
 
+(declaim (inline lowtag-of))
+(defun lowtag-of (x) (logand (get-lisp-obj-address x) sb-vm:lowtag-mask))
+
 (defmethod print-object ((object t) stream)
-  (flet ((output-it (stream)
-          (when (eq object sb!pcl:+slot-unbound+)
-            (print-unreadable-object (object stream)
-              ;; If specifically the unbound marker with 0 data,
-              ;; as opposed to any other unbound marker.
-              (write-string "unbound" stream))
-            (return-from output-it))
-           (print-unreadable-object (object stream :identity t)
-             (let ((lowtag (lowtag-of object)))
-               (case lowtag
-                 (#.sb!vm:other-pointer-lowtag
-                  (let ((widetag (widetag-of object)))
-                    (case widetag
-                      (#.sb!vm:value-cell-widetag
-                       (write-string "value cell " stream)
-                       (output-object (value-cell-ref object) stream))
-                      (t
-                       (write-string "unknown pointer object, widetag=" stream)
-                       (output-integer widetag stream 16 t)))))
-                 ((#.sb!vm:fun-pointer-lowtag
-                   #.sb!vm:instance-pointer-lowtag
-                   #.sb!vm:list-pointer-lowtag)
-                  (write-string "unknown pointer object, lowtag=" stream)
-                  (output-integer lowtag stream 16 t))
-                (t
-                 (case (widetag-of object)
-                   (#.sb!vm:unbound-marker-widetag
-                    (write-string "unbound marker" stream))
-                   (t
-                    (write-string "unknown immediate object, lowtag=" stream)
-                    (output-integer lowtag stream 2 t)
-                    (write-string ", widetag=" stream)
-                    (output-integer (widetag-of object) stream 16 t)))))))))
-    (if *print-pretty*
-      ;; This block might not be necessary. Not sure, probably can't hurt.
-        (pprint-logical-block (stream nil) (output-it stream))
-        (output-it stream))))
+  (when (eq object sb-pcl:+slot-unbound+)
+    ;; If specifically the unbound marker with 0 data,
+    ;; as opposed to any other unbound marker.
+    (print-unreadable-object (object stream) (write-string "unbound" stream))
+    (return-from print-object))
+  (print-unreadable-object (object stream :identity t)
+    (let ((lowtag (lowtag-of object)))
+      (case lowtag
+        (#.sb-vm:other-pointer-lowtag
+         (let ((widetag (widetag-of object)))
+           (case widetag
+             (#.sb-vm:value-cell-widetag
+              (write-string "value cell " stream)
+              (output-object (value-cell-ref object) stream))
+             (#.sb-vm:filler-widetag
+              (write-string "pad " stream)
+              (write (1+ (get-header-data object)) :stream stream)
+              (write-string "w" stream)) ; words
+             (t
+              (write-string "unknown pointer object, widetag=" stream)
+              (output-integer widetag stream 16 t)))))
+        ((#.sb-vm:fun-pointer-lowtag
+          #.sb-vm:instance-pointer-lowtag
+          #.sb-vm:list-pointer-lowtag)
+         (write-string "unknown pointer object, lowtag=" stream)
+         (output-integer lowtag stream 16 t))
+        (t
+         (case (widetag-of object)
+           (#.sb-vm:unbound-marker-widetag
+            (write-string "unbound marker" stream))
+           (t
+            (write-string "unknown immediate object, lowtag=" stream)
+            (output-integer lowtag stream 2 t)
+            (write-string ", widetag=" stream)
+            (output-integer (widetag-of object) stream 16 t))))))))

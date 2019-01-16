@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; utilities
 
@@ -131,7 +131,7 @@
           (let* ((tn (tn-ref-tn ref))
                  (local (tn-local tn))
                  (kind (tn-kind tn)))
-            (unless (member kind '(:component :environment :constant))
+            (unless (member kind '(:component :environment :constant :unused))
               (unless (eq local block)
                 (when (= ltn-num local-tn-limit)
                   (return-from find-local-references vop))
@@ -311,22 +311,23 @@
              (tn-ref-across op)))
         ((null op))
       (let ((tn (tn-ref-tn op)))
-        (assert
-          (flet ((frob (refs)
-                   (do ((ref refs (tn-ref-next ref)))
-                       ((null ref) t)
-                     (when (and (eq (vop-block (tn-ref-vop ref)) block)
-                                (not (eq ref op)))
-                       (return nil)))))
-            (and (frob (tn-reads tn)) (frob (tn-writes tn))))
-          () "More operand ~S used more than once in its VOP." op)
-        (aver (not (find-in #'global-conflicts-next-blockwise tn
-                            (ir2-block-global-tns block)
-                            :key #'global-conflicts-tn)))
+        (unless (member (tn-kind tn) '(:unused :constant))
+          (assert
+           (flet ((frob (refs)
+                    (do ((ref refs (tn-ref-next ref)))
+                        ((null ref) t)
+                      (when (and (eq (vop-block (tn-ref-vop ref)) block)
+                                 (not (eq ref op)))
+                        (return nil)))))
+             (and (frob (tn-reads tn)) (frob (tn-writes tn))))
+           () "More operand ~S used more than once in its VOP." op)
+          (aver (not (find-in #'global-conflicts-next-blockwise tn
+                              (ir2-block-global-tns block)
+                              :key #'global-conflicts-tn)))
 
-        (add-global-conflict :read-only tn block num)
-        (setf (tn-local tn) block)
-        (setf (tn-local-number tn) num))))
+          (add-global-conflict :read-only tn block num)
+          (setf (tn-local tn) block)
+          (setf (tn-local-number tn) num)))))
   (values))
 
 (defevent coalesce-more-ltn-numbers
@@ -647,7 +648,8 @@
         (ecase (tn-kind tn)
           ((:normal :debug-environment)
            (setf (sbit live (tn-local-number tn)) 0))
-          (:environment :component))))
+          (:environment :component)
+          (:unused))))
     live))
 
 ;;; This is used to determine whether a :DEBUG-ENVIRONMENT TN should
@@ -761,12 +763,6 @@
              (cached-block-physenv (ir2-block-block block))))))))
   (values))
 
-;;; FIXME: The next 3 macros aren't needed in the target runtime.
-;;; Figure out some way to make them only at build time. (Just
-;;; (EVAL-WHEN (:COMPILE-TOPLEVEL :EXECUTE) (DEFMACRO ..)) isn't good enough,
-;;; since we need CL:DEFMACRO at build-the-cross-compiler time and
-;;; SB!XC:DEFMACRO at run-the-cross-compiler time.)
-
 ;;; This is used in SCAN-VOP-REFS to simultaneously do something to
 ;;; all of the TNs referenced by a big more arg. We have to treat
 ;;; these TNs specially, since when we set or clear the bit in the
@@ -780,12 +776,14 @@
      (let ((prev ref))
        (do ((mref (tn-ref-next-ref ref) (tn-ref-next-ref mref)))
            ((null mref))
-         (let ((mtn (tn-ref-tn mref)))
-           (unless (eql (tn-local-number mtn) num)
-             (return))
-           ,action)
-         (setq prev mref))
-       (setq ref prev))))
+         (let* ((mtn (tn-ref-tn mref))
+                (tn-number (tn-local-number mtn)))
+           (when tn-number
+             (unless (eql tn-number num)
+               (return))
+             ,action
+             (setq prev mref)
+             (setq ref prev)))))))
 
 ;;; Handle the part of CONFLICT-ANALYZE-1-BLOCK that scans the REFs
 ;;; for the current VOP. This macro shamelessly references free

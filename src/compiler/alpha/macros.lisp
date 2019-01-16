@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; a handy macro for defining top level forms that depend on the
 ;;; compile environment
@@ -191,51 +191,19 @@
   (assemble ()
     (when vop
       (note-this-location vop :internal-error))
-    (inst gentrap kind)
-    (inst byte code)
-    (with-adjustable-vector (vector)
-      (dolist (tn values)
-        (write-var-integer
-         (make-sc-offset (sc-number (tn-sc tn)) (tn-offset tn)) vector))
-      (dotimes (i (length vector))
-        (inst byte (aref vector i))))
+    (emit-internal-error kind code values
+                         :trap-emitter (lambda (tramp-number)
+                                         (inst gentrap tramp-number)))
     (emit-alignment word-shift)))
-
-(defun error-call (vop error-code &rest values)
-  "Cause an error.  ERROR-CODE is the error to cause."
-  (emit-error-break vop error-trap (error-number-or-lose error-code) values))
-
-
-(defun cerror-call (vop label error-code &rest values)
-  "Cause a continuable error.  If the error is continued, execution resumes at
-  LABEL."
-  (assemble ()
-     (emit-error-break vop cerror-trap (error-number-or-lose error-code) values)
-     (inst br zero-tn label)))
 
 (defun generate-error-code (vop error-code &rest values)
   "Generate-Error-Code Error-code Value*
   Emit code for an error with the specified Error-Code and context Values."
-  (assemble (*elsewhere*)
+  (assemble (:elsewhere)
     (let ((start-lab (gen-label)))
       (emit-label start-lab)
       (apply #'error-call vop error-code values)
       start-lab)))
-
-(defmacro generate-cerror-code (vop error-code &rest values)
-  "Generate-CError-Code Error-code Value*
-  Emit code for a continuable error with the specified Error-Code and
-  context Values.  If the error is continued, execution resumes after
-  the GENERATE-CERROR-CODE form."
-  (assemble ()
-    (let ((continue (gen-label)))
-      (emit-label continue)
-      (assemble (*elsewhere*)
-        (let ((error (gen-label)))
-          (emit-label error)
-          (apply #'cerror-call vop continue error-code values)
-          error)))))
-
 
 ;;; a handy macro for making sequences look atomic
 (defmacro pseudo-atomic ((&key (extra 0)) &rest forms)

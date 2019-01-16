@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 (declaim (special *compiler-error-bailout*))
 
@@ -20,6 +20,11 @@
 ;;; top level form.
 (declaim (type index *current-form-number*))
 (defvar *current-form-number*)
+
+;;; Report as we try each transform? (either source or IR)
+;;; Bind to T to see the ones that didn't abort,
+;;; or :ALL if you want to see each attempted transform.
+(defvar *show-transforms-p* nil)
 
 (declaim (inline source-form-has-path-p))
 (defun source-form-has-path-p (form)
@@ -84,8 +89,6 @@
   to optimize code which uses those definitions? Setting this true
   gives non-ANSI, early-CMU-CL behavior. It can be useful for improving
   the efficiency of stable code.")
-
-(defvar *post-binding-variable-lexenv* nil)
 
 ;;;; namespace management utilities
 
@@ -97,8 +100,8 @@
          (typecase env
            (null nil)
            #!+(and sb-fasteval (host-feature sb-xc))
-           (sb!interpreter:basic-env
-            (sb!interpreter::fun-lexically-notinline-p name env))
+           (sb-interpreter:basic-env
+            (sb-interpreter::fun-lexically-notinline-p name env))
            (t
             (let ((fun (cdr (assoc name (lexenv-funs env) :test #'equal))))
               ;; FIXME: this seems to omit FUNCTIONAL
@@ -124,7 +127,7 @@
   (let ((where (info :function :where-from name)))
     (when (and (eq where :assumed)
                ;; Slot accessors are defined just-in-time, if not already.
-               (not (typep name '(cons (eql sb!pcl::slot-accessor))))
+               (not (typep name '(cons (eql sb-pcl::slot-accessor))))
                ;; In the ordinary target Lisp, it's silly to report
                ;; undefinedness when the function is defined in the
                ;; running Lisp. But at cross-compile time, the current
@@ -285,7 +288,7 @@
                 (:alien
                  (info :variable :alien-info name))
                 ;; FIXME: The return value in this case should really be
-                ;; of type SB!C::LEAF.  I don't feel too badly about it,
+                ;; of type SB-C::LEAF.  I don't feel too badly about it,
                 ;; because the MACRO idiom is scattered throughout this
                 ;; file, but it should be cleaned up so we're not
                 ;; throwing random conses around.  --njf 2002-03-23
@@ -321,10 +324,11 @@
 (defun maybe-emit-make-load-forms (constant &optional (name nil namep))
   (let ((xset (alloc-xset)))
     (labels ((trivialp (value)
-               (typep value
+               (sb-xc:typep value
                       '(or
                         #-sb-xc-host
-                        (or unboxed-array #!+sb-simd-pack simd-pack)
+                        (or unboxed-array #!+sb-simd-pack simd-pack
+                                          #!+sb-simd-pack-256 simd-pack-256)
                         #+sb-xc-host
                         (and array (not (array t)))
                         symbol
@@ -358,7 +362,10 @@
                    ((array t)
                     (dotimes (i (array-total-size value))
                       (grovel (row-major-aref value i))))
-                   (#+sb-xc-host structure!object
+                   ;; We use ordinary host packages to model the target packages.
+                   ;; Those objects are not in "our" type system, but we can check
+                   ;; for them and make them legal to dump out.
+                   (#+sb-xc-host (or structure!object package)
                     #-sb-xc-host instance
                     ;; In the target SBCL, we can dump any instance, but
                     ;; in the cross-compilation host, %INSTANCE-FOO
@@ -374,12 +381,12 @@
                     (when (emit-make-load-form value)
                       #+sb-xc-host
                       (aver (eql (layout-bitmap (%instance-layout value))
-                                 sb!kernel::+layout-all-tagged+))
+                                 sb-kernel::+layout-all-tagged+))
                       (do-instance-tagged-slot (i value)
                         (grovel (%instance-ref value i)))))
                    (t
                     (compiler-error
-                      "Objects of type ~/sb!impl:print-type-specifier/ ~
+                      "Objects of type ~/sb-impl:print-type-specifier/ ~
                        can't be dumped into fasl files."
                      (type-of value)))))))
       ;; Dump all non-trivial named constants using the name.
@@ -531,8 +538,8 @@
                    `(progn
                       (when (atom subform) (return))
                       (let ((fm (car subform)))
-                        (when (sb!int:comma-p fm)
-                          (setf fm (sb!int:comma-expr fm)))
+                        (when (comma-p fm)
+                          (setf fm (comma-expr fm)))
                         (cond ((consp fm)
                                ;; If it's a cons, recurse.
                                (sub-find-source-paths fm (cons pos path)))
@@ -654,7 +661,7 @@
                         (let ((functional (defined-fun-functional leaf)))
                           (when (and functional (not (functional-kind functional)))
                             (maybe-reanalyze-functional functional))))
-                   (when (and (lambda-p leaf)
+                   (when (and (functional-p leaf)
                               (memq (functional-kind leaf)
                                     '(nil :optional)))
                      (maybe-reanalyze-functional leaf))
@@ -734,17 +741,17 @@
   (flet ((legal-cm-name-p (name)
            (and (legal-fun-name-p name)
                 (or (not (symbolp name))
-                    (not (sb!xc:macro-function name *lexenv*))))))
+                    (not (sb-xc:macro-function name *lexenv*))))))
     (if (eq opname 'funcall)
         (let ((fun-form (cadr form)))
           (cond ((and (consp fun-form) (eq 'function (car fun-form))
                       (not (cddr fun-form)))
                  (let ((real-fun (cadr fun-form)))
                    (if (legal-cm-name-p real-fun)
-                       (values (sb!xc:compiler-macro-function real-fun *lexenv*)
+                       (values (sb-xc:compiler-macro-function real-fun *lexenv*)
                                real-fun)
                        (values nil nil))))
-                ((sb!xc:constantp fun-form *lexenv*)
+                ((sb-xc:constantp fun-form *lexenv*)
                  (let ((fun (constant-form-value fun-form *lexenv*)))
                    (if (legal-cm-name-p fun)
                        ;; CLHS tells us that local functions must shadow
@@ -756,12 +763,12 @@
                        ;; a list (function name)", that means that
                        ;; (funcall 'name) that gets here doesn't fit the
                        ;; definition.
-                       (values (sb!xc:compiler-macro-function fun nil) fun)
+                       (values (sb-xc:compiler-macro-function fun nil) fun)
                        (values nil nil))))
                 (t
                  (values nil nil))))
         (if (legal-fun-name-p opname)
-            (values (sb!xc:compiler-macro-function opname *lexenv*) opname)
+            (values (sb-xc:compiler-macro-function opname *lexenv*) opname)
             (values nil nil)))))
 
 ;;; If FORM has a usable compiler macro, use it; otherwise return FORM itself.
@@ -944,34 +951,23 @@
 
 ;;;; code coverage
 
-;;; Used as the CDR of the code coverage instrumentation records
-;;; (instead of NIL) to ensure that any well-behaving user code will
-;;; not have constants EQUAL to that record. This avoids problems with
-;;; the records getting coalesced with non-record conses, which then
-;;; get mutated when the instrumentation runs. Note that it's
-;;; important for multiple records for the same location to be
-;;; coalesced. -- JES, 2008-01-02
-;;; Use of #. mandates :COMPILE-TOPLEVEL for several Lisps
-;;; even though for us it's immediately accessible to EVAL.
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defconstant +code-coverage-unmarked+ '%code-coverage-unmarked%))
-
 ;;; Check the policy for whether we should generate code coverage
 ;;; instrumentation. If not, just return the original START
 ;;; ctran. Otherwise insert code coverage instrumentation after
 ;;; START, and return the new ctran.
-(defun instrument-coverage (start mode form)
+(defun instrument-coverage (start mode form
+                            &aux (metadata *compiler-coverage-metadata*))
   ;; We don't actually use FORM for anything, it's just convenient to
   ;; have around when debugging the instrumentation.
   (declare (ignore form))
-  (if (and (policy *lexenv* (> store-coverage-data 0))
-           *code-coverage-records*
+  (if (and metadata
+           (policy *lexenv* (> store-coverage-data 0))
            *allow-instrumenting*)
       (let ((path (source-path-original-source *current-path*)))
         (when mode
           (push mode path))
         (if (member (ctran-block start)
-                    (gethash path *code-coverage-blocks*))
+                    (gethash path (code-coverage-blocks metadata)))
             ;; If this source path has already been instrumented in
             ;; this block, don't instrument it again.
             start
@@ -979,13 +975,17 @@
                    ;; Get an interned record cons for the path. A cons
                    ;; with the same object identity must be used for
                    ;; each instrument for the same block.
-                   (ensure-gethash path *code-coverage-records*
+                   (ensure-gethash path (code-coverage-records metadata)
                                    (cons path +code-coverage-unmarked+)))
                   (next (make-ctran))
                   (*allow-instrumenting* nil))
+              #!+(or x86-64 x86) (declare (ignore store)) ; eval'd for side-effect only
               (push (ctran-block start)
-                    (gethash path *code-coverage-blocks*))
+                    (gethash path (code-coverage-blocks metadata)))
               (ir1-convert start next nil
+                           #!+(or x86-64 x86)
+                           `(%primitive mark-covered ',path)
+                           #!-(or x86-64 x86)
                            `(locally
                                 (declare (optimize speed
                                                    (safety 0)
@@ -1012,26 +1012,6 @@
           (when *current-path*
             (instrument-coverage start nil form))))
       start))
-
-(defun record-code-coverage (info cc)
-  (setf (gethash info *code-coverage-info*) cc))
-
-(defun clear-code-coverage ()
-  (clrhash *code-coverage-info*))
-
-(defun reset-code-coverage ()
-  (maphash (lambda (info cc)
-             (declare (ignore info))
-             (dolist (cc-entry cc)
-               (setf (cdr cc-entry) +code-coverage-unmarked+)))
-           *code-coverage-info*))
-
-(defun code-coverage-record-marked (record)
-  (aver (consp record))
-  (ecase (cdr record)
-    ((#.+code-coverage-unmarked+) nil)
-    ((t) t)))
-
 
 ;;;; converting combinations
 
@@ -1045,12 +1025,12 @@
            ;; if the value is unused.
            (if (member symbol '(symeval sym-global-val))
                (not (constantp (second form)))
-               (not (member (symbol-package symbol)
+               (not (member (sb-xc:symbol-package symbol)
                             (load-time-value
                               ;; KLUDGE: packages we're not interested in
                               ;; stepping.
-                              (mapcar #'find-package '(sb!c sb!int sb!impl
-                                                       sb!kernel sb!pcl))
+                              (mapcar #'find-package '(sb-c sb-int sb-impl
+                                                       sb-kernel sb-pcl))
                              t))))))
     (and *allow-instrumenting*
          (policy *lexenv* (= insert-step-conditions 3))
@@ -1097,19 +1077,28 @@
       (let ((this-start start)
             (forms args))
         (dolist (arg args)
-          (setf this-start
-                (maybe-instrument-progn-like this-start forms arg))
-          (setf forms (cdr forms))
-          (let ((this-ctran (make-ctran))
-                (this-lvar (make-lvar node)))
-            (ir1-convert this-start this-ctran this-lvar arg)
-            (setq this-start this-ctran)
-            (arg-lvars this-lvar)))
+          (cond ((lvar-p arg)
+                 (aver (not (lvar-dest arg)))
+                 (arg-lvars arg)
+                 (setf (lvar-dest arg) node))
+                (t
+                 (setf this-start
+                       (maybe-instrument-progn-like this-start forms arg))
+                 (let ((this-ctran (make-ctran))
+                       (this-lvar (make-lvar node)))
+                   (ir1-convert this-start this-ctran this-lvar arg)
+                   (setq this-start this-ctran)
+                   (arg-lvars this-lvar))))
+          (pop forms))
         (link-node-to-previous-ctran node this-start)
         (use-continuation node next result)
         (setf (combination-args node) (arg-lvars))))
     node))
 
+(defun show-transform (kind name new-form)
+  (let ((*print-right-margin* 100))
+    (format *trace-output* "~&xform (~a) ~S~% -> ~S~%"
+            kind name new-form)))
 ;;; Convert a call to a global function. If not :NOTINLINE, then we do
 ;;; source transforms and try out any inline expansion. If there is no
 ;;; expansion, but is :INLINE, then give an efficiency note (unless a
@@ -1143,6 +1132,8 @@
                       (t
                        (unless (policy *lexenv* (zerop store-xref-data))
                          (record-call name (ctran-block start) *current-path*))
+                       (when *show-transforms-p*
+                         (show-transform "src" name transformed))
                        (ir1-convert start next result transformed))))
               (ir1-convert-maybe-predicate start next result form var))))))
 
@@ -1242,64 +1233,66 @@
                  (when (typep type-specifier 'type-specifier)
                    (check-deprecated-type type-specifier))
                  (compiler-specifier-type type-specifier))))
-    (collect ((restr nil cons)
-             (new-vars nil cons))
-      (dolist (var-name (rest decl))
-        (unless (symbolp var-name)
-          (compiler-error "Variable name is not a symbol: ~S." var-name))
-        (unless (eq (info :variable :kind var-name) :unknown)
-          (program-assert-symbol-home-package-unlocked
-           context var-name "declaring the type of ~A"))
-        (let* ((bound-var (find-in-bindings vars var-name))
-               (var (or bound-var
-                        (lexenv-find var-name vars)
-                        (find-free-var var-name))))
-          (etypecase var
-            (leaf
-             (flet
-                 ((process-var (var bound-var)
-                    (let* ((old-type (or (lexenv-find var type-restrictions)
-                                         (leaf-type var)))
-                           (int (if (or (fun-type-p type)
-                                        (fun-type-p old-type))
-                                    type
-                                    (type-approx-intersection2
-                                     old-type type))))
-                      (cond ((eq int *empty-type*)
-                             (unless (policy *lexenv* (= inhibit-warnings 3))
-                               (warn
-                                'type-warning
-                                :format-control
-                                 "The type declarations ~
-                                  ~/sb!impl:print-type/ and ~
-                                  ~/sb!impl:print-type/ for ~
+    (if type
+        (collect ((restr nil cons)
+                  (new-vars nil cons))
+          (dolist (var-name (rest decl))
+            (unless (symbolp var-name)
+              (compiler-error "Variable name is not a symbol: ~S." var-name))
+            (unless (eq (info :variable :kind var-name) :unknown)
+              (program-assert-symbol-home-package-unlocked
+               context var-name "declaring the type of ~A"))
+            (let* ((bound-var (find-in-bindings vars var-name))
+                   (var (or bound-var
+                            (lexenv-find var-name vars)
+                            (find-free-var var-name))))
+              (etypecase var
+                (leaf
+                 (flet
+                     ((process-var (var bound-var)
+                        (let* ((old-type (or (lexenv-find var type-restrictions)
+                                             (leaf-type var)))
+                               (int (if (or (fun-type-p type)
+                                            (fun-type-p old-type))
+                                        type
+                                        (type-approx-intersection2
+                                         old-type type))))
+                          (cond ((eq int *empty-type*)
+                                 (unless (policy *lexenv* (= inhibit-warnings 3))
+                                   (warn
+                                    'type-warning
+                                    :format-control
+                                    "The type declarations ~
+                                  ~/sb-impl:print-type/ and ~
+                                  ~/sb-impl:print-type/ for ~
                                   ~S conflict."
-                                :format-arguments
-                                (list old-type type var-name))))
-                            (bound-var
-                             (setf (leaf-type bound-var) int
-                                   (leaf-where-from bound-var) :declared))
-                            (t
-                             (restr (cons var int)))))))
-               (process-var var bound-var)
-               (awhen (and (lambda-var-p var)
-                           (lambda-var-specvar var))
-                      (process-var it nil))))
-            (cons
-             ;; FIXME: non-ANSI weirdness. [See lp#309122]
-             (aver (eq (car var) 'macro))
-             (new-vars `(,var-name . (macro . (the ,(first decl)
-                                                ,(cdr var))))))
-            (heap-alien-info
-             (compiler-error
-              "~S is an alien variable, so its type can't be declared."
-              var-name)))))
+                                    :format-arguments
+                                    (list old-type type var-name))))
+                                (bound-var
+                                 (setf (leaf-type bound-var) int
+                                       (leaf-where-from bound-var) :declared))
+                                (t
+                                 (restr (cons var int)))))))
+                   (process-var var bound-var)
+                   (awhen (and (lambda-var-p var)
+                               (lambda-var-specvar var))
+                     (process-var it nil))))
+                (cons
+                 ;; FIXME: non-ANSI weirdness. [See lp#309122]
+                 (aver (eq (car var) 'macro))
+                 (new-vars `(,var-name . (macro . (the ,(first decl)
+                                                       ,(cdr var))))))
+                (heap-alien-info
+                 (compiler-error
+                  "~S is an alien variable, so its type can't be declared."
+                  var-name)))))
 
-      (if (or (restr) (new-vars))
-          (make-lexenv :default res
-                       :type-restrictions (restr)
-                       :vars (new-vars))
-          res))))
+          (if (or (restr) (new-vars))
+              (make-lexenv :default res
+                           :type-restrictions (restr)
+                           :vars (new-vars))
+              res))
+        res)))
 
 ;;; This is somewhat similar to PROCESS-TYPE-DECL, but handles
 ;;; declarations for function variables. In addition to allowing
@@ -1309,7 +1302,8 @@
 (defun process-ftype-decl (type-specifier res names fvars context)
   (declare (type list names fvars)
            (type lexenv res))
-  (let ((type (compiler-specifier-type type-specifier)))
+  (let ((type (or (compiler-specifier-type type-specifier)
+                  (return-from process-ftype-decl res))))
     (check-deprecated-type type-specifier)
     (unless (csubtypep type (specifier-type 'function))
       (compiler-style-warn "ignoring declared FTYPE: ~S (not a function type)"
@@ -1340,9 +1334,14 @@
 
 ;;; Process a special declaration, returning a new LEXENV. A non-bound
 ;;; special declaration is instantiated by throwing a special variable
-;;; into the variables if BINDING-FORM-P is NIL, or otherwise into
-;;; *POST-BINDING-VARIABLE-LEXENV*.
-(defun process-special-decl (spec res vars binding-form-p context)
+;;; into the variables if POST-BINDING-LEXENV is NIL,
+;;; or by mutating POST-BINDING-LEXENV if non-nil.
+;;; Note that POST-BINDING-LEXENV is not actually a lexenv - it is only
+;;; the contents of the 'vars' slot of a LEXENV, and moreover, as supplied
+;;; to this function, it has a dummy cons in front which is later removed.
+;;; The dummy cons serves a double purpose - as an indicator that this decl
+;;; occurs in a LET/LET* form, and facilitating pass by reference of the list.
+(defun process-special-decl (spec res vars post-binding-lexenv context)
   (declare (list spec vars) (type lexenv res))
   (collect ((new-venv nil cons))
     (dolist (name (cdr spec))
@@ -1379,9 +1378,9 @@
           (null
            (unless (or (assoc name (new-venv) :test #'eq))
              (new-venv (cons name (specvar-for-binding name))))))))
-    (cond (binding-form-p
-           (setf *post-binding-variable-lexenv*
-                 (append (new-venv) *post-binding-variable-lexenv*))
+    (cond (post-binding-lexenv
+           (setf (cdr post-binding-lexenv)
+                 (append (new-venv) (cdr post-binding-lexenv)))
            res)
           ((new-venv)
            (make-lexenv :default res :vars (new-venv)))
@@ -1591,7 +1590,7 @@
 ;;; Process a single declaration spec, augmenting the specified LEXENV
 ;;; RES. Return RES and result type. VARS and FVARS are as described
 ;;; PROCESS-DECLS.
-(defun process-1-decl (raw-spec res vars fvars binding-form-p context)
+(defun process-1-decl (raw-spec res vars fvars post-binding-lexenv context)
   (declare (type list raw-spec vars fvars))
   (declare (type lexenv res))
   (let ((spec (canonized-decl-spec raw-spec))
@@ -1608,7 +1607,8 @@
        ((ignore ignorable)
         (process-ignore-decl spec vars fvars res)
         res)
-       (special (process-special-decl spec res vars binding-form-p context))
+       (special
+        (process-special-decl spec res vars post-binding-lexenv context))
        (ftype
         (unless (cdr spec)
           (compiler-error "no type specified in FTYPE declaration: ~S" spec))
@@ -1638,6 +1638,10 @@
          :default res
          :disabled-package-locks (process-package-lock-decl
                                   spec (lexenv-disabled-package-locks res))))
+       (flushable
+        (make-lexenv
+         :default res
+         :flushable (cdr spec)))
        ;; We may want to detect LAMBDA-LIST and VALUES decls here,
        ;; and report them as "Misplaced" rather than "Unrecognized".
        (t
@@ -1670,7 +1674,7 @@
         (allow-explicit-check allow-lambda-list)
         (lambda-list (if allow-lambda-list :unspecified nil))
         (optimize-qualities)
-        (*post-binding-variable-lexenv* nil))
+        (post-binding-lexenv (if binding-form-p (list nil)))) ; dummy cell
     (flet ((process-it (spec decl)
              (cond ((atom spec)
                     (compiler-error "malformed declaration specifier ~S in ~S"
@@ -1685,11 +1689,12 @@
                     (setq result-type
                           (values-type-intersection
                            result-type
-                           (compiler-values-specifier-type
-                            (let ((types (cdr spec)))
-                              (if (singleton-p types)
-                                  (car types)
-                                  `(values ,@types)))))))
+                           (or (compiler-values-specifier-type
+                                (let ((types (cdr spec)))
+                                  (if (singleton-p types)
+                                      (car types)
+                                      `(values ,@types))))
+                               (return-from process-it)))))
                    ((and allow-explicit-check
                          (typep spec '(cons (eql explicit-check))))
                     ;; EXPLICIT-CHECK by itself specifies that all argument and
@@ -1707,10 +1712,11 @@
                                       it))
                     (setq explicit-check (or (cdr spec) t)
                           allow-explicit-check nil)) ; at most one of this decl
+                   ((equal spec '(top-level-form))) ; ignore
                    (t
                     (multiple-value-bind (new-env new-qualities)
                         (process-1-decl spec lexenv vars fvars
-                                        binding-form-p context)
+                                        post-binding-lexenv context)
                       (setq lexenv new-env
                             optimize-qualities
                             (nconc new-qualities optimize-qualities)))))))
@@ -1722,7 +1728,7 @@
               ;; Kludge: EVAL calls this function to deal with LOCALLY.
               (process-it spec decl)))))
     (warn-repeated-optimize-qualities (lexenv-policy lexenv) optimize-qualities)
-    (values lexenv result-type *post-binding-variable-lexenv*
+    (values lexenv result-type (cdr post-binding-lexenv)
             lambda-list explicit-check)))
 
 (defun %processing-decls (decls vars fvars ctran lvar binding-form-p fun)
@@ -1744,10 +1750,9 @@
 (defmacro processing-decls ((decls vars fvars ctran lvar
                                    &optional post-binding-lexenv)
                             &body forms)
-  (check-type ctran symbol)
-  (check-type lvar symbol)
+  (declare (symbol ctran lvar))
   (let ((post-binding-lexenv-p (not (null post-binding-lexenv)))
-        (post-binding-lexenv (or post-binding-lexenv (sb!xc:gensym "LEXENV"))))
+        (post-binding-lexenv (or post-binding-lexenv (sb-xc:gensym "LEXENV"))))
     `(%processing-decls ,decls ,vars ,fvars ,ctran ,lvar
                         ,post-binding-lexenv-p
                         (lambda (,ctran ,lvar ,post-binding-lexenv)

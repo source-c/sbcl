@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; the branch VOP
 
@@ -35,7 +35,7 @@
 ;;; false. Otherwise, the code must branch to dest if the test was true.
 
 (define-vop (branch-if)
-  (:info dest flags not-p)
+  (:info dest not-p flags)
   (:generator 0
      (when (eq (car flags) 'not)
        (pop flags)
@@ -60,7 +60,7 @@
               (dolist (flag flags)
                 (inst jmp flag dest)))))))
 
-(defvar *cmov-ptype-representation-vop*
+(define-load-time-global *cmov-ptype-representation-vop*
   (mapcan (lambda (entry)
             (destructuring-bind (ptypes &optional sc vop)
                 entry
@@ -95,8 +95,8 @@
 
 (defun convert-conditional-move-p (node dst-tn x-tn y-tn)
   (declare (ignore node))
-  (let* ((ptype (sb!c::tn-primitive-type dst-tn))
-         (name  (sb!c::primitive-type-name ptype))
+  (let* ((ptype (sb-c::tn-primitive-type dst-tn))
+         (name  (sb-c::primitive-type-name ptype))
          (param (cdr (or (assoc name *cmov-ptype-representation-vop*)
                          '(t descriptor-reg move-if/t)))))
     (when param
@@ -105,7 +105,10 @@
           (labels ((make-tn ()
                      (make-representation-tn ptype scn))
                    (frob-tn (tn)
-                     (if (immediate-tn-p tn)
+                     ;; Careful not to load constants which require boxing
+                     ;; and may overwrite the flags.
+                     ;; Representation selection should avoid that.
+                     (if (eq (tn-kind tn) :constant)
                          tn
                          (make-tn))))
             (values vop
@@ -204,7 +207,7 @@
     (cond
       ((sc-is y immediate)
        (let* ((value (encode-value-if-immediate y))
-              (immediate (immediate32-p value)))
+              (immediate (plausible-signed-imm32-operand-p value)))
          (cond ((fixup-p value) ; immobile object
                 (inst cmp x value))
                ((and (zerop value) (sc-is x any-reg descriptor-reg))
@@ -239,3 +242,48 @@
   (def fast-if-eq-signed/c fast-if-eql-c/signed 4)
   (def fast-if-eq-unsigned fast-if-eql/unsigned 5)
   (def fast-if-eq-unsigned/c fast-if-eql-c/unsigned 4))
+
+(define-vop (%instance-ref-eq)
+  (:args (instance :scs (descriptor-reg))
+         (x :scs (descriptor-reg any-reg)
+            :load-if (or (not (sc-is x immediate))
+                         (typep (tn-value x)
+                                '(and integer
+                                  (not (signed-byte #.(- 32 n-fixnum-tag-bits))))))))
+  (:arg-types * (:constant (unsigned-byte 16)) *)
+  (:info slot)
+  (:translate %instance-ref-eq)
+  (:conditional :e)
+  (:policy :fast-safe)
+  (:generator 1
+   (inst cmp :qword
+         (ea (+ (- instance-pointer-lowtag)
+                (ash (+ slot instance-slots-offset) word-shift))
+             instance)
+         (encode-value-if-immediate x))))
+
+(define-vop (fixnump-instance-ref)
+  (:args (instance :scs (descriptor-reg)))
+  (:arg-types * (:constant (unsigned-byte 16)))
+  (:info slot)
+  (:translate fixnump-instance-ref)
+  (:conditional :e)
+  (:policy :fast-safe)
+  (:generator 1
+   (inst test :byte
+         (ea (+ (- instance-pointer-lowtag)
+                (ash (+ slot instance-slots-offset) word-shift))
+             instance)
+         fixnum-tag-mask)))
+(macrolet ((def-fixnump-cxr (name index)
+             `(define-vop (,name)
+                (:args (x :scs (descriptor-reg)))
+                (:translate ,name)
+                (:conditional :e)
+                (:policy :fast-safe)
+                (:generator 1
+                 (inst test :byte
+                       (ea (- (ash ,index word-shift) list-pointer-lowtag) x)
+                       fixnum-tag-mask)))))
+  (def-fixnump-cxr fixnump-car cons-car-slot)
+  (def-fixnump-cxr fixnump-cdr cons-cdr-slot))

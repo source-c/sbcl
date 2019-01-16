@@ -7,7 +7,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;; entries in STATIC-SYMBOLS table, references to which can be compiled
 ;;; as though they're special variables
@@ -16,33 +16,48 @@
 ;;; listed here and then listed separately (and by now, 2001-06-06,
 ;;; slightly differently) elsewhere. (Maybe this is resolved?)
 (declaim (special *posix-argv*
-                  *core-string*
-                  *stdin*
-                  *stdout*
                   *stderr*
-                  *tty*
-                  sb!vm:*current-catch-block*
-                  sb!vm::*current-unwind-protect-block*
-                  sb!vm::*alien-stack-pointer*
-                  sb!vm:*control-stack-start*
-                  sb!vm:*control-stack-end*
-                  sb!vm:*binding-stack-start*
-                  #!+(or hpux) sb!vm::*c-lra*
+                  sb-vm:*current-catch-block*
+                  sb-vm::*current-unwind-protect-block*
+                  sb-vm::*alien-stack-pointer*
+                  sb-vm:*control-stack-start*
+                  sb-vm:*control-stack-end*
+                  sb-vm:*binding-stack-start*
+                  #!+(or hpux) sb-vm::*c-lra*
                   *allow-with-interrupts*
-                  sb!unix::*unblock-deferrables-on-enabling-interrupts-p*
+                  sb-unix::*unblock-deferrables-on-enabling-interrupts-p*
                   *interrupts-enabled*
                   *interrupt-pending*
                   #!+sb-thruption *thruption-pending*
-                  #!+sb-safepoint *gc-safe*
                   #!+sb-safepoint *in-safepoint*
                   *free-interrupt-context-index*
-                  sb!vm::*allocation-pointer*
-                  sb!vm::*binding-stack-pointer*
-                  sb!pcl::*cache-miss-values-stack*
-                  sb!pcl::*dfun-miss-gfs-on-stack*))
-(defvar sb!vm:*alloc-signal*) ; initialized by create_thread_struct()
+                  #!-gencgc
+                  sb-vm::*allocation-pointer*
+                  sb-vm::*binding-stack-pointer*
+                  sb-pcl::*cache-miss-values-stack*
+                  sb-pcl::*dfun-miss-gfs-on-stack*))
+(defvar sb-vm:*alloc-signal*) ; initialized by create_thread_struct()
 ;;; This is a slot of 'struct thread' if multithreaded,
 ;;; and the symbol-global-value should never be used.
 ;;; (And in any case it is not really a special var)
 #!+(and (or x86 x86-64) (not sb-thread))
-(!defvar *pseudo-atomic-bits* 0)
+(defparameter *pseudo-atomic-bits* 0) ; initialized by genesis
+
+#!+c-stack-is-control-stack
+(setf (info :variable :always-bound 'sb-c:*alien-stack-pointer*) :always-bound)
+
+;;; A unique GC id. This is supplied for code that needs to detect
+;;; whether a GC has happened since some earlier point in time. For
+;;; example:
+;;;
+;;;   (let ((epoch *gc-epoch*))
+;;;      ...
+;;;      (unless (eql epoch *gc-epoch)
+;;;        ....))
+;;;
+;;; This isn't just a fixnum counter since then we'd have theoretical
+;;; problems when exactly 2^29 GCs happen between epoch
+;;; comparisons. Unlikely, but the cost of using a cons instead is too
+;;; small to measure. -- JES, 2007-09-30
+(declaim (type cons sb-kernel::*gc-epoch*))
+(!define-load-time-global sb-kernel::*gc-epoch* '(nil . nil))

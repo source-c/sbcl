@@ -7,7 +7,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 (declaim (special *read-suppress*))
 
@@ -70,7 +70,7 @@
                                  1 0)))
                 (i 0 (1+ i)))
                ((= i input-len) bvec)
-             (declare (index i) (optimize (sb!c::insert-array-bounds-checks 0)))
+             (declare (index i) (optimize (sb-c::insert-array-bounds-checks 0)))
              (let ((char (char bstring i)))
                (setf (elt bvec i)
                      (case char
@@ -97,33 +97,39 @@
                "Comma inside a backquoted array (not a list or general vector.)"))
          (*backquote-depth* 0)
          (contents (read stream t nil t)))
-    (if rank
-        (collect ((dims))
-          (let ((seq contents))
-            (dotimes (axis rank
-                           (make-array (dims) :initial-contents contents))
-              (unless (typep seq 'sequence)
-                (simple-reader-error stream
-                                     "#~WA axis ~W is not a sequence:~%  ~S"
-                                     rank axis seq))
-              (let ((len (length seq)))
-                (dims len)
-                (unless (or (= axis (1- rank))
-                            ;; ANSI: "If some dimension of the array whose
-                            ;; representation is being parsed is found to be
-                            ;; 0, all dimensions to the right (i.e., the
-                            ;; higher numbered dimensions) are also
-                            ;; considered to be 0."
-                            (= len 0))
-                  (setq seq (elt seq 0)))))))
-        ;; It's not legal to have #A without the rank, use that for
-        ;; #A(dimensions element-type contents) to avoid using #. when
-        ;; printing specialized arrays readably.
-        (let ((dimensions (car contents))
-              (type (cadr contents))
-              (contents (cddr contents)))
-          (make-array dimensions :initial-contents contents
-                                 :element-type type)))))
+    (cond
+      (rank
+       (collect ((dims))
+         (let ((seq contents))
+           (dotimes (axis rank
+                          (make-array (dims) :initial-contents contents))
+             (unless (typep seq 'sequence)
+               (simple-reader-error stream
+                                    "#~WA axis ~W is not a sequence:~%  ~S"
+                                    rank axis seq))
+             (let ((len (length seq)))
+               (dims len)
+               (unless (or (= axis (1- rank))
+                           ;; ANSI: "If some dimension of the array whose
+                           ;; representation is being parsed is found to be
+                           ;; 0, all dimensions to the right (i.e., the
+                           ;; higher numbered dimensions) are also
+                           ;; considered to be 0."
+                           (= len 0))
+                 (setq seq (elt seq 0))))))))
+      ;; It's not legal to have #A without the rank, use that for
+      ;; #A(dimensions element-type contents) to avoid using #. when
+      ;; printing specialized arrays readably.
+      ((list-of-length-at-least-p contents 2)
+       (destructuring-bind (dimensions type &rest contents) contents
+         (make-array dimensions :initial-contents contents
+                                :element-type type)))
+      (t
+       (simple-reader-error stream
+                            "~@<Array literal is neither of the ~
+                             standard form #<rank>A<contents> nor the ~
+                             SBCL-specific form #A(dimensions ~
+                             element-type . contents).~@:>")))))
 
 ;;;; reading structure instances: the #S readmacro
 
@@ -288,8 +294,8 @@
                     (unless (eq old new)
                       (setf (%instance-ref tree i) new)))))
                ((typep tree 'funcallable-instance)
-                (do ((i sb!vm:instance-data-start (1+ i))
-                     (end (- (1+ (get-closure-length tree)) sb!vm:funcallable-instance-info-offset)))
+                (do ((i sb-vm:instance-data-start (1+ i))
+                     (end (- (1+ (get-closure-length tree)) sb-vm:funcallable-instance-info-offset)))
                     ((= i end))
                   (let* ((old (%funcallable-instance-info tree i))
                          (new (circle-subst circle-table old)))
@@ -347,6 +353,27 @@
 
 ;;;; conditional compilation: the #+ and #- readmacros
 
+;;; If X is a symbol, see whether it is present in *FEATURES*. Also
+;;; handle arbitrary combinations of atoms using NOT, AND, OR.
+(defun featurep (x)
+  (typecase x
+    (cons
+     (case (car x)
+       ((:not not)
+        (cond
+          ((cddr x)
+           (error "too many subexpressions in feature expression: ~S" x))
+          ((null (cdr x))
+           (error "too few subexpressions in feature expression: ~S" x))
+          (t (not (featurep (cadr x))))))
+       ((:and and) (every #'featurep (cdr x)))
+       ((:or or) (some #'featurep (cdr x)))
+       (t
+        (error "unknown operator in feature expression: ~S." x))))
+    (symbol (not (null (memq x *features*))))
+    (t
+      (error "invalid feature expression: ~S" x))))
+
 (defun sharp-plus-minus (stream sub-char numarg)
     (ignore-numarg sub-char numarg)
     (if (char= (if (featurep (let ((*package* *keyword-package*)
@@ -387,7 +414,7 @@
         #'(lambda (decoding-error)
             (declare (ignorable decoding-error))
             (style-warn
-             'sb!kernel::character-decoding-error-in-dispatch-macro-char-comment
+             'sb-kernel::character-decoding-error-in-dispatch-macro-char-comment
              :sub-char sub-char :position (file-position stream) :stream stream)
             (invoke-restart 'attempt-resync))))
     (let ((stream (in-stream-from-designator stream)))

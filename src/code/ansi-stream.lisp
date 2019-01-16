@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;; HOW THE ANSI-STREAM STRUCTURE IS USED
 ;;;
@@ -126,6 +126,24 @@
   ;; maintain correctness of the slot in ANSI-STREAM-UNREAD-CHAR.
   (input-char-pos nil))
 
+;;; SYNONYM-STREAM type is needed by ANSI-STREAM-{INPUT,OUTPUT}-STREAM-P
+;;; and also needed by OPEN (though not obviously), which is compiled
+;;; prior to some of the stream type definitions in src/code/stream,
+;;; so let's define that one here as soon as we can.
+(defstruct (synonym-stream (:include ansi-stream
+                                     (in #'synonym-in)
+                                     (bin #'synonym-bin)
+                                     (n-bin #'synonym-n-bin)
+                                     (out #'synonym-out)
+                                     (bout #'synonym-bout)
+                                     (sout #'synonym-sout)
+                                     (misc #'synonym-misc))
+                           (:constructor make-synonym-stream (symbol))
+                           (:copier nil))
+  ;; This is the symbol, the value of which is the stream we are synonym to.
+  (symbol nil :type symbol :read-only t))
+(declaim (freeze-type synonym-stream))
+
 (defmethod print-object ((x stream) stream)
   (print-unreadable-object (x stream :type t :identity t)))
 
@@ -155,6 +173,7 @@
          *READ-SUPPRESS*                  NIL
          *READTABLE*                      the standard readtable
   SB-EXT:*SUPPRESS-PRINT-ERRORS*          NIL
+  SB-EXT:*PRINT-VECTOR-LENGTH*            NIL
 "
   (let ((name (make-symbol "THUNK")))
     `(dx-flet ((,name () ,@body))

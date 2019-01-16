@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; Instruction-like macros.
 
@@ -90,7 +90,7 @@
   "Jump to the lisp lip LIP."
   `(let ((function ,function)
          (lip ,lip))
-     (assert (sc-is lip interior-reg))
+     (aver (sc-is lip interior-reg))
      (inst add lip function
            (- (ash simple-fun-code-offset word-shift)
               fun-pointer-lowtag))
@@ -103,7 +103,7 @@
      ;; Indicate a single-valued return by clearing all of the status
      ;; flags, or a multiple-valued return by setting all of the status
      ;; flags.
-     (assert (sc-is lip interior-reg))
+     (aver (sc-is lip interior-reg))
      ,@(ecase return-style
          (:single-value '((inst msr :nzcv zr-tn)))
          (:multiple-values '((inst orr tmp-tn zr-tn #xf0000000)
@@ -177,7 +177,7 @@
 (defun allocation-tramp (alloc-tn size back-label return-in-tmp lip)
   (unless (eq size tmp-tn)
     (inst mov tmp-tn size))
-  (load-inline-constant alloc-tn '(:fixup "alloc_tramp" :foreign) lip)
+  (load-inline-constant alloc-tn '(:fixup alloc-tramp :assembly-routine) lip)
   (inst blr alloc-tn)
   (unless return-in-tmp
     (move alloc-tn tmp-tn))
@@ -223,7 +223,7 @@
                   size)
               #!-sb-thread
               (progn
-                (load-inline-constant ,flag-tn '(:fixup "boxed_region" :foreign) ,lip)
+                (load-inline-constant ,flag-tn '(:fixup "gc_alloc_region" :foreign) ,lip)
                 (inst ldp ,result-tn ,flag-tn (@ ,flag-tn)))
               #!+sb-thread
               (inst ldp ,result-tn ,flag-tn (@ thread-tn
@@ -234,7 +234,7 @@
               (inst b :hi ALLOC)
               #!-sb-thread
               (progn
-                (load-inline-constant ,flag-tn '(:fixup "boxed_region" :foreign) ,lip)
+                (load-inline-constant ,flag-tn '(:fixup "gc_alloc_region" :foreign) ,lip)
                 (storew ,result-tn ,flag-tn))
               #!+sb-thread
               (storew ,result-tn thread-tn thread-alloc-region-slot)
@@ -249,7 +249,7 @@
               (when ,lowtag
                 (inst add ,result-tn tmp-tn ,lowtag))
 
-              (assemble (*elsewhere*)
+              (assemble (:elsewhere)
                 (emit-label ALLOC)
                 (allocation-tramp ,result-tn
                                   ,size BACK-FROM-ALLOC
@@ -294,14 +294,10 @@
       (encode-internal-error-args values)
       (emit-alignment 2))))
 
-(defun error-call (vop error-code &rest values)
-  "Cause an error.  ERROR-CODE is the error to cause."
-  (emit-error-break vop error-trap (error-number-or-lose error-code) values))
-
 (defun generate-error-code (vop error-code &rest values)
   "Generate-Error-Code Error-code Value*
   Emit code for an error with the specified Error-Code and context Values."
-  (assemble (*elsewhere*)
+  (assemble (:elsewhere)
     (let ((start-lab (gen-label)))
       (emit-label start-lab)
       (emit-error-break vop
@@ -313,9 +309,17 @@
 
 ;;;; PSEUDO-ATOMIC
 
+#!+sb-safepoint
+(defun emit-safepoint ()
+  (inst ldr zr-tn (@ null-tn
+                     (- (+ gc-safepoint-trap-offset n-word-bytes
+                           other-pointer-lowtag)))))
 
 ;;; handy macro for making sequences look atomic
 (defmacro pseudo-atomic ((flag-tn) &body forms)
+  #!+sb-safepoint-strictly
+  `(progn ,@forms (emit-safepoint))
+  #!-sb-safepoint-strictly
   `(progn
      (without-scheduling ()
        #!-sb-thread
@@ -343,7 +347,9 @@
        (let ((not-interrputed (gen-label)))
          (inst cbz ,flag-tn not-interrputed)
          (inst brk pending-interrupt-trap)
-         (emit-label not-interrputed)))))
+         (emit-label not-interrputed))
+       #!+sb-safepoint
+       (emit-safepoint))))
 
 ;;;; memory accessor vop generators
 
@@ -354,14 +360,20 @@
              `((:translate ,translate)))
      (:policy :fast-safe)
      (:args (object :scs (descriptor-reg))
-            (index :scs (any-reg)))
+            (index :scs (any-reg immediate)))
      (:arg-types ,type tagged-num)
      (:temporary (:scs (interior-reg)) lip)
      (:results (value :scs ,scs))
      (:result-types ,el-type)
      (:generator 5
-       (inst add lip object (lsl index (- word-shift n-fixnum-tag-bits)))
-       (loadw value lip ,offset ,lowtag))))
+       (sc-case index
+         (immediate
+          (inst ldr value (@ object (load-store-offset
+                                     (- (ash (+ ,offset (tn-value index)) word-shift)
+                                        ,lowtag)))))
+         (t
+          (inst add lip object (lsl index (- word-shift n-fixnum-tag-bits)))
+          (loadw value lip ,offset ,lowtag))))))
 
 (defmacro define-full-setter (name type offset lowtag scs el-type
                               &optional translate)
@@ -370,15 +382,21 @@
              `((:translate ,translate)))
      (:policy :fast-safe)
      (:args (object :scs (descriptor-reg))
-            (index :scs (any-reg))
+            (index :scs (any-reg immediate))
             (value :scs ,scs :target result))
      (:arg-types ,type tagged-num ,el-type)
      (:temporary (:scs (interior-reg)) lip)
      (:results (result :scs ,scs))
      (:result-types ,el-type)
      (:generator 2
-       (inst add lip object (lsl index (- word-shift n-fixnum-tag-bits)))
-       (storew value lip ,offset ,lowtag)
+       (sc-case index
+         (immediate
+          (inst str value (@ object (load-store-offset
+                                     (- (ash (+ ,offset (tn-value index)) word-shift)
+                                        ,lowtag)))))
+         (t
+          (inst add lip object (lsl index (- word-shift n-fixnum-tag-bits)))
+          (storew value lip ,offset ,lowtag)))
        (move result value))))
 
 (defmacro define-partial-reffer (name type size signed offset lowtag scs
@@ -388,25 +406,40 @@
              `((:translate ,translate)))
      (:policy :fast-safe)
      (:args (object :scs (descriptor-reg))
-            (index :scs (unsigned-reg)))
-     (:arg-types ,type positive-fixnum)
+            (index :scs (any-reg unsigned-reg immediate)))
+     (:arg-types ,type tagged-num)
      (:results (value :scs ,scs))
      (:result-types ,el-type)
      (:temporary (:scs (interior-reg)) lip)
      (:generator 5
-       ,@(ecase size
-           (:byte
-            `((inst add lip object index)
-              (inst ,(if signed 'ldrsb 'ldrb)
-                    value (@ lip (- (* ,offset n-word-bytes) ,lowtag)))))
-           (:short
-            `((inst add lip object (lsl index 1))
-              (inst ,(if signed 'ldrsh 'ldrh)
-                    value (@ lip (- (* ,offset n-word-bytes) ,lowtag)))))
-           (:word
-            `((inst add lip object (lsl index 2))
-              (inst ,(if signed 'ldrsw 'ldr) (32-bit-reg value)
-                    (@ lip (- (* ,offset n-word-bytes) ,lowtag)))))))))
+       ,@(multiple-value-bind (op shift)
+             (ecase size
+               (:byte
+                (values (if signed 'ldrsb 'ldrb) 0))
+               (:short
+                (values (if signed 'ldrsh 'ldrh) 1))
+               (:word
+                (values (if signed 'ldrsw 'ldr) 2)))
+           (let ((value (if (and (eq size :word)
+                                 (not signed))
+                            '(32-bit-reg value)
+                            'value)))
+             `((sc-case index
+                 (immediate
+                  (inst ,op ,value (@ object (load-store-offset
+                                              (+
+                                               (ash (tn-value index) ,shift)
+                                               (- (* ,offset n-word-bytes) ,lowtag))))))
+                 (t
+                  (let ((shift ,shift))
+                    (sc-case index
+                      (any-reg
+                       (decf shift n-fixnum-tag-bits)))
+                    (inst add lip object (if (minusp shift)
+                                             (asr index (- shift))
+                                             (lsl index shift)))
+                    (inst ,op
+                          ,value (@ lip (- (* ,offset n-word-bytes) ,lowtag))))))))))))
 
 (defmacro define-partial-setter (name type size offset lowtag scs el-type
                                  &optional translate)
@@ -415,23 +448,40 @@
              `((:translate ,translate)))
      (:policy :fast-safe)
      (:args (object :scs (descriptor-reg))
-            (index :scs (unsigned-reg))
+            (index :scs (any-reg unsigned-reg immediate))
             (value :scs ,scs :target result))
-     (:arg-types ,type positive-fixnum ,el-type)
+     (:arg-types ,type tagged-num ,el-type)
      (:temporary (:scs (interior-reg)) lip)
      (:results (result :scs ,scs))
      (:result-types ,el-type)
      (:generator 5
-       ,@(ecase size
-           (:byte
-            `((inst add lip object index)
-              (inst strb value (@ lip (- (* ,offset n-word-bytes) ,lowtag)))))
-           (:short
-            `((inst add lip object (lsl index 1))
-              (inst strh value (@ lip (- (* ,offset n-word-bytes) ,lowtag)))))
-           (:word
-            `((inst add lip object (lsl index 2))
-              (inst str (32-bit-reg value) (@ lip (- (* ,offset n-word-bytes) ,lowtag))))))
+       ,@(multiple-value-bind (op shift)
+             (ecase size
+               (:byte
+                (values 'strb 0))
+               (:short
+                (values 'strh 1))
+               (:word
+                (values 'str 2)))
+           (let ((value (if (eq size :word)
+                            '(32-bit-reg value)
+                            'value)))
+             `((sc-case index
+                 (immediate
+                  (inst ,op ,value (@ object (load-store-offset
+                                              (+
+                                               (ash (tn-value index) ,shift)
+                                               (- (* ,offset n-word-bytes) ,lowtag))))))
+                 (t
+                  (let ((shift ,shift))
+                    (sc-case index
+                      (any-reg
+                       (decf shift n-fixnum-tag-bits)))
+                    (inst add lip object (if (minusp shift)
+                                             (asr index (- shift))
+                                             (lsl index shift)))
+                    (inst ,op
+                          ,value (@ lip (- (* ,offset n-word-bytes) ,lowtag)))))))))
        (move result value))))
 
 (defun load-inline-constant (dst value &optional lip)

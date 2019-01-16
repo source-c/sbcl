@@ -9,14 +9,14 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; data types used by pathnames
 
 ;;; The HOST structure holds the functions that both parse the
 ;;; pathname information into structure slot entries, and after
 ;;; translation the inverse (unparse) functions.
-(sb!xc:defstruct (host (:constructor nil)
+(sb-xc:defstruct (host (:constructor nil)
                        (:copier nil)
                        (:print-object
                         (lambda (host stream)
@@ -34,57 +34,19 @@
   (simplify-namestring (missing-arg) :type function :read-only t)
   (customary-case (missing-arg) :type (member :upper :lower) :read-only t))
 
-(sb!xc:defstruct
-            (logical-host
-             (:copier nil)
-             (:print-object
-              (lambda (logical-host stream)
-                (print-unreadable-object (logical-host stream :type t)
-                  (prin1 (logical-host-name logical-host) stream))))
-             (:include host
-                       (parse #'parse-logical-namestring)
-                       (parse-native
-                        (lambda (&rest x)
-                          (error "called PARSE-NATIVE-NAMESTRING using a ~
-                                  logical host: ~S" (first x))))
-                       (unparse #'unparse-logical-namestring)
-                       (unparse-native
-                        (lambda (&rest x)
-                          (error "called NATIVE-NAMESTRING using a ~
-                                  logical host: ~S" (first x))))
-                       (unparse-host
-                        (lambda (x)
-                          (logical-host-name (%pathname-host x))))
-                       (unparse-directory #'unparse-logical-directory)
-                       (unparse-file #'unparse-logical-file)
-                       (unparse-enough #'unparse-enough-namestring)
-                       (unparse-directory-separator ";")
-                       (simplify-namestring #'identity)
-                       (customary-case :upper)))
-  (name "" :type simple-string :read-only t)
-  (translations nil :type list)
-  (canon-transls nil :type list))
-
-#-sb-xc-host
-(defmethod make-load-form ((logical-host logical-host) &optional env)
-  (declare (ignore env))
-  (values `(find-logical-host ',(logical-host-name logical-host))
-          nil))
-
 ;;; A PATTERN is a list of entries and wildcards used for pattern
 ;;; matches of translations.
-(sb!xc:defstruct (pattern (:constructor make-pattern (pieces)) (:copier nil))
+(sb-xc:defstruct (pattern (:constructor make-pattern (pieces)) (:copier nil))
   (pieces nil :type list))
 
 ;;;; PATHNAME structures
 
 ;;; the various magic tokens that are allowed to appear in pretty much
 ;;; all pathname components
-(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
-  (sb!xc:deftype pathname-component-tokens ()
-    '(member nil :unspecific :wild :unc)))
+(sb-xc:deftype pathname-component-tokens ()
+  '(member nil :unspecific :wild :unc))
 
-(sb!xc:defstruct (pathname (:conc-name %pathname-)
+(sb-xc:defstruct (pathname (:conc-name %pathname-)
                            (:copier nil)
                            (:constructor %%make-pathname
                                (host device directory name type version
@@ -110,73 +72,3 @@
   (version nil :type (or integer pathname-component-tokens (member :newest))
                :read-only t))
 
-;;; Logical pathnames have the following format:
-;;;
-;;; logical-namestring ::=
-;;;      [host ":"] [";"] {directory ";"}* [name] ["." type ["." version]]
-;;;
-;;; host ::= word
-;;; directory ::= word | wildcard-word | **
-;;; name ::= word | wildcard-word
-;;; type ::= word | wildcard-word
-;;; version ::= pos-int | newest | NEWEST | *
-;;; word ::= {uppercase-letter | digit | -}+
-;;; wildcard-word ::= [word] '* {word '*}* [word]
-;;; pos-int ::= integer > 0
-;;;
-;;; Physical pathnames include all these slots and a device slot.
-
-;;; Logical pathnames are a subclass of PATHNAME. Their class
-;;; relations are mimicked using structures for efficiency.
-(sb!xc:defstruct (logical-pathname (:conc-name %logical-pathname-)
-                                   (:include pathname)
-                                   (:copier nil)
-                                   (:constructor %make-logical-pathname
-                                    (host device directory name type version
-                                     &aux (dir-hash (pathname-dir-hash directory))
-                                          (stem-hash (mix (sxhash name) (sxhash type)))))))
-
-;;; This is used both for Unix and Windows: while we accept both
-;;; \ and / as directory separators on Windows, we print our
-;;; own always with /, which is much less confusing what with
-;;; being \ needing to be escaped.
-#-sb-xc-host ; %PATHNAME-DIRECTORY is target-only
-(defun unparse-physical-directory (pathname escape-char)
-  (declare (pathname pathname))
-  (unparse-physical-directory-list (%pathname-directory pathname) escape-char))
-
-#-sb-xc-host
-(defun unparse-physical-directory-list (directory escape-char)
-  (declare (list directory))
-  (collect ((pieces))
-    (when directory
-      (ecase (pop directory)
-       (:absolute
-        (let ((next (pop directory)))
-          (cond ((eq :home next)
-                 (pieces "~"))
-                ((and (consp next) (eq :home (car next)))
-                 (pieces "~")
-                 (pieces (second next)))
-                ((and (plusp (length next)) (char= #\~ (char next 0)))
-                 ;; The only place we need to escape the tilde.
-                 (pieces "\\")
-                 (pieces next))
-                (next
-                 (push next directory)))
-          (pieces "/")))
-        (:relative))
-      (dolist (dir directory)
-        (typecase dir
-         ((member :up)
-          (pieces "../"))
-         ((member :back)
-          (error ":BACK cannot be represented in namestrings."))
-         ((member :wild-inferiors)
-          (pieces "**/"))
-         ((or simple-string pattern (member :wild))
-          (pieces (unparse-physical-piece dir escape-char))
-          (pieces "/"))
-         (t
-          (error "invalid directory component: ~S" dir)))))
-    (apply #'concatenate 'simple-string (pieces))))

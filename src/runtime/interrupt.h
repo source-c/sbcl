@@ -73,11 +73,6 @@ extern void maybe_save_gc_mask_and_block_deferrables(sigset_t *sigset);
  *
  * -- NS 2007-01-29
  */
-/* No longer defined here, but in 'compiler/generic/parms.lisp' due to
-   requirement that Lisp skip this many words when assigning thread-local
-   storage indices */
-// #define MAX_INTERRUPTS 1024
-
 union interrupt_handler {
     lispobj lisp;
     void (*c)(int, siginfo_t*, os_context_t*);
@@ -97,7 +92,7 @@ struct interrupt_data {
      * and with no pending handler. Both deferrable interrupt handlers
      * and gc are careful not to clobber each other's pending_mask. */
     boolean gc_blocked_deferrables;
-#ifdef GENCGC_IS_PRECISE
+#if GENCGC_IS_PRECISE
     /* On PPC when consing wants to turn to alloc(), it does so via a
      * trap. When alloc() wants to save the sigmask it consults
      * allocation_trap_context. It does not look up the most recent

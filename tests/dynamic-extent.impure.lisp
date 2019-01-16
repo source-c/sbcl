@@ -335,7 +335,7 @@
   (sb-int:dx-let ((s (make-list-container :listy-slot (make-list n))))
     (funcall thunk s)))
 ;; :stack-allocatable-lists is necessary but not sufficient
-(with-test (:name (:dx-list :make-list) :skipped-on '(not :x86-64))
+(with-test (:name (:dx-list :make-list) :skipped-on (not :x86-64))
   (assert (null (ctu:find-named-callees #'make-var-length-dx-list)))
   (assert-no-consing (make-var-length-dx-list
                       50 (lambda (x) (declare (ignore x))))))
@@ -514,7 +514,7 @@
 ;; even though the MAKE- function was not expressly INLINE when its DEFSTRUCT
 ;; was compiled.
 (dolist (s '(make-foo1 make-foo2 make-foo3))
-  (assert (null (sb-int:info :function :inline-expansion-designator s))))
+  (assert (null (sb-int:info :function :inlining-data s))))
 
 (defstruct foo1 x)
 
@@ -625,26 +625,26 @@
 
 (with-test (:name (:bug-1044465 :reduced))
   ;; Test case from Stas Boukarev
-  (compile nil '(lambda (x)
-                 (let ((a (if x
-                              (list (list x))
-                              (list (list x)))))
-                   (declare (dynamic-extent a))
-                   (prin1 a)
-                   1))))
+  (checked-compile '(lambda (x)
+                      (let ((a (if x
+                                   (list (list x))
+                                   (list (list x)))))
+                        (declare (dynamic-extent a))
+                        (prin1 a)
+                        1))))
 
 (with-test (:name (:bug-1044465 :nasty))
   ;; Test case from Alastair Bridgewater
-  (compile nil '(lambda (x y)
-                 (dotimes (i 2)
-                   (block bar
-                     (let ((a (if x
-                                 (list (list x))
-                                 (list (list x))))
-                           (b (if y x (return-from bar x))))
-                      (declare (dynamic-extent a))
-                      (prin1 a)
-                      b))))))
+  (checked-compile '(lambda (x y)
+                      (dotimes (i 2)
+                        (block bar
+                          (let ((a (if x
+                                       (list (list x))
+                                       (list (list x))))
+                                (b (if y x (return-from bar x))))
+                            (declare (dynamic-extent a))
+                            (prin1 a)
+                            b))))))
 
 ;;; multiple uses for dx lvar
 
@@ -664,13 +664,16 @@
 ;;; handler-case and handler-bind should use DX internally
 
 (defun dx-handler-bind (x)
-  (handler-bind ((error
-                  #'(lambda (c)
-                      (break "OOPS: ~S caused ~S" x c)))
-                 ((and serious-condition (not error))
-                  #'(lambda (c)
-                      (break "OOPS2: ~S did ~S" x c))))
-    (/ 2 x)))
+  (let ((y 3))
+    (macrolet ((fool () `(lambda (c) (print (list c (incf y))))))
+      (handler-bind ((error
+                      #'(lambda (c)
+                          (break "OOPS: ~S caused ~S" x c)))
+                     (warning (fool))
+                     ((and serious-condition (not error))
+                      #'(lambda (c)
+                          (break "OOPS2: ~S did ~S" x c))))
+        (/ 2 x)))))
 
 (defun dx-handler-case (x)
   (assert (zerop (handler-case (/ 2 x)
@@ -691,11 +694,11 @@
 
 (defvar *a-cons* (cons nil nil))
 
-(with-test (:name (:no-consing :dx-closures) :skipped-on '(not :stack-allocatable-closures))
+(with-test (:name (:no-consing :dx-closures) :skipped-on (not :stack-allocatable-closures))
   (assert-no-consing (dxclosure 42)))
 
 (with-test (:name (:no-consing :dx-lists)
-            :skipped-on '(not (and :stack-allocatable-lists
+            :skipped-on (not (and :stack-allocatable-lists
                                :stack-allocatable-fixed-objects)))
   (assert-no-consing (dxlength 1 2 3))
   (assert-no-consing (dxlength t t t t t t))
@@ -713,11 +716,11 @@
   (assert-no-consing (multiple-dx-uses)))
 
 (with-test (:name (:no-consing :dx-value-cell)
-                  :skipped-on '(not :stack-allocatable-closures))
+                  :skipped-on (not :stack-allocatable-closures))
   (assert-no-consing (dx-value-cell 13)))
 
 (with-test (:name (:no-consing :dx-fixed-objects)
-                  :skipped-on '(not (and :stack-allocatable-fixed-objects
+                  :skipped-on (not (and :stack-allocatable-fixed-objects
                                          :stack-allocatable-closures)))
   (assert-no-consing (cons-on-stack 42))
   (assert-no-consing (make-foo1-on-stack 123))
@@ -726,7 +729,7 @@
   (assert-no-consing (dx-handler-bind 2))
   (assert-no-consing (dx-handler-case 2)))
 
-(with-test (:name (:no-consing :dx-vectors) :skipped-on '(not :stack-allocatable-vectors))
+(with-test (:name (:no-consing :dx-vectors) :skipped-on (not :stack-allocatable-vectors))
   (assert-no-consing (force-make-array-on-stack 128))
   (assert-no-consing (make-array-on-stack-2 5 '(1 2.0 3 4.0 5)))
   (assert-no-consing (make-array-on-stack-3 9 8 7))
@@ -734,7 +737,7 @@
   (assert-no-consing (make-array-on-stack-5))
   (assert-no-consing (vector-on-stack :x :y)))
 
-(with-test (:name (:no-consing :dx-arrays) :skipped-on '(not :stack-allocatable-vectors))
+(with-test (:name (:no-consing :dx-arrays) :skipped-on (not :stack-allocatable-vectors))
   (assert-no-consing (make-3d-fixed-array-on-stack-1))
   (assert-no-consing (make-2d-variable-array-on-stack))
   (assert-no-consing (make-2d-array-function-initializer 1))
@@ -742,13 +745,13 @@
   (assert-no-consing (make-2d-array-function-initializer 3)))
 
 (with-test (:name (:no-consing :dx-specialized-arrays)
-            :skipped-on '(not (and :stack-allocatable-vectors
+            :skipped-on (not (and :stack-allocatable-vectors
                                    :c-stack-is-control-stack)))
   (assert-no-consing (make-3d-fixed-array-on-stack-2 0 0 1 1)))
 
 (with-test (:name (:no-consing :specialized-dx-vectors)
-            :skipped-on `(not (and :stack-allocatable-vectors
-                                   :c-stack-is-control-stack)))
+            :skipped-on (not (and :stack-allocatable-vectors
+                                  :c-stack-is-control-stack)))
   (assert-no-consing (make-array-on-stack-1))
   (assert-no-consing (make-array-on-stack-6))
   (assert-no-consing (make-array-on-stack-7))
@@ -757,8 +760,11 @@
   (assert-no-consing (make-array-on-stack-10))
   (assert-no-consing (make-array-on-stack-11)))
 
-(with-test (:name (:no-consing :dx-raw-instances) :skipped-on '(or (not :raw-instance-init-vops)
-                                                                   (not (and :gencgc :c-stack-is-control-stack))))
+(when (gethash 'sb-vm::raw-instance-init/word sb-c::*backend-parsed-vops*)
+  (pushnew :raw-instance-init-vops *features*))
+(with-test (:name (:no-consing :dx-raw-instances)
+            :skipped-on (or (not :raw-instance-init-vops)
+                            (not (and :gencgc :c-stack-is-control-stack))))
   (let (a b)
     (setf a 1.24 b 1.23d0)
     (assert-no-consing (make-foo2-on-stack a b)))
@@ -798,27 +804,47 @@
   (sb-thread:with-mutex (*mutex*)
     (true *mutex*)))
 
-(with-test (:name (:no-consing :mutex) :skipped-on '(not :sb-thread))
+(with-test (:name (:no-consing :mutex) :skipped-on (not :sb-thread))
   (assert-no-consing (test-mutex)))
 
 
 ;;; Bugs found by Paul F. Dietz
 
 (with-test (:name (:dx-bug-misc :pfdietz))
-  (assert
-   (eq
-    (funcall
-     (compile
-      nil
+  (checked-compile-and-assert (:optimize :all)
       '(lambda (a b)
-        (declare (optimize (speed 2) (space 0) (safety 0)
-                  (debug 1) (compilation-speed 3)))
-        (let* ((v5 (cons b b)))
-          (declare (dynamic-extent v5))
-          v5
-          a)))
-     'x 'y)
-    'x)))
+         (let* ((v5 (cons b b)))
+           (declare (dynamic-extent v5))
+           v5
+           a))
+    (('x 'y) 'x)))
+
+(with-test (:name :bug-1738095)
+  ;; STACK analysis wasn't marking UVL or DX LVARs that are held live
+  ;; by a DX allocation as being live in blocks along the path from
+  ;; the allocation to the ENTRY node, causing problems when there is
+  ;; a block that is outside the lexical environment of the "earlier"
+  ;; DX allocation (in the case below, such a block would be the first
+  ;; (outermost) use of LIST).
+  (checked-compile '(lambda ()
+                     (let ((* (list (let ((* (list nil)))
+                                      (declare (dynamic-extent *))
+                                      (list 1)))))
+                       (declare (dynamic-extent *))))))
+
+(with-test (:name :bug-1739308)
+  ;; STACK analysis wasn't propagating DX LVARs back from ENTRY to
+  ;; allocation through non-local-entry environments (below, the CATCH
+  ;; entry point), causing problems when such is the ONLY live path
+  ;; back to the allocation.
+  (checked-compile '(lambda (x y)
+                     (let ((s
+                            (multiple-value-prog1
+                                (list x)
+                              (catch 'ct1
+                                (throw 'ct8 30)))))
+                       (declare (dynamic-extent s))
+                       (funcall (the function y) s)))))
 
 ;;; bug reported by Svein Ove Aas
 (defun svein-2005-ii-07 (x y)
@@ -945,28 +971,28 @@
                  (test-update-uvl-live-sets #() 4 5))))
 
 (with-test (:name :regression-1.0.23.38)
-  (compile nil '(lambda ()
-                 (declare (muffle-conditions compiler-note))
-                 (flet ((make (x y)
-                          (let ((res (cons x x)))
-                            (setf (cdr res) y)
-                            res)))
-                   (declare (inline make))
-                   (let ((z (make 1 2)))
-                     (declare (dynamic-extent z))
-                     (print z)
-                     t))))
-  (compile nil '(lambda ()
-                 (declare (muffle-conditions compiler-note))
-                 (flet ((make (x y)
-                          (let ((res (cons x x)))
-                            (setf (cdr res) y)
-                            (if x res y))))
-                   (declare (inline make))
-                   (let ((z (make 1 2)))
-                     (declare (dynamic-extent z))
-                     (print z)
-                     t)))))
+  (checked-compile '(lambda ()
+                      (declare (muffle-conditions compiler-note))
+                      (flet ((make (x y)
+                               (let ((res (cons x x)))
+                                 (setf (cdr res) y)
+                                 res)))
+                        (declare (inline make))
+                        (let ((z (make 1 2)))
+                          (declare (dynamic-extent z))
+                          (print z)
+                          t))))
+  (checked-compile '(lambda ()
+                      (declare (muffle-conditions compiler-note))
+                      (flet ((make (x y)
+                               (let ((res (cons x x)))
+                                 (setf (cdr res) y)
+                                 (if x res y))))
+                        (declare (inline make))
+                        (let ((z (make 1 2)))
+                          (declare (dynamic-extent z))
+                          (print z)
+                          t)))))
 
 ;;; On x86 and x86-64 upto 1.0.28.16 LENGTH and WORDS argument
 ;;; tns to ALLOCATE-VECTOR-ON-STACK could be packed in the same
@@ -981,54 +1007,42 @@
   (assert (= 1 (length-and-words-packed-in-same-tn -3))))
 
 (with-test (:name :handler-case-bogus-compiler-note
-            :skipped-on '(not (and :stack-allocatable-fixed-objects
+            :skipped-on (not (and :stack-allocatable-fixed-objects
                                    :stack-allocatable-closures)))
-  (handler-bind
-      ((compiler-note (lambda (note)
-                        (error "compiler issued note ~S during test" note))))
-    ;; Taken from SWANK, used to signal a bogus stack allocation
-    ;; failure note.
-    (compile nil
-             `(lambda (files fasl-dir load)
-                (declare (muffle-conditions style-warning))
-                (let ((needs-recompile nil))
-                  (dolist (src files)
-                    (let ((dest (binary-pathname src fasl-dir)))
-                      (handler-case
-                          (progn
-                            (when (or needs-recompile
-                                      (not (probe-file dest))
-                                      (file-newer-p src dest))
-                              (setq needs-recompile t)
-                              (ensure-directories-exist dest)
-                              (compile-file src :output-file dest :print nil :verbose t))
-                            (when load
-                              (load dest :verbose t)))
-                        (serious-condition (c)
-                          (handle-loadtime-error c dest))))))))))
+  ;; Taken from SWANK, used to signal a bogus stack allocation
+  ;; failure note.
+  (checked-compile
+   `(lambda (files fasl-dir load)
+      (declare (muffle-conditions style-warning))
+      (let ((needs-recompile nil))
+        (dolist (src files)
+          (let ((dest (binary-pathname src fasl-dir)))
+            (handler-case
+                (progn
+                  (when (or needs-recompile
+                            (not (probe-file dest))
+                            (file-newer-p src dest))
+                    (setq needs-recompile t)
+                    (ensure-directories-exist dest)
+                    (compile-file src :output-file dest :print nil :verbose t))
+                  (when load
+                    (load dest :verbose t)))
+              (serious-condition (c)
+                (handle-loadtime-error c dest)))))))
+   :allow-notes nil))
 
-(declaim (inline foovector barvector))
-(defun foovector (x y z)
-  (let ((v (make-array 3)))
-    (setf (aref v 0) x
-          (aref v 1) y
-          (aref v 2) z)
-    v))
+(declaim (inline barvector))
 (defun barvector (x y z)
   (make-array 3 :initial-contents (list x y z)))
 (with-test (:name :dx-compiler-notes
-            :skipped-on '(not (and :stack-allocatable-vectors
-                                   :stack-allocatable-closures)))
+            :skipped-on (not (and :stack-allocatable-vectors
+                                  :stack-allocatable-closures))
+            :fails-on (and))
   (flet ((assert-notes (j lambda)
-           (let ((n 0))
-             (handler-bind ((compiler-note (lambda (c)
-                                             (declare (ignore c))
-                                             (incf n))))
-               (let ((*error-output* (make-broadcast-stream)))
-                 (compile nil lambda))
-               (unless (= j n)
-                 (error "Wanted ~S notes, got ~S for~%   ~S"
-                        j n lambda))))))
+           (let ((notes (nth 4 (multiple-value-list (checked-compile lambda))))) ; TODO
+             (unless (= (length notes) j)
+               (error "Wanted ~S notes, got ~S for~%   ~S"
+                      j (length notes) lambda)))))
     ;; These ones should complain.
     (assert-notes 1 `(lambda (x)
                        (let ((v (make-array x)))
@@ -1039,11 +1053,6 @@
                                     (true x)
                                     (true (- x)))))
                          (declare (dynamic-extent y))
-                         (print y)
-                         nil)))
-    (assert-notes 1 `(lambda (x)
-                       (let ((y (foovector x x x)))
-                         (declare (sb-int:truly-dynamic-extent y))
                          (print y)
                          nil)))
     ;; These ones should not complain.
@@ -1080,7 +1089,7 @@
           (assert (= sp (sb-c::%primitive sb-c:current-stack-pointer)))
           (setf sp (sb-c::%primitive sb-c:current-stack-pointer))))))
 (with-test (:name :handler-case-eating-stack
-            :skipped-on '(not (and :stack-allocatable-fixed-objects
+            :skipped-on (not (and :stack-allocatable-fixed-objects
                                    :stack-allocatable-closures)))
   (assert-no-consing (handler-case-eating-stack)))
 
@@ -1100,7 +1109,7 @@
       (declare (dynamic-extent vec))
       (funcall fun vec))))
 (with-test (:name :recheck-nested-dx-bug
-            :skipped-on '(not :stack-allocatable-vectors))
+            :skipped-on (not :stack-allocatable-vectors))
   (assert (funcall (bad-boy (vec 1.0 2.0 3.3))
                    (lambda (vec) (equalp vec (vec 1.0 2.0 3.3)))))
   (flet ((foo (x) (declare (ignore x))))
@@ -1108,29 +1117,24 @@
       (assert-no-consing (funcall bad-boy #'foo)))))
 
 (with-test (:name :bug-497321)
-  (flet ((test (lambda type)
-           (let ((n 0))
-             (handler-bind ((condition (lambda (c)
-                                         (incf n)
-                                         (unless (typep c type)
-                                           (error "wanted ~S for~%  ~S~%got ~S"
-                                                  type lambda (type-of c))))))
-               (let ((*error-output* (make-broadcast-stream)))
-                 (compile nil lambda)))
-             (assert (= n 1)))))
+  (flet ((test (lambda &rest args)
+           (multiple-value-bind (fun failure-p warnings style-warnings notes)
+               (apply #'checked-compile lambda args)
+             (declare (ignore fun failure-p))
+             (assert (= (length (append warnings style-warnings notes)) 1)))))
     (test `(lambda () (declare (dynamic-extent #'bar)))
-          'style-warning)
+          :allow-style-warnings 'style-warning)
     (test `(lambda () (declare (dynamic-extent bar)))
-          'style-warning)
+          :allow-style-warnings 'style-warning)
     (test `(lambda (bar) (cons bar (lambda () (declare (dynamic-extent bar)))))
-          'sb-ext:compiler-note)
+          :allow-notes 'sb-ext:compiler-note)
     (test `(lambda ()
              (flet ((bar () t))
                (cons #'bar (lambda () (declare (dynamic-extent #'bar))))))
-          'sb-ext:compiler-note)))
+          :allow-notes 'sb-ext:compiler-note)))
 
 (with-test (:name :bug-586105
-            :skipped-on '(not (and :stack-allocatable-vectors
+            :skipped-on (not (and :stack-allocatable-vectors
                                :stack-allocatable-lists)))
   (flet ((test (x)
            (let ((vec1 (make-array 1 :initial-contents (list (list x))))
@@ -1193,28 +1197,28 @@
 ;;;; These tests aren't strictly speaking DX, but rather &REST -> &MORE
 ;;;; conversion.
 (with-test (:name :rest-to-more-conversion)
-  (let ((f1 (compile nil `(lambda (f &rest args)
-                            (apply f args)))))
+  (let ((f1 (checked-compile `(lambda (f &rest args)
+                                (apply f args)))))
     (assert-no-consing (assert (eql f1 (funcall f1 #'identity f1)))))
-  (let ((f2 (compile nil `(lambda (f1 f2 &rest args)
-                            (values (apply f1 args) (apply f2 args))))))
+  (let ((f2 (checked-compile `(lambda (f1 f2 &rest args)
+                                (values (apply f1 args) (apply f2 args))))))
     (assert-no-consing (multiple-value-bind (a b)
                            (funcall f2 (lambda (x y z) (+ x y z)) (lambda (x y z) (- x y z))
                                     1 2 3)
                          (assert (and (eql 6 a) (eql -4 b))))))
-  (let ((f3 (compile nil `(lambda (f &optional x &rest args)
-                            (when x
-                              (apply f x args))))))
+  (let ((f3 (checked-compile `(lambda (f &optional x &rest args)
+                                (when x
+                                  (apply f x args))))))
     (assert-no-consing (assert (eql 42 (funcall f3
                                                 (lambda (a b c) (+ a b c))
                                                 11
                                                 10
                                                 21)))))
   (let ((f4
-          (let ((*error-output* (make-broadcast-stream)))
-            (compile nil `(lambda (f &optional x &rest args
-                                     &key y &allow-other-keys)
-                            (apply f y x args))))))
+         (checked-compile `(lambda (f &optional x &rest args
+                                    &key y &allow-other-keys)
+                             (apply f y x args))
+                          :allow-style-warnings t)))
     (assert-no-consing (funcall f4 (lambda (y x yk y2 b c)
                                      (assert (eq y 'y))
                                      (assert (= x 2))
@@ -1223,62 +1227,73 @@
                                      (assert (eq b 'b))
                                      (assert (eq c 'c)))
                                 2 :y 'y 'b 'c)))
-  (let ((f5 (compile nil `(lambda (a b c &rest args)
-                            (apply #'list* a b c args)))))
-    (assert (equal '(1 2 3 4 5 6 7) (funcall f5 1 2 3 4 5 6 '(7)))))
-  (let ((f6 (compile nil `(lambda (x y)
-                            (declare (optimize speed))
-                            (concatenate 'string x y)))))
-    (assert (equal "foobar" (funcall f6 "foo" "bar"))))
-  (let ((f7 (compile nil `(lambda (&rest args)
-                            (lambda (f)
-                              (apply f args))))))
-    (assert (equal '(a b c d e f) (funcall (funcall f7 'a 'b 'c 'd 'e 'f) 'list))))
-  (let ((f8 (compile nil `(lambda (&rest args)
-                            (flet ((foo (f)
-                                     (apply f args)))
-                              #'foo)))))
-    (assert (equal '(a b c d e f) (funcall (funcall f8 'a 'b 'c 'd 'e 'f) 'list))))
-  (let ((f9 (compile nil `(lambda (f &rest args)
-                            (flet ((foo (g)
-                                     (apply g args)))
-                              (declare (dynamic-extent #'foo))
-                              (funcall f #'foo))))))
-    (assert (equal '(a b c d e f)
-                   (funcall f9 (lambda (f) (funcall f 'list)) 'a 'b 'c 'd 'e 'f))))
-  (let ((f10 (compile nil `(lambda (f &rest args)
-                            (flet ((foo (g)
-                                     (apply g args)))
-                              (funcall f #'foo))))))
-    (assert (equal '(a b c d e f)
-                   (funcall f10 (lambda (f) (funcall f 'list)) 'a 'b 'c 'd 'e 'f))))
-  (let ((f11 (compile nil `(lambda (x y z)
-                             (block out
-                               (labels ((foo (x &rest rest)
-                                          (apply (lambda (&rest rest2)
-                                                   (return-from out (values-list rest2)))
-                                                 x rest)))
-                                (if x
-                                    (foo x y z)
-                                    (foo y z x))))))))
-    (multiple-value-bind (a b c) (funcall f11 1 2 3)
-      (assert (eql a 1))
-      (assert (eql b 2))
-      (assert (eql c 3)))))
+  (checked-compile-and-assert ()
+      `(lambda (a b c &rest args)
+         (apply #'list* a b c args))
+    ((1 2 3 4 5 6 '(7)) '(1 2 3 4 5 6 7)))
+  (checked-compile-and-assert ()
+      `(lambda (x y)
+         (concatenate 'string x y))
+    (("foo" "bar") "foobar"))
+  (checked-compile-and-assert ()
+      `(lambda (&rest args)
+         (lambda (f)
+           (apply f args)))
+    (('a 'b 'c 'd 'e 'f) '(a b c d e f)
+     :test (lambda (values expected)
+             (equal (multiple-value-list
+                     (funcall (first values) 'list))
+                    expected))))
+  (checked-compile-and-assert ()
+      `(lambda (&rest args)
+         (flet ((foo (f)
+                  (apply f args)))
+           #'foo))
+    (('a 'b 'c 'd 'e 'f) '(a b c d e f)
+     :test (lambda (values expected)
+             (equal (multiple-value-list
+                     (funcall (first values) 'list))
+                    expected))))
+  (checked-compile-and-assert ()
+      `(lambda (f &rest args)
+         (flet ((foo (g)
+                  (apply g args)))
+           (declare (dynamic-extent #'foo))
+           (funcall f #'foo)))
+    (((lambda (f) (funcall f 'list)) 'a 'b 'c 'd 'e 'f)
+     '(a b c d e f)))
+  (checked-compile-and-assert ()
+      `(lambda (f &rest args)
+         (flet ((foo (g)
+                  (apply g args)))
+           (funcall f #'foo)))
+    (((lambda (f) (funcall f 'list)) 'a 'b 'c 'd 'e 'f)
+     '(a b c d e f)))
+  (checked-compile-and-assert ()
+      `(lambda (x y z)
+         (block out
+           (labels ((foo (x &rest rest)
+                      (apply (lambda (&rest rest2)
+                               (return-from out (values-list rest2)))
+                             x rest)))
+             (if x
+                 (foo x y z)
+                 (foo y z x)))))
+    ((1 2 3) (values 1 2 3))))
 
 (defun opaque-funcall (function &rest arguments)
   (apply function arguments))
 
 (with-test (:name :implicit-value-cells)
   (flet ((test-it (type input output)
-           (let ((f (compile nil `(lambda (x)
-                                    (declare (type ,type x))
-                                    (flet ((inc ()
-                                             (incf x)))
-                                      (declare (dynamic-extent #'inc))
-                                      (list (opaque-funcall #'inc) x))))))
-             (assert (equal (funcall f input)
-                            (list output output))))))
+           (checked-compile-and-assert ()
+               `(lambda (x)
+                  (declare (type ,type x))
+                  (flet ((inc ()
+                           (incf x)))
+                    (declare (dynamic-extent #'inc))
+                    (list (opaque-funcall #'inc) x)))
+             ((input) (list output output)))))
     (let ((width sb-vm:n-word-bits))
       (test-it t (1- most-positive-fixnum) most-positive-fixnum)
       (test-it `(unsigned-byte ,(1- width)) (ash 1 (- width 2)) (1+ (ash 1 (- width 2))))
@@ -1290,24 +1305,22 @@
       (test-it '(complex double-float) #c(3d0 4d0) #c(4d0 4d0)))))
 
 (with-test (:name :sap-implicit-value-cells)
-  (let ((f (compile nil `(lambda (x)
-                           (declare (type system-area-pointer x))
-                           (flet ((inc ()
-                                    (setf x (sb-sys:sap+ x 16))))
-                             (declare (dynamic-extent #'inc))
-                             (list (opaque-funcall #'inc) x)))))
+  (let ((f (checked-compile `(lambda (x)
+                               (declare (type system-area-pointer x))
+                               (flet ((inc ()
+                                        (setf x (sb-sys:sap+ x 16))))
+                                 (declare (dynamic-extent #'inc))
+                                 (list (opaque-funcall #'inc) x)))))
         (width sb-vm:n-machine-word-bits))
     (assert (every (lambda (x)
                      (sb-sys:sap= x (sb-sys:int-sap (+ 16 (ash 1 (1- width))))))
                    (funcall f (sb-sys:int-sap (ash 1 (1- width))))))))
 
-(with-test (:name :&more-bounds)
-  ;; lp#1154946
-  (assert (not (funcall (compile nil '(lambda (&rest args) (car args))))))
-  (assert (not (funcall (compile nil '(lambda (&rest args) (nth 6 args))))))
-  (assert (not (funcall (compile nil '(lambda (&rest args) (elt args 10))))))
-  (assert (not (funcall (compile nil '(lambda (&rest args) (cadr args))))))
-  (assert (not (funcall (compile nil '(lambda (&rest args) (third args)))))))
+(with-test (:name (:&more-bounds :lp-1154946))
+  (checked-compile-and-assert () '(lambda (&rest args) (car args)) (() nil))
+  (checked-compile-and-assert () '(lambda (&rest args) (nth 6 args)) (() nil))
+  (checked-compile-and-assert () '(lambda (&rest args) (cadr args)) (() nil))
+  (checked-compile-and-assert () '(lambda (&rest args) (third args)) (() nil)))
 
 (with-test (:name :local-notinline-functions)
   (multiple-value-bind (start result end)
@@ -1339,22 +1352,202 @@
     (assert (sb-sys:sap= start end))
     (assert result)))
 
-
 (with-test (:name :unused-paremeters-of-an-inlined-function)
   (let ((name (gensym "fun")))
     (proclaim `(inline ,name))
     (eval `(defun ,name (a b &optional c d)
              (declare (ignore c d))
              (cons a b)))
-    (assert (equal (funcall
-                    (funcall
-                     (checked-compile
-                      `(lambda ()
-                         (let ((x (cons
-                                   (,name 1 2)
-                                   (,name 2 3))))
-                           (declare (dynamic-extent x))
-                           (true x))
-                         #',name)))
-                    2 3)
-                   '(2 . 3)))))
+    (checked-compile-and-assert ()
+        `(lambda ()
+           (let ((x (cons
+                     (,name 1 2)
+                     (,name 2 3))))
+             (declare (dynamic-extent x))
+             (true x))
+           #',name)
+      (() '(2 . 3) :test (lambda (values expected)
+                           (equal (multiple-value-list
+                                   (funcall (first values) 2 3))
+                                  expected))))))
+
+(with-test (:name :nested-multiple-use-vars)
+  (let ((fun (checked-compile
+              `(lambda ()
+                 (sb-int:dx-let ((x (let ((x (make-array 3)))
+                                      (setf (aref x 0) 22)
+                                      x)))
+                   (opaque-identity x)
+                   10)))))
+    (assert-no-consing (funcall fun))))
+
+(with-test (:name :nested-multiple-use-vars-vector-fill)
+  (let ((fun (checked-compile
+              `(lambda ()
+                 (declare (optimize speed))
+                 (sb-int:dx-let ((x (make-array 3 :initial-element 123)))
+                   (opaque-identity x)
+                   10)))))
+    (assert-no-consing (funcall fun))))
+
+(defun trythisfun (test arg &key key)
+  (declare (dynamic-extent test key))
+  (funcall test (funcall key arg)))
+(declaim (maybe-inline sortasort))
+(defun sortasort (seq pred)
+  (declare (dynamic-extent pred))
+  (funcall pred (elt seq 0) (elt seq 1))
+  seq)
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (import 'sb-c::fun-name-dx-args))
+(with-test (:name :store-dx-arglist)
+  ;; Positional argument 0 and keyword argument :KEY
+  (assert (equal (fun-name-dx-args 'trythisfun) '(0 :key)))
+  ;; Positional argument 1
+  (assert (equal (fun-name-dx-args 'sortasort) '(1)))
+  ;; And also an inline expansion
+  (assert (sb-c::fun-name-inline-expansion 'sortasort)))
+(with-test (:name :store-dx-arglist-std-functions)
+  ;; You might think this would go in the SB-C::FUN-INFO,
+  ;; but we want user-defined functions to have this bit of info
+  ;; as well, potentially.
+  (assert (equal (fun-name-dx-args 'remove) '(:test :test-not :key)))
+  (assert (equal (fun-name-dx-args 'remove-if) '(0 :key))))
+
+(defun trivial-hof (fun arg)
+  (declare (dynamic-extent fun))
+  (funcall fun 3 arg))
+
+(declaim (ftype (function (function t &key (:key function)) *)
+                fancy-hof))
+(defun fancy-hof (pred arg &key key)
+  (declare (dynamic-extent pred key))
+  (funcall pred (funcall key arg)))
+
+(defun autodxclosure1 (&optional (x 4))
+  ;; Calling a higher-order function will only implicitly DXify a funarg
+  ;; if the callee is trusted (a CL: function) or the caller is unsafe.
+  (declare (optimize speed (safety 0) (debug 0)))
+  (trivial-hof (lambda (a b) (+ a b x)) 92))
+
+(defun autodxclosure2 (&aux (i 0) (j 0))
+  (declare (optimize speed (safety 0) (debug 0)))
+  (assert (eq (fancy-hof (lambda (x) (incf i) (symbolp x))
+                         '(a b)
+                         :key (lambda (x) (incf j) (car x)))
+              t))
+  (assert (and (= i 1) (= j 1))))
+
+(with-test (:name (:no-consing :auto-dx-closures)
+                  :skipped-on (not :stack-allocatable-closures))
+  (assert-no-consing (autodxclosure1 42))
+  (assert-no-consing (autodxclosure2)))
+
+#+gencgc
+(with-test (:name (:no-consing :more-auto-dx-closures)
+                  :skipped-on (not :stack-allocatable-closures))
+  (assert-no-consing
+   (let ((ct 0))
+     (sb-vm:map-allocated-objects
+      (lambda (obj type size)
+        (declare (ignore obj type size))
+        (incf ct))
+      :static)
+     ;; Static-space has some small number of objects
+     (assert (<= 1 ct 100)))))
+
+(with-test (:name :cast-dx-funarg-no-spurious-warn)
+  (checked-compile
+   '(lambda (&key (test #'eql) key)
+     (declare (function test key))
+     (declare (dynamic-extent test key))
+     test key
+     1)
+   :allow-notes nil))
+
+(with-test (:name :stack-alloc-p
+            :skipped-on (or (not :stack-allocatable-lists)
+                            (not :sb-thread)))
+  (let* ((sem1 (sb-thread:make-semaphore))
+         (sem2 (sb-thread:make-semaphore))
+         (blah nil)
+         (thread
+          (sb-thread:make-thread
+           (lambda ()
+             (sb-int:dx-let ((a (cons 1 2)))
+               (setq blah a)
+               (sb-thread:signal-semaphore sem1)
+               (sb-thread:wait-on-semaphore sem2))
+             'yay))))
+    ;; thread1 will assign something on its stack into BLAH
+    (sb-thread:wait-on-semaphore sem1)
+    (assert blah)
+    ;; not on my stack
+    (assert (not (sb-ext:stack-allocated-p blah)))
+    ;; but on their stack
+    (assert (eq (sb-ext:stack-allocated-p blah t) thread))
+    (setq blah nil) ; be safe, don't look at other stacks
+    (sb-thread:signal-semaphore sem2)
+    (sb-thread:join-thread thread)))
+
+(with-test (:name :back-propagation-losing-blocks)
+  (checked-compile-and-assert ()
+   `(lambda ()
+      (let ((v (list (list :good)
+                     (labels ((r (v)
+                                (or v
+                                    (r (not v)))))
+                       (r nil)))))
+        (declare (dynamic-extent v))
+        (caar v)))
+   (() :good)))
+
+(with-test (:name :back-propagation-losing-blocks.2)
+  (checked-compile-and-assert
+   ()
+   `(lambda (b c)
+      (let ((v
+              (vector
+               (list 10)
+               (BLOCK NIL
+                 (let ((loop-repeat-550 1)
+                       (loop-sum-551 0))
+                   (tagbody
+                    next-loop
+                      (if (<= loop-repeat-550 0)
+                          (go end-loop)
+                          (decf loop-repeat-550))
+                      (setq loop-sum-551
+                            (if (not c)
+                                (return-from nil 0)
+                                (block nil
+                                  (let ((loop-repeat-552 1)
+                                        (loop-sum-553 0))
+                                    (tagbody
+                                     next-loop
+                                       (if (<= loop-repeat-552 0)
+                                           (go end-loop)
+                                           (decf loop-repeat-552))
+                                       (setq loop-sum-553
+                                             (if b
+                                                 1
+                                                 2))
+                                       (go next-loop)
+                                     end-loop
+                                       (return-from nil loop-sum-553))))))
+                      (go next-loop)
+                    end-loop)
+                   loop-sum-551)))))
+        (declare (dynamic-extent v))
+        (car (elt v 0))))
+   ((t t) 10)))
+
+(with-test (:name :back-propagate-one-dx-lvar-nlx)
+  (checked-compile-and-assert
+   ()
+   `(lambda (c)
+      (catch 'c
+        (let ((v (list (vector 0 c 0 0) (catch 'ct5 (throw 'ct5 0)) 0)))
+          (declare (dynamic-extent v))
+          (elt (elt v 0) 1))))
+   ((33) 33)))

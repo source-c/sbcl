@@ -1,19 +1,20 @@
 (load "test-util.lisp")
+(load "assertoid.lisp")
+(load "compiler-test-util.lisp")
 
 (defpackage :run-tests
-    (:use :cl :test-util :sb-ext))
-
-(load "assertoid.lisp")
+  (:use :cl :test-util :sb-ext))
 
 (in-package run-tests)
 
 (load "colorize.lisp")
 
-(defvar *test-evaluator-mode* :compile)
 (defvar *all-failures* nil)
 (defvar *break-on-error* nil)
 (defvar *report-skipped-tests* nil)
 (defvar *explicit-test-files* nil)
+
+(load "test-funs")
 
 (defun run-all ()
   (loop :with remainder = (rest *posix-argv*)
@@ -42,11 +43,14 @@
            (t
             (push (truename (parse-namestring arg)) *explicit-test-files*))))
   (setf *explicit-test-files* (nreverse *explicit-test-files*))
-  (pure-runner (pure-load-files) #'load-test)
-  (pure-runner (pure-cload-files) #'cload-test)
-  (impure-runner (impure-load-files) #'load-test)
-  (impure-runner (impure-cload-files) #'cload-test)
-  #-win32 (impure-runner (sh-files) #'sh-test)
+  (with-open-file (log "test.log" :direction :output
+                       :if-exists :overwrite
+                       :if-does-not-exist :create)
+    (pure-runner (pure-load-files) 'load-test log)
+    (pure-runner (pure-cload-files) 'cload-test log)
+    (impure-runner (impure-load-files) 'load-test log)
+    (impure-runner (impure-cload-files) 'cload-test log)
+    #-win32 (impure-runner (sh-files) 'sh-test log))
   (report)
   (sb-ext:exit :code (if (unexpected-failures)
                          1
@@ -96,7 +100,7 @@
           (t
            (format t "All tests succeeded~%")))))
 
-(defun pure-runner (files test-fun)
+(defun pure-runner (files test-fun log)
   (when files
     (format t "// Running pure tests (~a)~%" test-fun)
     (let ((*package* (find-package :cl-user))
@@ -112,90 +116,56 @@
                        (if (eq sb-ext:*evaluator-mode* :interpret)
                            (cons :interpreter *features*)
                            *features*)))
-                (eval (funcall test-fun file))))
+                (let ((start (get-internal-real-time)))
+                  (funcall test-fun file)
+                  (let ((end (get-internal-real-time)))
+                    (format log "~5d - ~a~%" (- end start) file)
+                    (force-output log)))))
           (skip-file ())))
       (append-failures))))
 
-(defun run-in-child-sbcl (load-forms forms)
+(defun run-in-child-sbcl (load eval)
   (process-exit-code
    (sb-ext:run-program
     (first *POSIX-ARGV*)
-    (list* "--core" SB-INT:*CORE-STRING*
+    (list "--core" SB-INT:*CORE-STRING*
            "--noinform"
            "--no-sysinit"
            "--no-userinit"
            "--noprint"
            "--disable-debugger"
-           (loop for form in (append load-forms forms)
-                 collect "--eval"
-                 collect (write-to-string form)))
+           "--load" load
+           "--eval" (write-to-string eval
+                                     :right-margin 1000))
     :output t
     :input t)))
 
-(defun clear-test-status ()
-  (with-open-file (stream "test-status.lisp-expr"
-                          :direction :output
-                          :if-exists :supersede)
-    (write-line "NIL" stream)))
-
-(defun run-impure-in-child-sbcl (test-file test-code)
+(defun run-impure-in-child-sbcl (test-file test-fun)
   (clear-test-status)
   (run-in-child-sbcl
-   `((load "test-util")
-     (load "assertoid")
-     (defpackage :run-tests
-       (:use :cl :test-util :sb-ext)))
+   "impure-runner"
+   `(run-tests::run
+     ,(enough-namestring test-file)
+     ',test-fun
+     ,*break-on-failure*
+     ,*break-on-expected-failure*
+     ,*break-on-error*
+     ,(eq *test-evaluator-mode* :interpret))))
 
-   `((in-package :cl-user)
-     (use-package :test-util)
-     (use-package :assertoid)
-     (setf test-util:*break-on-failure* ,test-util:*break-on-failure*)
-     (setf test-util:*break-on-expected-failure*
-           ,test-util:*break-on-expected-failure*)
-     (let* ((file ,test-file)
-            (sb-ext:*evaluator-mode* ,*test-evaluator-mode*)
-            (*features*
-             (if (eq sb-ext:*evaluator-mode* :interpret)
-                 (cons :interpreter *features*)
-                 *features*))
-            (*break-on-error* ,run-tests::*break-on-error*))
-       (declare (special *break-on-error*))
-       (format t "// Running ~a in ~a evaluator mode~%"
-               file sb-ext:*evaluator-mode*)
-       (restart-case
-           (handler-bind
-               ((error (lambda (condition)
-                         (push (list :unhandled-error file)
-                               test-util::*failures*)
-                         (cond (*break-on-error*
-                                (test-util:really-invoke-debugger condition))
-                               (t
-                                (format *error-output* "~&Unhandled ~a: ~a~%"
-                                        (type-of condition) condition)
-                                (sb-debug:print-backtrace)))
-                         (invoke-restart 'skip-file))))
-             ,test-code)
-         (skip-file ()
-           (format t ">>>~a<<<~%" test-util::*failures*)))
-       (test-util:report-test-status)
-       (sb-ext:exit :code 104)))))
-
-(defun impure-runner (files test-fun)
+(defun impure-runner (files test-fun log)
+  (declare (ignore log))
   (when files
     (format t "// Running impure tests (~a)~%" test-fun)
-    (let ((*package* (find-package :cl-user)))
-      (setup-cl-user)
-      (dolist (file files)
-        (force-output)
-        (let ((exit-code (run-impure-in-child-sbcl file
-                                                   (funcall test-fun file))))
-          (if (= exit-code 104)
-              (with-open-file (stream "test-status.lisp-expr"
-                                      :direction :input
-                                      :if-does-not-exist :error)
-                (append-failures (read stream)))
-              (push (list :invalid-exit-status file)
-                    *all-failures*)))))))
+    (dolist (file files)
+      (force-output)
+      (let ((exit-code (run-impure-in-child-sbcl file test-fun)))
+        (if (= exit-code 104)
+            (with-open-file (stream "test-status.lisp-expr"
+                                    :direction :input
+                                    :if-does-not-exist :error)
+              (append-failures (read stream)))
+            (push (list :invalid-exit-status file)
+                  *all-failures*))))))
 
 (defun make-error-handler (file)
   (lambda (condition)
@@ -222,32 +192,6 @@
 (defun setup-cl-user ()
   (use-package :test-util)
   (use-package :assertoid))
-
-(defun load-test (file)
-  `(load ,file :external-format :utf-8))
-
-(defun cload-test (file)
-  `(let ((compile-name (compile-file-pathname ,file)))
-     (unwind-protect
-          (progn
-            (compile-file ,file :print nil)
-            (load compile-name))
-       (ignore-errors
-         (delete-file compile-name)))))
-
-(defun sh-test (file)
-  ;; What? No SB-POSIX:EXECV?
-  (clear-test-status)
-  `(progn
-     (sb-posix:setenv "TEST_SBCL_EVALUATOR_MODE"
-                      (string-downcase ,*test-evaluator-mode*)
-                      1)
-     (let ((process (sb-ext:run-program "/bin/sh"
-                                        (list (native-namestring ,file))
-                                        :output *error-output*)))
-       (let ((*failures* nil))
-         (test-util:report-test-status))
-       (sb-ext:exit :code (process-exit-code process)))))
 
 (defun filter-test-files (wild-mask)
   (if *explicit-test-files*

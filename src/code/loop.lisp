@@ -65,7 +65,7 @@
 ;;;;      United States of America
 ;;;;      +1-617-221-1000
 
-(in-package "SB!LOOP")
+(in-package "SB-LOOP")
 
 ;;;; The design of this LOOP is intended to permit, using mostly the same
 ;;;; kernel of code, up to three different "loop" macros:
@@ -90,13 +90,13 @@
 
 ;;;; list collection macrology
 
-(sb!xc:defmacro with-loop-list-collection-head
+(sb-xc:defmacro with-loop-list-collection-head
     ((head-var tail-var &optional user-head-var) &body body)
   (let ((l (and user-head-var (list (list user-head-var nil)))))
     `(let* ((,head-var (list nil)) (,tail-var ,head-var) ,@l)
        ,@body)))
 
-(sb!xc:defmacro loop-collect-rplacd
+(sb-xc:defmacro loop-collect-rplacd
     (&environment env (head-var tail-var &optional user-head-var) form)
   (setq form (%macroexpand form env))
   (flet ((cdr-wrap (form n)
@@ -142,7 +142,7 @@
                         (setq ,user-head-var (cdr ,head-var)))))
         answer))))
 
-(sb!xc:defmacro loop-collect-answer (head-var
+(sb-xc:defmacro loop-collect-answer (head-var
                                                    &optional user-head-var)
   (or user-head-var
       `(cdr ,head-var)))
@@ -183,7 +183,7 @@ constructed.
 (defun make-loop-minimax (answer-variable type)
   (let ((infinity-data (cdr (assoc type
                                    +loop-minimax-type-infinities-alist+
-                                   :test #'sb!xc:subtypep))))
+                                   :test #'sb-xc:subtypep))))
     (make-loop-minimax-internal
       :answer-variable answer-variable
       :type type
@@ -201,7 +201,7 @@ constructed.
           (gensym "LOOP-MAXMIN-FLAG-")))
   operation)
 
-(sb!xc:defmacro with-minimax-value (lm &body body)
+(sb-xc:defmacro with-minimax-value (lm &body body)
   (let ((init (loop-typed-init (loop-minimax-type lm)))
         (which (car (loop-minimax-operations lm)))
         (infinity-data (loop-minimax-infinity-data lm))
@@ -220,7 +220,7 @@ constructed.
            (declare (type ,type ,answer-var ,temp-var))
            ,@body))))
 
-(sb!xc:defmacro loop-accumulate-minimax-value (lm operation form)
+(sb-xc:defmacro loop-accumulate-minimax-value (lm operation form)
   (let* ((answer-var (loop-minimax-answer-variable lm))
          (temp-var (loop-minimax-temp-variable lm))
          (flag-var (loop-minimax-flag-variable lm))
@@ -265,16 +265,18 @@ code to be loaded.
   (and (symbolp loop-token)
        (values (gethash (symbol-name loop-token) table))))
 
-(sb!xc:defmacro loop-store-table-data (symbol table datum)
+(sb-xc:defmacro loop-store-table-data (symbol table datum)
   `(setf (gethash (symbol-name ,symbol) ,table) ,datum))
 
 ;;; "4.2.3 Type Specifiers" lists the standardized atomic type specifiers.
 ;;; While in theory we might want to include all of them,
 ;;; in practice it seems silly to allow "for x arithmetic-error in ..."
 (defun std-atom-type-specifier-p (symbol)
-  (and (eq (symbol-package symbol) *cl-package*)
-       ;; Check for primitiveness of the type, since some symbols in the CL
-       ;; package are private-use typedefs (e.g. ARRAY-RANK, CHAR-CODE).
+  ;; The check for symbols in CL is an optimization that skips calling INFO on
+  ;; most atoms. The real test is whether type = :PRIMITIVE, as there are CL
+  ;; symbols naming types which are not standard builtin type specifiers, e.g.
+  ;; ARRAY-RANK, CHAR-CODE. (One almost wonders if that is technically wrong).
+  (and (eq (sb-xc:symbol-package symbol) *cl-package*)
        (or (eq (info :type :kind symbol) :primitive)
            ;; allow certain :instance types, but not all of them
            (member symbol '(hash-table package pathname random-state readtable)))
@@ -317,26 +319,44 @@ code to be loaded.
                            ,(loop-make-psetq (cddr frobs))))))))
 
 (defun loop-make-desetq (var-val-pairs)
-  (if (null var-val-pairs)
-      nil
-      (cons 'loop-really-desetq var-val-pairs)))
+  (if var-val-pairs (cons 'loop-desetq var-val-pairs)))
 
-(sb!ext:defglobal *loop-desetq-temporary*
+(sb-ext:defglobal *loop-desetq-temporary*
         (make-symbol "LOOP-DESETQ-TEMP"))
 
-(sb!xc:defmacro loop-really-desetq (&environment env
-                                               &rest var-val-pairs)
+(sb-xc:defmacro loop-desetq (&environment env &rest var-val-pairs)
   (labels ((find-non-null (var)
              ;; See whether there's any non-null thing here. Recurse
              ;; if the list element is itself a list.
              (do ((tail var)) ((not (consp tail)) tail)
                (when (find-non-null (pop tail)) (return t))))
            (loop-desetq-internal (var val &optional temp)
+             ;; Check for well-formed use of MULTIPLE-VALUE-LIST
+             (when (and (typep val '(cons (eql multiple-value-list) (cons t null)))
+                        (proper-list-p var))
+               (return-from loop-desetq-internal
+                 (let ((temps (make-gensym-list (length var))))
+                   `((multiple-value-bind ,temps ,(cadr val)
+                       ,@(when (member nil var)
+                           `((declare (ignore ,@(mapcan (lambda (var val)
+                                                          (unless var (list val)))
+                                                        var temps)))))
+                       ,@(mapcan (lambda (var val)
+                                   (if var (list `(loop-desetq ,var ,val))))
+                                 var temps))))))
              ;; returns a list of actions to be performed
              (typecase var
                (null
                  (when (consp val)
                    ;; Don't lose possible side effects.
+                   ;; FIXME: this special case is just wrong. Either (DESETQ NIL THING)
+                   ;; evaluates THING, or it doesn't. If it does, then it mustn't touch
+                   ;; THING at all, because the user could have written
+                   ;;  (LOOP FOR NIL = (PROG1 AAA BBB)) where AAA and BBB are
+                   ;; symbol-macros the expansions of which are, let's say, (INCF C)
+                   ;; and (WHEN (PLUSP C) (RETURN)) respectively. The desired effect is
+                   ;; to perform the incf, ignore it, and then return.  But we turn that
+                   ;; whole form into NIL because of a PROG1. Wtf???
                    (if (eq (car val) 'prog1)
                        ;; These can come from PSETQ or DESETQ below.
                        ;; Throw away the value, keep the side effects.
@@ -497,10 +517,10 @@ code to be loaded.
 ;;;; code analysis stuff
 
 (defun loop-constant-fold-if-possible (form &optional expected-type)
-  (let* ((constantp (sb!xc:constantp form))
+  (let* ((constantp (sb-xc:constantp form))
          (value (and constantp (constant-form-value form))))
     (when (and constantp expected-type)
-      (unless (sb!xc:typep value expected-type)
+      (unless (sb-xc:typep value expected-type)
         (loop-warn "~@<The form ~S evaluated to ~S, which was not of ~
                     the anticipated type ~S.~:@>"
                    form value expected-type)
@@ -539,9 +559,8 @@ code to be loaded.
 
 (defun loop-error (format-string &rest format-args)
   #-sb-xc-host(declare (optimize allow-non-returning-tail-call))
-  (error 'simple-program-error
-         :format-control "~?~%current LOOP context:~{ ~S~}."
-         :format-arguments (list format-string format-args (loop-context))))
+  (%program-error "~?~%current LOOP context:~{ ~S~}."
+                  format-string format-args (loop-context)))
 
 (defun loop-warn (format-string &rest format-args)
   (warn "~?~%current LOOP context:~{ ~S~}."
@@ -553,7 +572,7 @@ code to be loaded.
                              &optional (default-type required-type))
   (if (null specified-type)
       default-type
-      (multiple-value-bind (a b) (sb!xc:subtypep specified-type required-type)
+      (multiple-value-bind (a b) (sb-xc:subtypep specified-type required-type)
         (cond ((not b)
                (loop-warn "LOOP couldn't verify that ~S is a subtype of the required type ~S."
                           specified-type required-type))
@@ -586,7 +605,7 @@ code to be loaded.
                         (push (car cdr) result))))))
       (values (transform tree) ignores))))
 
-(sb!xc:defmacro loop-destructuring-bind
+(sb-xc:defmacro loop-destructuring-bind
     (lambda-list args &rest body)
   (multiple-value-bind (d-lambda-list ignores)
       (transform-destructuring lambda-list)
@@ -714,22 +733,22 @@ code to be loaded.
 
 (defun loop-typed-init (data-type &optional step-var-p)
   ;; FIXME: can't tell if unsupplied or NIL, but it has to be rare.
-  (when data-type
-   (let ((ctype (specifier-type data-type)))
-     ;; FIXME: use the ctype for the rest of the type operations, now
-     ;; that it's parsed.
-     (cond ((eql ctype *empty-type*)
-            (values nil t))
-           ((sb!xc:subtypep data-type 'number)
+  ;; FIXME: returns either 2 values or 1 value, which is poor style.
+  (unless data-type
+    (return-from loop-typed-init (values nil nil)))
+  (let ((ctype (specifier-type data-type)))
+    (when (eq ctype *empty-type*)
+      (return-from loop-typed-init (values nil t)))
+    (cond ((csubtypep ctype (specifier-type 'number))
             (let ((init (if step-var-p 1 0)))
               (flet ((like (&rest types)
-                       (coerce init (find-if (lambda (type)
-                                               (sb!xc:subtypep data-type type))
+                       (coerce init (find-if (lambda (spec)
+                                               (csubtypep ctype (specifier-type spec)))
                                              types))))
-                (cond ((sb!xc:subtypep data-type 'float)
+                (cond ((csubtypep ctype (specifier-type 'float))
                        (like 'single-float 'double-float
                              'short-float 'long-float 'float))
-                      ((sb!xc:subtypep data-type '(complex float))
+                      ((csubtypep ctype (specifier-type '(complex float)))
                        (like '(complex single-float)
                              '(complex double-float)
                              '(complex short-float)
@@ -737,18 +756,18 @@ code to be loaded.
                              '(complex float)))
                       (t
                        init)))))
-           ((sb!xc:subtypep data-type 'vector)
+           ((csubtypep ctype (specifier-type 'vector))
             (when (array-type-p ctype)
               (let ((etype (type-*-to-t
                             (array-type-specialized-element-type ctype))))
                 (make-array 0 :element-type (type-specifier etype)))))
            #!+sb-unicode
-           ((sb!xc:subtypep data-type 'extended-char)
+           ((csubtypep ctype (specifier-type 'extended-char))
             (code-char base-char-code-limit))
-           ((sb!xc:subtypep data-type 'character)
+           ((csubtypep ctype (specifier-type 'character))
             #\x)
            (t
-            nil)))))
+            nil))))
 
 (defun loop-optional-type (&optional variable &aux (loop *loop*))
   ;; No variable specified implies that no destructuring is permissible.
@@ -911,21 +930,30 @@ code to be loaded.
             ;; longer be empty and the compiler won't produce
             ;; warnings.
             type)
-           ((sb!xc:typep init type)
+           ((sb-xc:typep init type)
             type)
-           ((sb!xc:typep init '(simple-array * (*)))
+           ((sb-xc:typep init '(simple-array * (*)))
+            ;; The cross-compiler must not inquire of the host
+            ;; for an array's element type.
+            #+sb-xc-host (bug "Can't get here")
             ;; type-of lets the size in
             `(or (simple-array ,(array-element-type init) (*)) ,type))
            (t
-            `(or ,(sb!xc:type-of init) ,type)))
+            (let ((disjunct
+                   #+sb-xc-host (if (null init)
+                                    'null
+                                    (error "Unexpected need for (TYPE-OF ~S) in xc"
+                                           init))
+                   #-sb-xc-host (type-of init)))
+              `(or ,disjunct ,type))))
      init)))
 
 (defun loop-declare-var (name dtype &key step-var-p initialization
                                          desetq &aux (loop *loop*))
   (cond ((or (null name) (null dtype) (eq dtype t)) nil)
         ((symbolp name)
-         (unless (or (sb!xc:subtypep t dtype)
-                     (and (eq (find-package :cl) (symbol-package name))
+         (unless (or (sb-xc:subtypep t dtype)
+                     (and (eq (sb-xc:symbol-package name) *cl-package*)
                           (eq :special (info :variable :kind name))))
            (let ((dtype `(type ,(if initialization
                                     dtype
@@ -1037,7 +1065,7 @@ code to be loaded.
   dtype
   (data nil)) ;collector-specific data
 
-(sb!xc:defmacro with-sum-count (lc &body body)
+(sb-xc:defmacro with-sum-count (lc &body body)
   (let* ((type (loop-collector-dtype lc))
          (temp-var (car (loop-collector-tempvars lc))))
     (multiple-value-bind (type init)
@@ -1328,30 +1356,21 @@ code to be loaded.
     (multiple-value-bind (vector-form constantp vector-value)
         (loop-constant-fold-if-possible val 'vector)
       (loop-make-var
-        vector-var vector-form
-        (if (and (consp vector-form) (eq (car vector-form) 'the))
-            (cadr vector-form)
-            'vector))
+       vector-var vector-form
+       (if (and (consp vector-form) (eq (car vector-form) 'the))
+           (cadr vector-form)
+           'vector))
       (loop-make-var index-var 0 'fixnum)
-      (let* ((length 0)
-             (length-form (cond ((not constantp)
-                                 (let ((v (gensym "LOOP-ACROSS-LIMIT-")))
-                                   (push `(setq ,v (length ,vector-var))
-                                         (prologue *loop*))
-                                   (loop-make-var v 0 'fixnum)))
-                                (t (setq length (length vector-value)))))
-             (first-test `(>= ,index-var ,length-form))
-             (other-test first-test)
+      (let* ((length-form (if constantp
+                              (length vector-value)
+                              (let ((v (gensym "LOOP-ACROSS-LIMIT-")))
+                                   (push `(let ((,v (length ,vector-var))))
+                                         (wrappers *loop*))
+                                   v)))
+             (test `(>= ,index-var ,length-form))
              (step `(,var (aref ,vector-var ,index-var)))
              (pstep `(,index-var (1+ ,index-var))))
-        (declare (fixnum length))
-        (when constantp
-          (setq first-test (= length 0))
-          (when (<= length 1)
-            (setq other-test t)))
-        `(,other-test ,step () ,pstep
-          ,@(and (neq first-test other-test)
-                 `(,first-test ,step () ,pstep)))))))
+        `(,test ,step () ,pstep)))))
 
 ;;;; list iteration
 
@@ -1410,7 +1429,7 @@ code to be loaded.
       (loop-constant-fold-if-possible val)
     (let ((listvar (gensym "LOOP-LIST-")))
       (loop-make-var var nil data-type)
-      (loop-make-var listvar list 'list)
+      (loop-make-var listvar list t)
       (let ((list-step (loop-list-step listvar)))
         (let* ((first-endtest `(endp ,listvar))
                (other-endtest first-endtest)
@@ -1579,7 +1598,8 @@ code to be loaded.
          (limit-given nil) ; T when prep phrase has specified end
          (limit-constantp nil)
          (limit-value nil))
-     #+ccl (progn start-constantp start-value) ; bogus "Unused" warnings
+     ;; Work around some "Unused" (rather, assigned-but-never-set) warnings
+     #+(or ccl clisp) (declare (ignorable start-constantp start-value))
      (flet ((assert-index-for-arithmetic (index)
               (unless (atom index)
                 (loop-error "Arithmetic index must be an atom."))))
@@ -1818,7 +1838,7 @@ code to be loaded.
 
 ;;;; ANSI LOOP
 
-(sb!ext:define-load-time-global *loop-ansi-universe*
+(sb-ext:define-load-time-global *loop-ansi-universe*
   (let ((w (!make-standard-loop-universe
              :keywords '((named (loop-do-named))
                          (initially (loop-do-initially))
@@ -1910,12 +1930,12 @@ code to be loaded.
       (let ((tag (gensym)))
         `(block nil (tagbody ,tag (progn ,@keywords-and-forms) (go ,tag))))))
 
-(sb!xc:defmacro loop (&environment env &rest keywords-and-forms)
+(sb-xc:defmacro loop (&environment env &rest keywords-and-forms)
   (loop-standard-expansion keywords-and-forms
                            env
                            *loop-ansi-universe*))
 
-(sb!xc:defmacro loop-finish ()
+(sb-xc:defmacro loop-finish ()
   "Cause the iteration to terminate \"normally\", the same as implicit
 termination by an iteration driving clause, or by use of WHILE or
 UNTIL -- the epilogue code (if any) will be run, and any implicitly

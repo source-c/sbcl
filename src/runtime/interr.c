@@ -27,12 +27,13 @@
 #include "lispregs.h"
 #include "genesis/static-symbols.h"
 #include "genesis/vector.h"
-#include "genesis/code.h"
+#include "code.h"
 #include "thread.h"
 #include "monitor.h"
 #include "breakpoint.h"
 #include "var-io.h"
 #include "sc-offset.h"
+#include "gc.h"
 
 /* the way that we shut down the system on a fatal error */
 
@@ -143,28 +144,28 @@ corruption_warning_and_maybe_lose(char *fmt, ...)
     print_message(fmt, ap);
     va_end(ap);
     fprintf(stderr, "The integrity of this image is possibly compromised.\n");
-    if (lose_on_corruption_p)
+    if (lose_on_corruption_p || gc_active_p) {
         fprintf(stderr, "Exiting.\n");
-    else
-        fprintf(stderr, "Continuing with fingers crossed.\n");
-    fflush(stderr);
-    if (lose_on_corruption_p)
+        fflush(stderr);
         call_lossage_handler();
+    }
+    else {
+        fprintf(stderr, "Continuing with fingers crossed.\n");
+        fflush(stderr);
 #ifndef LISP_FEATURE_WIN32
-    else
         thread_sigmask(SIG_SETMASK,&oldset,0);
 #endif
+    }
 }
 
 void print_constant(os_context_t *context, int offset) {
     lispobj code = find_code(context);
     if (code != NIL) {
         struct code *codeptr = (struct code *)native_pointer(code);
-        int length = code_header_words(codeptr->header);
         putchar('\t');
-        if (offset >= length) {
-            printf("Constant offset %d out of bounds for the code object of length %d.\n",
-                   offset, length);
+        if (offset >= code_header_words(codeptr)) {
+            printf("Constant offset %d out of bounds for the code object @ %p\n",
+                   offset, codeptr);
         } else {
             brief_print(codeptr->constants[offset -
                                            (offsetof(struct code, constants) >> WORD_SHIFT)]);
@@ -189,7 +190,7 @@ void skip_internal_error (os_context_t *context) {
     if (code > sizeof(internal_error_nargs)) {
         printf("Unknown error code %d at %p\n", code, (void*)*os_context_pc_addr(context));
     }
-    printf("%d\n", code);
+
     ptr += internal_error_nargs[code];
     *((unsigned char **)os_context_pc_addr(context)) = ptr;
 }
@@ -204,16 +205,22 @@ describe_internal_error(os_context_t *context)
 {
     unsigned char *ptr = arch_internal_error_arguments(context);
     char count;
-    int position, sc_offset, sc_number, offset, ch;
+    int position, sc_and_offset, sc_number, offset, ch;
     void * pc = (void*)*os_context_pc_addr(context);
+    unsigned char code;
 
 #ifdef LISP_FEATURE_ARM64
     u32 trap_instruction = *(u32 *)ptr;
-    unsigned char code = trap_instruction >> 13 & 0xFF;
+    code = trap_instruction >> 13 & 0xFF;
     ptr += 4;
 #else
-    unsigned char code = *ptr;
-    ptr++;
+    unsigned char trap = *(ptr-1);
+    if (trap >= trap_Error) {
+        code = trap - trap_Error;
+    } else {
+        code = *ptr;
+        ptr++;
+    }
 #endif
 
     if (code > sizeof(internal_error_nargs)) {
@@ -224,9 +231,9 @@ describe_internal_error(os_context_t *context)
     for (count = internal_error_nargs[code], position = 0;
          count > 0;
          --count) {
-        sc_offset = read_var_integer(ptr, &position);
-        sc_number = sc_offset_sc_number(sc_offset);
-        offset = sc_offset_offset(sc_offset);
+        sc_and_offset = read_var_integer(ptr, &position);
+        sc_number = sc_and_offset_sc_number(sc_and_offset);
+        offset = sc_and_offset_offset(sc_and_offset);
 
         printf("    SC: %d, Offset: %d", sc_number, offset);
         switch (sc_number) {

@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!ARM-ASM")
+(in-package "SB-ARM-ASM")
 
 (defun maybe-add-notes (dstate)
   (let* ((inst (sap-ref-int (dstate-segment-sap dstate)
@@ -46,13 +46,13 @@
            (fixnum value)
            (ignore dstate))
   (unless (= value 14) ;; Don't print :al
-    (princ (aref sb!vm::+condition-name-vec+ value) stream)))
+    (princ (aref sb-vm::+condition-name-vec+ value) stream)))
 
 (defun print-reg (value stream dstate)
   (declare (type stream stream)
            (fixnum value)
            (ignore dstate))
-  (princ (aref sb!vm::*register-names* value) stream))
+  (princ (aref sb-vm::*register-names* value) stream))
 
 (defun print-float-reg (value stream dstate)
   (declare (type stream stream)
@@ -154,22 +154,22 @@
 (defun debug-trap-control (chunk inst stream dstate)
   (declare (ignore inst))
   (flet ((nt (x) (if stream (note x dstate))))
-    (case (debug-trap-code chunk dstate)
-      (#.halt-trap
-       (nt "Halt trap"))
-      (#.pending-interrupt-trap
-       (nt "Pending interrupt trap"))
-      (#.error-trap
-       (nt "Error trap")
-       (handle-break-args #'snarf-error-junk stream dstate))
-      (#.cerror-trap
-       (nt "Cerror trap")
-       (handle-break-args #'snarf-error-junk stream dstate))
-      (#.breakpoint-trap
-       (nt "Breakpoint trap"))
-      (#.fun-end-breakpoint-trap
-       (nt "Function end breakpoint trap"))
-      (#.single-step-around-trap
-       (nt "Single step around trap"))
-      (#.single-step-before-trap
-       (nt "Single step before trap")))))
+    (let ((trap (debug-trap-code chunk dstate)))
+      (case trap
+        (#.halt-trap
+         (nt "Halt trap"))
+        (#.pending-interrupt-trap
+         (nt "Pending interrupt trap"))
+        (#.cerror-trap
+         (nt "Cerror trap")
+         (handle-break-args #'snarf-error-junk trap stream dstate))
+        (#.breakpoint-trap
+         (nt "Breakpoint trap"))
+        (#.fun-end-breakpoint-trap
+         (nt "Function end breakpoint trap"))
+        (#.single-step-around-trap
+         (nt "Single step around trap"))
+        (#.single-step-before-trap
+         (nt "Single step before trap"))
+        (t
+         (handle-break-args #'snarf-error-junk trap stream dstate))))))

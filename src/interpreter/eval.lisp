@@ -66,18 +66,9 @@
 (defparameter *eval-level* -1)
 (defparameter *eval-verbose* nil)
 
-;;; These are the forms sb-fasteval will process for itself when the evaluator
-;;; mode is :COMPILE. They all preserve a bidirectional mapping between
-;;; LEXENV and subtypes of BASIC-ENV. Things like BLOCK/RETURN could not.
-;;; The list also happens to match the the tiny evaluator (in 'eval'),
-;;; though it might be reasonable to have additional things here.
-(defconstant-eqx !simple-special-operators
-  '(eval-when if progn quote locally macrolet symbol-macrolet setq)
-  #'equal)
-
 (defun %eval (exp env)
   (labels
-      ((%%eval (&aux fname special-op)
+      ((%%eval (&aux fname)
          (cond
           ((symbolp exp)
            ;; CLHS 3.1.2.1.1 Symbols as Forms
@@ -102,18 +93,22 @@
                                   (make-proto-fn fname) env nil))
                (compile-it)))
           ((not (symbolp fname))
-           (ip-error "Invalid function name: ~S" fname))
+           (%program-error "Invalid function name: ~S" fname))
           ;; CLHS 3.1.2.1.2.1 Special Forms
           ;; Pick off special forms first for speed. Special operators
           ;; can't be shadowed by local defs.
-          ((setq special-op (let ((fdefn (sb-impl::symbol-fdefn fname)))
-                              (and fdefn (!special-form-handler fdefn))))
-           (if (or (eq sb-ext:*evaluator-mode* :interpret)
-                   (member fname !simple-special-operators))
-               (funcall (truly-the function (car special-op)) (cdr exp) env)
-               (compile-it)))
-          (t
-           ;; Everything else: macros and functions.
+          ((logtest (get-header-data fname) +special-op-symbol+)
+           (cond ((or (logtest (get-header-data fname) +simple-special-op+)
+                      (eq sb-ext:*evaluator-mode* :interpret))
+                  (cond ((and (symbol-extra-slot-p fname)
+                              (functionp (symbol-extra fname)))
+                         (funcall (truly-the function (symbol-extra fname))
+                                  (cdr exp) env))
+                        (t
+                         (dispatch (%sexpr exp) env))))
+                 (t
+                  (compile-it))))
+          (t ; Everything else: macros and functions.
            (multiple-value-bind (fn macro-p) (get-function (car exp) env)
              (if macro-p
                  (%eval (funcall (valid-macroexpand-hook) fn exp env) env)
@@ -170,23 +165,21 @@
            (return-from digest-form
              (digest-form `(funcall #',fname ,@(cdr form)) env sexpr)))
           ((not (symbolp fname))
-           (ip-error "Invalid function name: ~S" fname)))
+           (%program-error "Invalid function name: ~S" fname)))
     ;; CLHS 3.1.2.1.2.1 Special Forms.
-    (let ((fdefn (sb-impl::symbol-fdefn fname)))
-      (awhen (and fdefn (!special-form-handler fdefn))
-        (return-from digest-form
-          (let ((digested-form
-                 (funcall (truly-the function (cdr it)) (cdr form) env)))
-            (cond (digested-form
-                   (setf (sexpr-handler sexpr) digested-form)
-                   (%dispatch sexpr env))
-                  ((eq (info :function :kind fname) :special-form)
-                   ;; Special operators that reimplement macros can decline,
-                   ;; falling back upon the macro. This allows faster
-                   ;; implementations of things like AND,OR,COND,INCF
-                   ;; without having to deal with their full generality.
-                   (error "Operator ~S mustn't decline to handle ~S"
-                          fname form)))))))
+    (when (logtest (get-header-data fname) +special-op-symbol+)
+      (let ((processor (info :function :interpreter fname)))
+        (when (functionp processor)
+          (return-from digest-form
+            (let ((digested-form (funcall processor (cdr form) env)))
+              (setf (sexpr-handler sexpr) digested-form)
+              (%dispatch sexpr env)))))
+      (when (eq (info :function :kind fname) :special-form)
+        ;; Special operators that reimplement macros can decline,
+        ;; falling back upon the macro. This allows faster
+        ;; implementations of things like AND,OR,COND,INCF
+        ;; without having to deal with their full generality.
+        (error "Operator ~S mustn't decline to handle ~S" fname form)))
     (let ((frame-ptr (local-fn-frame-ptr fname env)))
       (if (eq frame-ptr :macro)
           ;; CLHS 3.1.2.1.2.2 Macro Forms
@@ -244,7 +237,7 @@
         ;; affect the policy in an interpreter environment.
         (%eval form interpreter-env))))
 
-(defun !unintern-symbols ()
+(push
   (let ((this-pkg (find-package "SB-INTERPRETER")))
     `("SB-INTERPRETER"
       %%eval ; got inlined
@@ -254,4 +247,5 @@
                        (macro-function s)
                        (not (member s '(defspecial with-subforms do-decl-spec)))) ; for SB-CLTL2
               (push s macros)))
-          macros))))
+          macros)))
+  *!removable-symbols*)

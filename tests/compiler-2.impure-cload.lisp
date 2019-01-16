@@ -104,3 +104,46 @@
   (assert (equal (sb-c:definition-source-location-plist
                      (sb-int:info :source-location :variable '*foofoo2*))
                  '(strange "Yes"))))
+
+(defstruct zombie-cast-struct
+  (value nil :type zombie-cast-struct-v))
+
+(defstruct zombie-cast-struct-v
+  (uses nil :type (or list zombie-cast-struct)))
+
+(with-test (:name :flush-zombie-casts)
+  (checked-compile `(lambda (x)
+                      (declare (optimize (debug 2) (speed 1)))
+                      (let ((value (zombie-cast-struct-value x)))
+                        (labels ((l (x)
+                                   (declare (ignore x))
+                                   (let ((uses (zombie-cast-struct-v-uses value)))
+                                     (when (zombie-cast-struct-p uses)
+                                       (list* uses (l uses)))))))))))
+
+(let ()
+  (define-condition non-top-level-condition (error) ()))
+
+(with-test (:name :non-top-level-condition)
+  (assert
+   (handler-case (signal 'non-top-level-condition)
+     (non-top-level-condition () t))))
+
+(defun somefun (x)
+  (declare (optimize (sb-c:store-source-form 3)))
+  (+ x 101))
+
+(locally
+    (declare (optimize (sb-c:store-source-form 3)))
+  (defun otherfun (y)
+    (/ y 3)))
+
+(locally
+    (declare (optimize (sb-c:store-source-form 2)))
+  (defun nosourcefun (y)
+    (/ y 3)))
+
+(with-test (:name :store-source-form)
+  (assert (function-lambda-expression #'somefun))
+  (assert (function-lambda-expression #'otherfun))
+  (assert (not (function-lambda-expression #'nosourcefun))))

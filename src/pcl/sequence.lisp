@@ -83,10 +83,10 @@
   (:method ((s list) length &key
             (initial-element nil iep) (initial-contents nil icp))
     (cond
-      ((and icp iep) (error "bar"))
+      ((and icp iep) (error "supplied both ~S and ~S to ~S" :initial-element :initial-contents 'make-sequence-like))
       (iep (make-list length :initial-element initial-element))
       (icp (unless (= (length initial-contents) length)
-             (error "foo"))
+             (error "length mismatch in ~S" 'make-sequence-like))
            (let ((result (make-list length)))
              (replace result initial-contents)
              result))
@@ -94,7 +94,7 @@
   (:method ((s vector) length &key
             (initial-element nil iep) (initial-contents nil icp))
     (cond
-      ((and icp iep) (error "foo"))
+      ((and icp iep) (error "supplied both ~S and ~S to ~S" :initial-element :initial-contents 'make-sequence-like))
       (iep (make-array length :element-type (array-element-type s)
                        :initial-element initial-element))
       (icp (make-array length :element-type (array-element-type s)
@@ -195,7 +195,7 @@
    the elements are visited in the opposite order."))
 
 ;;; magic termination value for list :from-end t
-(defvar *exhausted* (cons nil nil))
+(define-load-time-global *exhausted* (cons nil nil))
 
 (defun make-list-iterator (list from-end start end)
   (multiple-value-bind (iterator limit from-end)
@@ -216,8 +216,7 @@
                   (if (eq iterator list)
                       *exhausted*
                       (do* ((cdr list (cdr cdr)))
-                           ((eq (cdr cdr) iterator) cdr)))
-                  (1+ iterator))
+                           ((eq (cdr cdr) iterator) cdr))))
                 (lambda (list iterator from-end)
                   (declare (ignore list from-end))
                   (cdr iterator)))

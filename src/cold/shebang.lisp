@@ -12,28 +12,74 @@
 (in-package "SB-COLD")
 
 ;;;; definition of #!+ and #!- as a mechanism analogous to #+/#-, but
-;;;; for *SHEBANG-FEATURES* instead of CL:*FEATURES*. (This is handy
+;;;; for SB-XC:*FEATURES* instead of CL:*FEATURES*. (This is handy
 ;;;; when cross-compiling, so that we can make a distinction between
 ;;;; features of the host Common Lisp and features of the target
 ;;;; SBCL.)
 
 ;;; the feature list for the target system
-(export '*shebang-features*)
-(declaim (type list *shebang-features*))
-(defvar *shebang-features*)
+(unless (find-package "SB-XC")
+  (make-package "SB-XC" :use nil :nicknames nil))
+(export (intern "*FEATURES*" "SB-XC") "SB-XC")
+(declaim (type list sb-xc:*features*))
+(defvar sb-xc:*features*)
 
-(defun target-platform-name ()
-  (let ((arch (intersection '(:alpha :arm :arm64 :hppa :mips :ppc :sparc :x86 :x86-64)
-                            *shebang-features*)))
+(defun target-platform-keyword (&optional (features sb-xc:*features*))
+  (let ((arch (intersection '(:alpha :arm :arm64 :hppa :mips :ppc :ppc64 :sparc :x86 :x86-64)
+                            features)))
     (cond ((not arch) (error "No architecture selected"))
           ((> (length arch) 1) (error "More than one architecture selected")))
-    (string-downcase (car arch))))
+    (car arch)))
 
 ;;; Not necessarily the logical place to define BACKEND-ASM-PACKAGE-NAME,
-;;; but a convenient one, because *shebang-features* needs to have been
+;;; but a convenient one, because sb-xc:*features* needs to have been
 ;;; DEFVARed, and because 'chill' loads this and only this file.
 (defun backend-asm-package-name ()
-  (concatenate 'string "SB!" (string-upcase (target-platform-name)) "-ASM"))
+  (concatenate 'string "SB-" (string (target-platform-keyword)) "-ASM"))
+
+(defun any-vop-named-p (vop-name)
+  (let ((ht (symbol-value (find-symbol "*BACKEND-PARSED-VOPS*" "SB-C"))))
+    (not (null (gethash vop-name ht)))))
+
+(defun any-vop-translates-p (fun-name)
+  (let ((f (intern "INFO" "SB-INT")))
+    (when (fboundp f)
+      (let ((info (funcall f :function :info fun-name)))
+        (if info
+            (let ((f (intern "FUN-INFO-TEMPLATES" "SB-C")))
+              (and (fboundp f) (not (null (funcall f info))))))))))
+
+(defvar *feature-eval-results-file* "output/feature-tests.lisp-expr")
+(defvar *feature-evaluation-results*)
+
+(defun recording-feature-eval (expression value)
+  ;; This safety check does not work for parallel build, but that produces
+  ;; different code anyway due to missing derived types in any file that would
+  ;; have been compiled in the serial order but was interpreted instead.
+  (when (boundp '*feature-evaluation-results*)
+    ; (format t "~&FEATURE EXPR: ~S -> ~S~%" expression value)
+    (push (cons expression value) *feature-evaluation-results*))
+  value)
+
+(defun write-feature-eval-results ()
+  (with-open-file (f *feature-eval-results-file*
+                     :direction :output
+                     :if-exists :supersede :if-does-not-exist :create)
+    (let ((*print-readably* t))
+      (format f "(~{~S~^~% ~})~%" *feature-evaluation-results*))))
+
+(defun sanity-check-feature-evaluation ()
+  (flet ((check (phase list)
+           (dolist (x list)
+             (let ((answer
+                     (ecase (caar x)
+                      (:vop-named (any-vop-named-p (cadar x)))
+                      (:vop-translates (any-vop-translates-p (cadar x))))))
+               (unless (eq answer (cdr x))
+                 (error "make-host-~D DEFINE-VOP ordering bug:~@
+ ~S should be ~S, was ~S at xc time" phase x answer (cdr x)))))))
+    (check 1 (with-open-file (f *feature-eval-results-file*) (read f)))
+    (check 2 *feature-evaluation-results*)))
 
 (defun feature-in-list-p (feature list)
   (labels ((sane-expr-p (x)
@@ -42,7 +88,7 @@
                ;; This allows you to write #!+(host-feature sbcl) <stuff>
                ;; to muffle conditions, bypassing the "probable XC bug" check.
                ;; Using the escape hatch is assumed never to be a mistake.
-               ((cons (eql :host-feature)) t)
+               ((cons (member :host-feature :vop-named :vop-translates)) t)
                (cons (every #'sane-expr-p (cdr x))))))
     (unless (sane-expr-p feature)
       (error "Target feature expression ~S looks screwy" feature)))
@@ -53,14 +99,21 @@
             (ecase (first feature)
               (:or  (some  #'subfeature-in-list-p (rest feature)))
               (:and (every #'subfeature-in-list-p (rest feature)))
-              ((:host-feature :not)
+              ((:host-feature :not :vop-named :vop-translates)
                (destructuring-bind (subexpr) (cdr feature)
-                 (cond ((eq (first feature) :host-feature)
+                 (case (first feature)
+                   (:host-feature
                         ;; (:HOST-FEATURE :sym) looks in *FEATURES* for :SYM
-                        (check-type subexpr symbol)
-                        (member subexpr *features* :test #'eq))
-                       (t
-                        (not (subfeature-in-list-p subexpr)))))))))))
+                    (check-type subexpr symbol)
+                    (member subexpr *features* :test #'eq))
+                   (:vop-named
+                    (recording-feature-eval feature
+                                      (any-vop-named-p subexpr)))
+                   (:vop-translates
+                    (recording-feature-eval feature
+                                            (any-vop-translates-p subexpr)))
+                   (t
+                    (not (subfeature-in-list-p subexpr)))))))))))
 (compile 'feature-in-list-p)
 
 (defun shebang-reader (stream sub-character infix-parameter)
@@ -73,7 +126,7 @@
     (if (char= (if (let* ((*package* (find-package "KEYWORD"))
                           (*read-suppress* nil)
                           (feature (read stream)))
-                     (feature-in-list-p feature *shebang-features*))
+                     (feature-in-list-p feature sb-xc:*features*))
                    #\+ #\-) next-char)
         (read stream t nil t)
         ;; Read (and discard) a form from input.
@@ -87,14 +140,14 @@
 ;;; check our own code; it is too easy to write #+ when meaning #!+,
 ;;; and such mistakes can go undetected for a while.
 ;;;
-;;; ideally we wouldn't use *SHEBANG-FEATURES* but
-;;; *ALL-POSSIBLE-SHEBANG-FEATURES*, but maintaining that variable
-;;; will not be easy.
+;;; ideally we wouldn't use SB-XC:*FEATURES* but something like
+;;; *ALL-POSSIBLE-TARGET-FEATURES*, but maintaining that variable
+;;; would not be easy.
 (defun checked-feature-in-features-list-p (feature list)
   (etypecase feature
     (symbol (unless (member feature '(:ansi-cl :common-lisp :ieee-floating-point))
-              (when (member feature *shebang-features* :test #'eq)
-                (error "probable XC bug in host read-time conditional")))
+              (when (member feature sb-xc:*features* :test #'eq)
+                (error "probable XC bug in host read-time conditional: ~S" feature)))
             (member feature list :test #'eq))
     (cons (flet ((subfeature-in-list-p (subfeature)
                    (checked-feature-in-features-list-p subfeature list)))
@@ -123,18 +176,22 @@
   (values))
 (compile 'she-reader)
 
-;;;; variables like *SHEBANG-FEATURES* but different
+;;;; variables like SB-XC:*FEATURES* but different
 
-;;; This variable is declared here (like *SHEBANG-FEATURES*) so that
+;;; This variable is declared here (like SB-XC:*FEATURES*) so that
 ;;; things like chill.lisp work (because the variable has properties
-;;; similar to *SHEBANG-FEATURES*, and chill.lisp was set up to work
+;;; similar to SB-XC:*FEATURES*, and chill.lisp was set up to work
 ;;; for that). For an explanation of what it really does, look
 ;;; elsewhere.
+;;; FIXME: Can we just assign SB-C:*BACKEND-SUBFEATURES* directly?
+;;; (This has nothing whatsoever to do with the so-called "shebang" reader)
 (export '*shebang-backend-subfeatures*)
 (declaim (type list *shebang-backend-subfeatures*))
 (defvar *shebang-backend-subfeatures*)
 
 ;;;; string checker, for catching non-portability early
+;;;; This is defined here, but not installed here.
+;;;; See IN-TARGET-CROSS-COMPILATION-MODE for the gory details.
 (defun make-quote-reader (standard-quote-reader)
   (lambda (stream char)
     (let ((result (funcall standard-quote-reader stream char)))
@@ -142,5 +199,3 @@
         (warn "Found non-STANDARD-CHAR in ~S" result))
       result)))
 (compile 'make-quote-reader)
-
-(set-macro-character #\" (make-quote-reader (get-macro-character #\" nil)))

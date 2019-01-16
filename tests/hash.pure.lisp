@@ -9,8 +9,6 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(in-package :cl-user)
-
 ;;; +MAGIC-HASH-VECTOR-VALUE+ is used to mark empty entries in the slot
 ;;; HASH-VECTOR of hash tables. It must be a value outside of the range
 ;;; of SXHASH. The range of SXHASH is the non-negative fixnums.
@@ -45,11 +43,11 @@
   ;; but it's best to verify the assumption that each cons bumps the count
   ;; by 1, lest it be violated in a way that affects the quality of CTYPE
   ;; hashes.
-  (let ((win 0) (n-trials 10) (prev (sb-impl::address-based-counter-val)))
+  (let ((win 0) (n-trials 10) (prev (sb-int:address-based-counter-val)))
     (dotimes (i n-trials)
       (declare (notinline cons)) ; it's flushable, but don't flush it
       (cons 1 2)
-      (let ((ptr (sb-impl::address-based-counter-val)))
+      (let ((ptr (sb-int:address-based-counter-val)))
         (when (= ptr (1+ prev))
           (incf win))
         (setq prev ptr)))
@@ -138,3 +136,18 @@
     (format (make-broadcast-stream) "Printing: ~A~%" key)
     (assert (remhash key map))
     (assert (= 0 (hash-table-count map)))))
+
+(with-test (:name :clrhash-clears-rehash-p)
+  (let ((tbl (make-hash-table)))
+    (dotimes (i 10)
+      (setf (gethash (cons 'foo (gensym)) tbl) 1))
+    (gc)
+    ;; The need-to-rehash bit is set
+    (assert (eql 1 (svref (sb-impl::hash-table-table tbl) 1)))
+    (clrhash tbl)
+    ;; The need-to-rehash bit is not set
+    (assert (eql 0 (svref (sb-impl::hash-table-table tbl) 1)))))
+
+(with-test (:name :sxhash-signed-floating-point-zeros)
+  (assert (not (eql (sxhash -0f0) (sxhash 0f0))))
+  (assert (not (eql (sxhash -0d0) (sxhash 0d0)))))

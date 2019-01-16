@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; moves and coercions
 
@@ -185,7 +185,7 @@
   (:policy :fast-safe)
   (:note "inline constant comparison")
   (:generator 2
-    (inst cmp x (sb!xc:char-code y))))
+    (inst cmp x (sb-xc:char-code y))))
 
 (define-vop (fast-char=/character/c character-compare/c)
   (:translate char=)

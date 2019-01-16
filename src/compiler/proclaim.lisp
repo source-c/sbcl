@@ -12,7 +12,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; A list of UNDEFINED-WARNING structures representing references to unknown
 ;;; stuff which came up in a compilation unit.
@@ -27,9 +27,11 @@
       (destructuring-bind (typespec restart-name) clause
         (let ((type (compiler-specifier-type typespec))
               (ospec (rassoc restart-name new :test #'eq)))
-          (if ospec
-              (setf (car ospec) (type-union (car ospec) type))
-              (push (cons type restart-name) new)))))))
+          (cond ((not type))
+                (ospec
+                 (setf (car ospec) (type-union (car ospec) type)))
+                (t
+                 (push (cons type restart-name) new))))))))
 
 (declaim (ftype (function (list list) list)
                 process-muffle-conditions-decl))
@@ -43,17 +45,17 @@
 (defun process-unhandle-conditions-decl (spec list)
   (let ((new (copy-alist list)))
     (dolist (clause (cdr spec) new)
-      (destructuring-bind (typespec restart-name) clause
-        (let ((ospec (rassoc restart-name new :test #'eq)))
-          (if ospec
-              (let ((type (type-intersection
-                           (car ospec)
-                           (compiler-specifier-type `(not ,typespec)))))
-                (if (type= type *empty-type*)
-                    (setq new (delete restart-name new :test #'eq :key #'cdr))
-                    (setf (car ospec) type)))
-              ;; do nothing?
-              nil))))))
+      (block nil
+       (destructuring-bind (typespec restart-name) clause
+         (let ((ospec (rassoc restart-name new :test #'eq)))
+           (when ospec
+             (let ((type (type-intersection
+                          (car ospec)
+                          (or (compiler-specifier-type `(not ,typespec))
+                              (return)))))
+               (if (type= type *empty-type*)
+                   (setq new (delete restart-name new :test #'eq :key #'cdr))
+                   (setf (car ospec) type))))))))))
 
 (declaim (ftype (function (list list) list)
                 process-unmuffle-conditions-decl))
@@ -74,14 +76,20 @@
       (enable-package-locks
        (set-difference old names :test #'equal)))))
 
-(!defvar *queued-proclaims* nil) ; should this be !*QUEUED-PROCLAIMS* ?
+;;; This variable really wants to be a DEFVAR, but the "if (boundp)" expression
+;;; is too tricky for genesis. Let's ensure proper behavior by not clobbering
+;;; it in the host, but doing the only thing that genesis can do in the target.
+(#+sb-xc-host defvar #-sb-xc-host defparameter
+ *queued-proclaims* nil) ; should this be !*QUEUED-PROCLAIMS* ?
 
 (defun process-variable-declaration (name kind info-value)
   (unless (symbolp name)
     (error "Cannot proclaim a non-symbol as ~A: ~S" kind name))
 
   (when (and (eq kind 'always-bound) (eq info-value :always-bound)
-             (not (boundp name)))
+             (not (boundp name))
+             ;; Allow it to be unbound at compile-time.
+             (not *compile-time-eval*))
     (error "Cannot proclaim an unbound symbol as ~A: ~S" kind name))
 
   (multiple-value-bind (allowed test)
@@ -127,7 +135,7 @@
     (error "Cannot declare FTYPE of illegal function name ~S" name))
   (when (and (ctype-p type-oid)
              (not (csubtypep type-oid (specifier-type 'function))))
-    (error "Not a function type: ~/sb!impl:print-type/" type-oid))
+    (error "Not a function type: ~/sb-impl:print-type/" type-oid))
   (with-single-package-locked-error
       (:symbol name "globally declaring the FTYPE of ~A")
     (when (eq (info :function :where-from name) :declared)
@@ -198,7 +206,7 @@
            :format-arguments (list form state
                                    (rest (typexpand 'deprecation-state)))))
   (multiple-value-call #'values
-    state (sb!impl::normalize-deprecation-since since)))
+    state (sb-impl::normalize-deprecation-since since)))
 
 (defun process-deprecation-declaration (thing state software version)
   (destructuring-bind (namespace name &key replacement) thing
@@ -206,19 +214,19 @@
       (ecase namespace
         (function
          (when (eq state :final)
-           (sb!impl::setup-function-in-final-deprecation
+           (sb-impl::setup-function-in-final-deprecation
             software version name replacement))
          (setf (info :function :deprecated name) info))
         (variable
          (check-variable-name
           name :context "deprecated variable declaration" :signal-via #'error)
          (when (eq state :final)
-           (sb!impl::setup-variable-in-final-deprecation
+           (sb-impl::setup-variable-in-final-deprecation
             software version name replacement))
          (setf (info :variable :deprecated name) info))
         (type
          (when (eq state :final)
-           (sb!impl::setup-type-in-final-deprecation
+           (sb-impl::setup-type-in-final-deprecation
             software version name replacement))
          (setf (info :type :deprecated name) info))))))
 
@@ -329,9 +337,8 @@
          (unless (info :declaration :recognized kind)
            (compiler-warn "unrecognized declaration ~S" raw-form)))))))
 
-(defun sb!xc:proclaim (raw-form)
-  #!+(and sb-show (host-feature sb-xc))
-  (progn (write-string "* ") (write `(declaim ,raw-form) :level nil) (terpri))
+(defun sb-xc:proclaim (raw-form)
+  (/show "PROCLAIM" raw-form)
   (%proclaim raw-form nil)
   (values))
 

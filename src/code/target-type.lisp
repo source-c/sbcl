@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 (!begin-collecting-cold-init-forms)
 
@@ -32,19 +32,32 @@
     ((or numeric-type
          named-type
          member-type
-         array-type
          character-set-type
          built-in-classoid
-         cons-type
-         #!+sb-simd-pack simd-pack-type)
-     (values (%%typep obj type) t))
+         #!+sb-simd-pack simd-pack-type
+         #!+sb-simd-pack-256 simd-pack-256-type)
+     (values (%%typep obj type)
+             t))
+    (array-type
+     (if (contains-unknown-type-p type)
+         (values nil (not (arrayp obj)))
+         (values (%%typep obj type) t)))
+    (cons-type
+     ;; Do not use %%TYPEP because of SATISFIES
+     (if (consp obj)
+         (multiple-value-bind (typep valid)
+             (ctypep (car obj) (cons-type-car-type type))
+           (if typep
+               (ctypep (cdr obj) (cons-type-cdr-type type))
+               (values nil valid)))
+         (values nil t)))
     (classoid
      (if (if (csubtypep type (specifier-type 'function))
              (funcallable-instance-p obj)
              (%instancep obj))
          (if (eq (classoid-layout type)
                  (info :type :compiler-layout (classoid-name type)))
-             (values (sb!xc:typep obj type) t)
+             (values (sb-xc:typep obj type) t)
              (values nil nil))
          (values nil t)))
     (compound-type
@@ -54,6 +67,8 @@
               #'ctypep
               obj
               (compound-type-types type)))
+    (fun-designator-type
+     (values (typep obj '(or function symbol)) t))
     (fun-type
      (values (functionp obj) t))
     (unknown-type
@@ -89,7 +104,7 @@
           ;; If the SATISFIES function is not foldable, we cannot answer!
           (let* ((form `(,(second hairy-spec) ',obj)))
             (multiple-value-bind (ok result)
-                (sb!c::constant-function-call-p form nil nil)
+                (sb-c::constant-function-call-p form nil nil)
               (values (not (null result)) ok)))))))))
 
 ;;;; miscellaneous interfaces
@@ -131,7 +146,7 @@
       (function
        (if (funcallable-instance-p x)
            (classoid-of x)
-           (let ((type (sb!impl::%fun-type x)))
+           (let ((type (sb-impl::%fun-type x)))
              (if (typep type '(cons (eql function))) ; sanity test
                  (try-cache type)
                  (classoid-of x)))))
@@ -154,6 +169,18 @@
          (svref (load-time-value
                  (coerce (cons (specifier-type 'simd-pack)
                                (mapcar (lambda (x) (specifier-type `(simd-pack ,x)))
+                                       *simd-pack-element-types*))
+                         'vector)
+                 t)
+                (if (<= 0 tag #.(1- (length *simd-pack-element-types*)))
+                    (1+ tag)
+                    0))))
+      #!+sb-simd-pack-256
+      (simd-pack-256
+       (let ((tag (%simd-pack-256-tag x)))
+         (svref (load-time-value
+                 (coerce (cons (specifier-type 'simd-pack-256)
+                               (mapcar (lambda (x) (specifier-type `(simd-pack-256 ,x)))
                                        *simd-pack-element-types*))
                          'vector)
                  t)
@@ -189,7 +216,7 @@
           (simple-p (if (simple-array-p array) 1 0))
           (header-p (array-header-p array)) ; non-simple or rank <> 1 or both
           (cookie (the fixnum (logior (ash (logior (ash rank 1) simple-p)
-                                           sb!vm:n-widetag-bits)
+                                           sb-vm:n-widetag-bits)
                                       (array-underlying-widetag array)))))
   ;; The value computed on cache miss.
   (let ((etype (specifier-type (array-element-type array))))

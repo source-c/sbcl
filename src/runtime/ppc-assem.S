@@ -5,18 +5,17 @@
 
 #define LANGUAGE_ASSEMBLY
 
-#include "sbcl.h" 
+#include "sbcl.h"
 #include "lispregs.h"
 #include "globals.h"
+#include "validate.h"
 
 #include "genesis/simple-fun.h"
 #include "genesis/fdefn.h"
 #include "genesis/closure.h"
 #include "genesis/funcallable-instance.h"
 #include "genesis/static-symbols.h"
-#ifdef LISP_FEATURE_SB_THREAD
 #include "genesis/thread.h"
-#endif
 
 #ifdef LISP_FEATURE_DARWIN
 #define CSYMBOL(x) _ ## x
@@ -63,7 +62,7 @@ x:
 #define store(reg,temp,global) \
 	lis temp,global@ha; stw reg,global@l(temp)
 #endif
-	
+
 #define	FIRST_SAVE_FPR	14	/* lowest-numbered non-volatile FPR */
 #ifdef LISP_FEATURE_DARWIN
 #define	FIRST_SAVE_GPR	13	/* lowest-numbered non-volatile GPR */
@@ -190,8 +189,8 @@ x:
 	mtcr REG(0) @ \
 	lwz REG(0),8(REG(1)) @ \
 	mtlr REG(0) @ \
-	
-#else	
+
+#else
 
 #define C_FULL_PROLOG \
 	mflr 0 ; \
@@ -282,19 +281,44 @@ x:
 	lwz 1,0(1) ; \
 	lwz 0,4(1) ; \
 	mtlr 0 ; \
-	
+
 #endif
 
 #ifdef LISP_FEATURE_SB_SAFEPOINT
-/* OAOOM because we don't have the C headers here. */
-# define THREAD_CSP_PAGE_SIZE 4096
-
 /* the CSP page sits right before the thread */
-# define THREAD_SAVED_CSP_OFFSET (-THREAD_CSP_PAGE_SIZE)
+# define THREAD_SAVED_CSP_OFFSET (-N_WORD_BYTES)
 #endif
-
 	.text
 
+#ifdef OS_THREAD_STACK
+	GFUNCDEF(funcall1_switching_stack)
+        /* The arguments are switched, funcall1_switching_stack(arg, function)
+           to avoid shuffling registers
+        */
+	/* save LR on old stack */
+	mflr	REG(0)
+	stw	REG(0),4(REG(1))
+
+	/* store old SP and switch to new stack */
+        lwz     REG(10),THREAD_ALIEN_STACK_START_OFFSET(REG(3))
+        addis   REG(10),REG(10),ALIEN_STACK_SIZE@ha
+#if ALIEN_STACK_SIZE % 65536 != 0
+        addi    REG(10),REG(10),ALIEN_STACK_SIZE@l
+#endif
+	stwu	REG(1),-16(REG(10))
+	mr	REG(1),REG(10)
+
+	/* call function */
+	mtctr	REG(4)
+	bctrl
+
+	/* restore old SP and LR then return */
+	lwz	REG(1),0(REG(1))
+	lwz	REG(0),4(REG(1))
+	mtlr	REG(0)
+	blr
+	SET_SIZE(funcall1_switching_stack)
+#endif
 /*
  * Function to transfer control into lisp.  The lisp object to invoke is
  * passed as the first argument, which puts it in NL0
@@ -405,11 +429,11 @@ x:
 	addi reg_LIP,reg_CODE,SIMPLE_FUN_CODE_OFFSET
 	mtctr reg_LIP
 	slwi reg_NARGS,reg_NL2,2
-	bctr			
-	
+	bctr
+
 	.align 3
 lra:
-	.long RETURN_PC_WIDETAG 
+	.long RETURN_PC_WIDETAG
 
 	/* Blow off any extra values. */
 	mr reg_CSP,reg_OCFP
@@ -449,7 +473,7 @@ lra:
 	subi reg_ALLOC, reg_ALLOC, flag_PseudoAtomic
 	andi. reg_NL3, reg_ALLOC, flag_PseudoAtomicInterrupted
 	twnei reg_NL3,0
-	
+
 	/* Back to C */
 	C_FULL_EPILOG
 	blr
@@ -498,7 +522,7 @@ lra:
 	clrrwi reg_NFP,reg_ALLOC,3
 	store(reg_NFP,reg_CFUNC,CSYMBOL(dynamic_space_free_pointer))
 	/* load(reg_CFUNC,current_thread) */
-	
+
 	store(reg_BSP,reg_CFUNC,CSYMBOL(current_binding_stack_pointer))
 	store(reg_CSP,reg_CFUNC,CSYMBOL(current_control_stack_pointer))
 	store(reg_CFP,reg_CFUNC,CSYMBOL(current_control_frame_pointer))
@@ -514,7 +538,12 @@ lra:
 
 #ifdef LISP_FEATURE_SB_SAFEPOINT
 	/* OK to run GC without stopping this thread from this point on. */
+#  ifdef LISP_FEATURE_SB_THREAD
 	stw reg_CSP,THREAD_SAVED_CSP_OFFSET(reg_THREAD)
+#  else
+	load(reg_CFUNC,CSYMBOL(all_threads))
+	stw reg_CSP,THREAD_SAVED_CSP_OFFSET(reg_CFUNC)
+#  endif
 #endif
 
 	mr reg_NL3,reg_NARGS
@@ -562,7 +591,12 @@ lra:
 
 # ifdef LISP_FEATURE_SB_SAFEPOINT
 	/* No longer OK to run GC except at safepoints. */
+#  ifdef LISP_FEATURE_SB_THREAD
 	stw reg_ZERO,THREAD_SAVED_CSP_OFFSET(reg_THREAD)
+#  else
+	load(reg_BSP,CSYMBOL(all_threads))
+	stw reg_ZERO,THREAD_SAVED_CSP_OFFSET(reg_BSP)
+#  endif
 # endif
 
 	/* Atomic ... */
@@ -600,17 +634,18 @@ lra:
 	add reg_LIP,reg_CODE,reg_LIP
 	la reg_LIP,-OTHER_POINTER_LOWTAG(reg_LIP)
 
+        /* Debugger expects LR to be valid when we come out of PA */
+	mtlr reg_LIP
+
 	/* No longer atomic */
 	subi reg_ALLOC, reg_ALLOC, flag_PseudoAtomic
 	andi. reg_NL3, reg_ALLOC, flag_PseudoAtomicInterrupted
 	twnei reg_NL3, 0
 
-	mtlr reg_LIP
-	
 	/* Reset the lisp stack. */
 	mr reg_CSP,reg_CFP
 	mr reg_CFP,reg_OCFP
-	
+
 	/* And back into Lisp. */
 	blr
 

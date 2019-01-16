@@ -7,9 +7,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
-
-(/show0 "parse-lambda-list.lisp 12")
+(in-package "SB-C")
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 (defconstant-eqx lambda-list-parser-states
@@ -93,7 +91,7 @@
                ;; &OPTIONAL/&KEY message randomly repeated, especially if it's
                ;; someone else's code. Fwiw, 'full-eval' muffles warnings during
                ;; all calls to this parser anyway.
-               (silent (typep list '(cons (eql sb!pcl::.pv.))))
+               (silent (typep list '(cons (eql sb-pcl::.pv.))))
           &aux (seen 0) required optional rest more keys aux env whole tail
                (rest-bits 0))
   (declare (optimize speed))
@@ -114,14 +112,14 @@
              (probably-ll-keyword-p (arg)
                ;; Compiler doesn't see that the check is manually done. :-(
                #-sb-xc-host
-               (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+               (declare (optimize (sb-c::insert-array-bounds-checks 0)))
                (and (symbolp arg)
                     (let ((name (symbol-name arg)))
                       (and (plusp (length name))
                            (char= (char name 0) #\&)))))
              (check-suspicious (kind form)
                (and (probably-ll-keyword-p form)
-                    (member form sb!xc:lambda-list-keywords)
+                    (member form sb-xc:lambda-list-keywords)
                     (report-suspicious kind form)))
              (report-suspicious (kind what)
                (style-warn-once list "suspicious ~A ~S in lambda list: ~S."
@@ -355,11 +353,12 @@
   (let ((names (make-repeated-name-check :signal-via signal-via))
         (keywords (make-repeated-name-check
                    :kind "keyword" :signal-via signal-via)))
-    (flet ((check-name (name)
+    (flet ((check-name (name &key allow-repeating)
              (check-variable-name-for-binding
               name :context context :signal-via signal-via
               :allow-symbol-macro allow-symbol-macro)
-             (funcall names name)))
+             (unless allow-repeating
+               (funcall names name))))
       (mapc #'check-name required)
       (mapc (lambda (spec)
               (multiple-value-bind (name default suppliedp-var)
@@ -370,6 +369,12 @@
                   (check-name (first suppliedp-var)))))
             optional)
       (mapc #'check-name rest)
+      (mapc (lambda (spec)
+              (check-name (if (consp spec)
+                              (car spec)
+                              spec)
+                          :allow-repeating t))
+            aux)
       (mapc (lambda (spec)
               (multiple-value-bind (keyword name default suppliedp-var)
                   (parse-key-arg-spec spec)
@@ -770,13 +775,16 @@
                                   (if sup-p-var `(values ,val-form t) val-form)
                                   def)))
              (cond ((not sup-p-var) (bind-pat var vals))
-                   ((symbolp var) (bind `((,var ,suppliedp) ,vals)))
-                   (t
-                    (let ((var-temp (sb!xc:gensym))
+                   ((not (symbolp var))
+                    (let ((var-temp (sb-xc:gensym))
                           (sup-p-temp (copy-symbol suppliedp)))
                       (bind `((,var-temp ,sup-p-temp) ,vals))
                       (descend var var-temp)
-                      (bind `(,suppliedp ,sup-p-temp)))))))
+                      (bind `(,suppliedp ,sup-p-temp))))
+                   ((eq var suppliedp)
+                    (bind `((nil ,suppliedp) ,vals)))
+                   (t
+                    (bind `((,var ,suppliedp) ,vals))))))
          (gen-test (sense test then else)
            (cond ((eq sense t) `(if ,test ,then ,@(if else (list else))))
                  (else `(if ,test ,else ,then)) ; flip the branches
@@ -791,7 +799,7 @@
              ;; in theory, (MULTIPLE-VALUE-BIND () (EXPR) ...)
              ;; but in practice it becomes a binding of an ignored gensym.
              (let* ((bindings-p (or whole required opt rest keys))
-                    (temp (and bindings-p (sb!xc:gensym))))
+                    (temp (and bindings-p (sb-xc:gensym))))
                (bind `(,temp
                        ,(cond ((or emit-pre-test (ll-kwds-keyp llks))
                                (emit-ds-bind-check parsed-lambda-list input
@@ -841,7 +849,7 @@
              (dolist (elt keys)
                (multiple-value-bind (keyword var def sup-p-var)
                    (parse-key-arg-spec elt default-default)
-                 (let ((temp (sb!xc:gensym)))
+                 (let ((temp (sb-xc:gensym)))
                    (bind `(,temp (ds-getf ,input ',keyword)))
                    (bind-if :not `(eql ,temp 0) `(car (truly-the cons ,temp))
                             var sup-p-var def))))
@@ -891,22 +899,22 @@
       ;; ERROR. To ingrain that knowledge into the CHECK-DS-foo
       ;; functions is a bit of a hack, but to do otherwise
       ;; changes how DS-BIND has to expand.
-      (compiler-error 'sb!kernel::arg-count-error
+      (compiler-error 'sb-kernel::arg-count-error
                       :kind "special operator" :name name
                       :args input :lambda-list lambda-list
                       :minimum min :maximum max))
      #!+sb-eval
      (:eval
-      (error 'sb!eval::arg-count-program-error
+      (error 'sb-eval::arg-count-program-error
              ;; This is stupid. Maybe we should just say
              ;;  "error parsing special form"?
              ;; It would be more sensible than mentioning
              ;; a random nonstandard macro.
-             :kind 'sb!eval::program-destructuring-bind
+             :kind 'sb-eval::program-destructuring-bind
              :args input :lambda-list lambda-list
              :minimum min :maximum max))
      (t
-      (error 'sb!kernel::arg-count-error
+      (error 'sb-kernel::arg-count-error
              :kind kind :name name
              :args input :lambda-list lambda-list
              :minimum min :maximum max)))))
@@ -948,7 +956,7 @@
       ;; but COERCE-TO-LIST is an inline function not yet defined, and
       ;; its subsequent definition would signal an inlining failure warning.
       (declare (notinline coerce))
-      (error 'sb!kernel::defmacro-lambda-list-broken-key-list-error
+      (error 'sb-kernel::defmacro-lambda-list-broken-key-list-error
              :kind kind :name name
              :problem problem
              :info (if (eq problem :unknown-keyword)
@@ -1151,18 +1159,25 @@
           (append whole env (ds-lambda-list-variables parse nil)))
     ;; Maybe kill docstring, but only under the cross-compiler.
     #!+(and (not sb-doc) (host-feature sb-xc-host)) (setq docstring nil)
+    ;; Note that we *NEVER* declare macro lambdas as a toplevel named lambda.
+    ;; Code such as:
+    ;;  `(setf (symbol-function ',myfun) ,(make-macro-lambda whatever))
+    ;; with the intent to render MYFUN as having status as a known global function
+    ;; ("known" in the sense of existing at all, and preventing an "undefined"
+    ;; warning, _not_ "known" in the sense of 'fndb' knowing about it specially),
+    ;; then that code is misguided.  Macro-like objects can not cause global
+    ;; function names to be defined. Only DEFUN can do that.
     (values `(,@(if lambda-name `(named-lambda ,lambda-name) '(lambda))
-                  (,ll-whole ,@ll-env ,@(and ll-aux (cons '&aux ll-aux)))
+                (,ll-whole ,@ll-env ,@(and ll-aux (cons '&aux ll-aux)))
               ,@(when (and docstring (eq doc-string-allowed :internal))
                   (prog1 (list docstring) (setq docstring nil)))
               ;; MACROLET doesn't produce an object capable of reflection,
               ;; so don't bother inserting a different lambda-list.
               ,@(unless (eq kind 'macrolet)
-
                   `((declare ,declared-lambda-list)))
               ,@(if outer-decls (list outer-decls))
               ,@(and (not env) (eq envp t) `((declare (ignore ,@ll-env))))
-              ,@(sb!c:macro-policy-decls)
+              ,@(sb-c:macro-policy-decls)
               (,@(if kind
                      `(named-ds-bind ,(if (eq kind :special-form)
                                           `(:special-form . ,name)
@@ -1202,5 +1217,3 @@
          ;; It is harmful to the space-saving effect of this function
          ;; if reconstituting the list results in an unnecessary copy.
          (if (equal new lambda-list) lambda-list new))))))
-
-(/show0 "parse-lambda-list.lisp end of file")

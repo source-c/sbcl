@@ -9,7 +9,7 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(in-package :cl-user)
+(enable-test-parallelism)
 
 (defvar *format-mode*)
 
@@ -42,6 +42,12 @@
   `(and sb-format:format-error
         (satisfies format-error-format-control-string-p)))
 
+(with-test (:name :combine-directives)
+  ;; The scratch buffer for rematerializing a control string after extracting
+  ;; user-fun directives (~//) needs to account for the expansion of the input
+  ;; if a directive is converted immediately to a run of literal characters.
+  (sb-format::extract-user-fun-directives "Oh hello~10%~/f/"))
+
 (with-test (:name (:[-directive :non-integer-argument))
   (with-compiled-and-interpreted-format ()
     (assert-error (format* "~[~]" 1d0) format-error-with-control-string)))
@@ -66,3 +72,46 @@
     (format s "~/sb-ext:print-symbol-with-prefix/" 'cl-user::test)
     (sb-int:unencapsulate 'sb-ext:print-symbol-with-prefix 'test)
     (assert (string= "{{COMMON-LISP-USER::TEST}}" (get-output-stream-string s)))))
+
+(with-test (:name :non-simple-string)
+  (let ((control (make-array 2 :element-type 'base-char
+                               :initial-element #\A
+                               :fill-pointer 1)))
+    (checked-compile-and-assert
+        ()
+        `(lambda () (with-output-to-string (stream)
+                      (funcall (formatter ,control) stream)))
+      (() "A" :test #'equal))
+    (checked-compile-and-assert
+        ()
+        `(lambda () (format nil ,control))
+      (() "A" :test #'equal))
+    (checked-compile-and-assert
+        ()
+        `(lambda () (cerror ,control ,control))
+      (() (condition 'simple-error)))
+    (checked-compile-and-assert
+        ()
+        `(lambda () (error ,control))
+      (() (condition 'simple-error)))))
+
+(with-test (:name :tokenize-curly-brace-nonliteral-empty)
+  (flet ((try (string)
+           (let ((tokens (sb-format::tokenize-control-string string)))
+             (assert (and (= (length tokens) 3)
+                          (string= (second tokens) ""))))))
+    ;; Each of these curly-brace-wrapped expressions needs to preserve
+    ;; the insides as an empty string so that it does not degenerate
+    ;; to the control string "~{~}".
+    (try "~{~
+~}")
+    (try "~{~0|~}")
+    (try "~{~0~~}")
+    (try "~{~0%~}")
+    ;; these are also each three parsed tokens:
+    ;; 0 newlines plus an ignored newline
+    (try "~{~0%~
+~}")
+    ;; 0 newlines, an ignored newline, and 0 tildes
+    (try "~{~0%~
+~0|~0~~}")))

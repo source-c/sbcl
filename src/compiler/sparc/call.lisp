@@ -9,11 +9,11 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
-(defconstant arg-count-sc (make-sc-offset immediate-arg-scn nargs-offset))
-(defconstant closure-sc (make-sc-offset descriptor-reg-sc-number lexenv-offset))
+(defconstant arg-count-sc (make-sc+offset immediate-arg-scn nargs-offset))
+(defconstant closure-sc (make-sc+offset descriptor-reg-sc-number lexenv-offset))
 
 ;;; Make a passing location TN for a local call return PC.  If
 ;;; standard is true, then use the standard (full call) location,
@@ -30,10 +30,11 @@
 ;;; standard convention, but is totally unrestricted in non-standard
 ;;; conventions, since we can always fetch it off of the stack using
 ;;; the arg pointer.
-(defun make-old-fp-passing-location (standard)
-  (if standard
-      (make-wired-tn *fixnum-primitive-type* immediate-arg-scn ocfp-offset)
-      (make-normal-tn *fixnum-primitive-type*)))
+(defun make-old-fp-passing-location ()
+  (make-wired-tn *fixnum-primitive-type* immediate-arg-scn ocfp-offset))
+
+(defconstant old-fp-passing-offset
+  (make-sc+offset descriptor-reg-sc-number ocfp-offset))
 
 ;;; Make the TNs used to hold Old-FP and Return-PC within the current
 ;;; function.  We treat these specially so that the debugger can find
@@ -117,8 +118,7 @@
     (emit-label start-lab)
     ;; Allocate function header.
     (inst simple-fun-header-word)
-    (dotimes (i (1- simple-fun-code-offset))
-      (inst word 0))
+    (inst .skip (* (1- simple-fun-code-offset) n-word-bytes))
     ;; The start of the actual code.
     ;; Fix CODE, cause the function object was passed in.
     (inst compute-code-from-fn code-tn code-tn start-lab temp)))
@@ -280,7 +280,7 @@ default-value-8
 
             (let ((defaults (defaults)))
               (when defaults
-                (assemble (*elsewhere*)
+                (assemble (:elsewhere)
                   (emit-label default-stack-vals)
                   (do ((remaining defaults (cdr remaining)))
                       ((null remaining))
@@ -327,7 +327,7 @@ default-value-8
 
     (emit-label done)
 
-    (assemble (*elsewhere*)
+    (assemble (:elsewhere)
       (emit-label variable-values)
       (inst compute-code-from-lra code-tn code-tn lra-label temp)
       (do ((arg *register-arg-tns* (rest arg))
@@ -724,8 +724,8 @@ default-value-8
                 (insert-step-instrumenting (callable-tn)
                   ;; Conditionally insert a conditional trap:
                   (when step-instrumenting
-                    ;; Get the symbol-value of SB!IMPL::*STEPPING*
-                    (load-symbol-value stepping sb!impl::*stepping*)
+                    ;; Get the symbol-value of SB-IMPL::*STEPPING*
+                    (load-symbol-value stepping sb-impl::*stepping*)
                     (inst cmp stepping zero-tn)
                     ;; If it's not null, trap.
                     (inst b :eq step-done-label)
@@ -737,7 +737,7 @@ default-value-8
                     ;; the register number of CALLABLE-TN.
                     (inst unimp (logior single-step-around-trap
                                         (ash (reg-tn-encoding callable-tn)
-                                             5)))
+                                             8)))
                     (emit-label step-done-label))))
            (declare (ignorable #'insert-step-instrumenting))
            ,@(case named
@@ -1130,7 +1130,7 @@ default-value-8
 ;;; stack top.
 (define-vop (more-arg-context)
   (:policy :fast-safe)
-  (:translate sb!c::%more-arg-context)
+  (:translate sb-c::%more-arg-context)
   (:args (supplied :scs (any-reg)))
   (:arg-types tagged-num (:constant fixnum))
   (:info fixed)
@@ -1142,28 +1142,6 @@ default-value-8
     (inst sub count supplied (fixnumize fixed))
     (inst sub context csp-tn count)))
 
-
-;;; Signal wrong argument count error if Nargs isn't = to Count.
-#!-precise-arg-count-error
-(define-vop (verify-arg-count)
-  (:policy :fast-safe)
-  (:translate sb!c::%verify-arg-count)
-  (:args (nargs :scs (any-reg)))
-  (:arg-types positive-fixnum (:constant t))
-  (:info count)
-  (:vop-var vop)
-  (:save-p :compute-only)
-  (:generator 3
-    (let ((err-lab
-           (generate-error-code vop 'invalid-arg-count-error nargs)))
-      (inst cmp nargs (fixnumize count))
-      (if (member :sparc-v9 *backend-subfeatures*)
-          ;; Assume we don't take the branch
-          (inst b :ne err-lab :pn)
-          (inst b :ne err-lab))
-      (inst nop))))
-
-#!+precise-arg-count-error
 (define-vop (verify-arg-count)
   (:policy :fast-safe)
   (:args (nargs :scs (any-reg)))
@@ -1187,12 +1165,12 @@ default-value-8
              (max
               (when (plusp min)
                 (inst cmp nargs (fixnumize min))
-                (b :leu))
+                (b :ltu))
               (inst cmp nargs (fixnumize max))
-              (b :geu))
+              (b :gtu))
              ((plusp min)
               (inst cmp nargs (fixnumize min))
-              (b :leu)))))))
+              (b :ltu)))))))
 
 ;;; Single-stepping
 (define-vop (step-instrument-before-vop)
@@ -1200,7 +1178,7 @@ default-value-8
   (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
-    (load-symbol-value stepping sb!impl::*stepping*)
+    (load-symbol-value stepping sb-impl::*stepping*)
     (inst cmp stepping zero-tn)
     (inst b :eq DONE)
     (inst nop)

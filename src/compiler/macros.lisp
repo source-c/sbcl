@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; source-hacking defining forms
 
@@ -49,7 +49,8 @@
         (,lambda-expr ,whole-var *lexenv*)
         (values))
       #-sb-xc-host
-      (install-guard-function ',name '(:special ,name) ,doc)
+      (progn (install-guard-function ',name '(:special ,name))
+             (setf (documentation (symbol-function ',name) t) ',doc))
            ;; FIXME: Evidently "there can only be one!" -- we overwrite any
            ;; other :IR1-CONVERT value. This deserves a warning, I think.
       (setf (info :function :ir1-convert ',name) #',fn-name)
@@ -118,7 +119,7 @@
                    (make-lambda-list llks nil req opt rest keys aux)
                    lambda-list)) ; otherwise use the original list
        (args (make-symbol "ARGS")))
-    `(setf (info :function :source-transform ',fun-name)
+    `(%define-source-transform ',fun-name
            (named-lambda (:source-transform ,fun-name)
                (,lambda-whole ,lambda-env &aux (,args (cdr ,lambda-whole)))
              ,@(if (not env) `((declare (ignore ,lambda-env))))
@@ -133,6 +134,10 @@
                        ,@inner-decls
                        (block ,(fun-name-block-name fun-name) ,@forms))
                    (values call pass)))))))
+(defun %define-source-transform (fun-name lambda)
+  (when (info :function :source-transform fun-name)
+    (warn "Redefining source-transform for ~S" fun-name))
+  (setf (info :function :source-transform fun-name) lambda))
 
 ;;;; lambda-list parsing utilities
 ;;;;
@@ -268,8 +273,8 @@
 ;;;   :IMPORTANT
 ;;;           - If the transform fails and :IMPORTANT is
 ;;;               NIL,       then never print an efficiency note.
-;;;               :SLIGHTLY, then print a note if SPEED>=INHIBIT-WARNINGS.
-;;;               T,         then print a note if SPEED>INHIBIT-WARNINGS.
+;;;               :SLIGHTLY, then print a note if SPEED>INHIBIT-WARNINGS.
+;;;               T,         then print a note if SPEED>=INHIBIT-WARNINGS.
 ;;;             :SLIGHTLY is the default.
 (defmacro deftransform (name (lambda-list &optional (arg-types '*)
                                           (result-type '*)
@@ -281,8 +286,8 @@
     (error "can't specify both DEFUN-ONLY and EVAL-NAME"))
   (multiple-value-bind (body decls doc) (parse-body body-decls-doc t)
     (let ((n-node (or node (make-symbol "NODE")))
-          (n-decls (sb!xc:gensym))
-          (n-lambda (sb!xc:gensym)))
+          (n-decls (sb-xc:gensym))
+          (n-lambda (sb-xc:gensym)))
       (multiple-value-bind (bindings vars)
           (parse-deftransform lambda-list n-node
                               '(give-up-ir1-transform))
@@ -299,14 +304,15 @@
                   ;; What purpose does it serve to allow the transform's body
                   ;; to return decls as a second value? They would go in the
                   ;; right place if simply returned as part of the expression.
-                  (multiple-value-bind (,n-lambda ,n-decls)
+                  (block ,(fun-name-block-name name)
+                   (multiple-value-bind (,n-lambda ,n-decls)
                       (progn ,@body)
                     (if (and (consp ,n-lambda) (eq (car ,n-lambda) 'lambda))
                         ,n-lambda
                         `(lambda ,',lambda-list
                            (declare (ignorable ,@',vars))
                            ,@,n-decls
-                           ,,n-lambda))))))
+                           ,,n-lambda)))))))
           (if defun-only
               `(defun ,name ,@stuff)
               `(%deftransform
@@ -347,134 +353,6 @@
                                  ,important
                                  policy))))))
 
-;;;; DEFKNOWN and DEFOPTIMIZER
-
-;;; This macro should be the way that all implementation independent
-;;; information about functions is made known to the compiler.
-;;;
-;;; FIXME: The comment above suggests that perhaps some of my added
-;;; FTYPE declarations are in poor taste. Should I change my
-;;; declarations, or change the comment, or what?
-;;;
-;;; FIXME: DEFKNOWN is needed only at build-the-system time. Figure
-;;; out some way to keep it from appearing in the target system.
-;;;
-;;; Declare the function NAME to be a known function. We construct a
-;;; type specifier for the function by wrapping (FUNCTION ...) around
-;;; the ARG-TYPES and RESULT-TYPE. ATTRIBUTES is an unevaluated list
-;;; of boolean attributes of the function. See their description in
-;;; (!DEF-BOOLEAN-ATTRIBUTE IR1). NAME may also be a list of names, in
-;;; which case the same information is given to all the names. The
-;;; keywords specify the initial values for various optimizers that
-;;; the function might have.
-(defmacro defknown (name arg-types result-type &optional (attributes '(any))
-                    &body keys)
-  #-sb-xc-host
-  (when (member 'unsafe attributes)
-    (style-warn "Ignoring legacy attribute UNSAFE. Replaced by its inverse: DX-SAFE.")
-    (setf attributes (remove 'unsafe attributes)))
-  (when (and (intersection attributes '(any call unwind))
-             (intersection attributes '(movable)))
-    (error "function cannot have both good and bad attributes: ~S" attributes))
-
-  (when (member 'any attributes)
-    (setq attributes (union '(unwind) attributes)))
-  (when (member 'flushable attributes)
-    (pushnew 'unsafely-flushable attributes))
-  (multiple-value-bind (callable-map arg-types)
-      (make-callable-map arg-types attributes)
-    `(%defknown ',(if (and (consp name)
-                           (not (legal-fun-name-p name)))
-                      name
-                      (list name))
-                '(sfunction ,arg-types ,result-type)
-                (ir1-attributes ,@attributes)
-                (source-location)
-                :callable-map ,callable-map
-                ,@keys)))
-
-(defun make-callable-map (arg-types attributes)
-  (if (member 'call attributes)
-      (multiple-value-bind (llks required optional rest keys)
-          (parse-lambda-list
-           arg-types
-           :context :function-type
-           :accept (lambda-list-keyword-mask
-                    '(&optional &rest &key &allow-other-keys))
-           :silent t)
-        (let (vars
-              call-vars
-              arg-count-specified)
-          (labels ((callable-p (x)
-                     (member x '(callable function)))
-                   (process-var (x &optional (name (gensym)))
-                     (if (callable-p (if (consp x)
-                                         (car x)
-                                         x))
-                         (push (list* name
-                                      (cond ((consp x)
-                                             (setf arg-count-specified t)
-                                             (cdr x))))
-                               call-vars)
-                         (push name vars))
-                     name)
-                   (process-type (type)
-                     (if (and (consp type)
-                              (callable-p (car type)))
-                         (car type)
-                         type))
-                   (callable-rest-p (x)
-                     (and (consp x)
-                          (callable-p (car x))
-                          (eql (cadr x) '&rest))))
-            (let* (rest-var
-                   (lambda-list
-                     (cond ((find-if #'callable-rest-p required)
-                            (setf rest-var (gensym))
-                            `(,@(loop for var in required
-                                      collect (process-var var)
-                                      until (callable-rest-p var))
-                              &rest ,rest-var))
-                           (t
-                            `(,@(mapcar #'process-var required)
-                              ,@(and optional
-                                     `(&optional ,@(mapcar #'process-var optional)))
-                              ,@(and rest
-                                     `(&rest ,@(mapcar #'process-var rest)))
-                              ,@(and (ll-kwds-keyp llks)
-                                     `(&key ,@(loop for (key type) in keys
-                                                    for var = (gensym)
-                                                    do (process-var type var)
-                                                    collect `((,key ,var))))))))))
-
-              (assert call-vars)
-              (values
-               `(lambda (function ,@lambda-list)
-                  (declare (ignore ,@vars))
-                  ,@(loop for (x arg-count . options) in call-vars
-                          collect `(funcall function
-                                            ,x
-                                            ,@(and arg-count
-                                                   `(:arg-count
-                                                     ,(if (eq arg-count '&rest)
-                                                          `(length ,rest-var)
-                                                          arg-count)))
-                                            ,@(loop for (keyword value) on options by #'cddr
-                                                    collect keyword
-                                                    collect `',value))))
-               `(,@(mapcar #'process-type required)
-                 ,@(and optional
-                        `(&optional ,@(mapcar #'process-type optional)))
-                 ,@(and (ll-kwds-restp llks)
-                        `(&rest ,@rest))
-                 ,@(and (ll-kwds-keyp llks)
-                        `(&key
-                          ,@(loop for (key type) in keys
-                                  collect `(,key ,(process-type type)))))
-                 ,@(and (ll-kwds-allowp llks)
-                        '(&allow-other-keys))))))))
-      (values nil arg-types)))
-
 ;;; Create a function which parses combination args according to WHAT
 ;;; and LAMBDA-LIST, where WHAT is either a function name or a list
 ;;; (FUN-NAME KIND) and does some KIND of optimization.
@@ -497,7 +375,7 @@
 ;;; methods are passed an additional POLICY argument, and IR2-CONVERT
 ;;; methods are passed an additional IR2-BLOCK argument.
 (defmacro defoptimizer (what (lambda-list
-                              &optional (node (sb!xc:gensym) node-p)
+                              &optional (node (sb-xc:gensym) node-p)
                               &rest vars)
                         &body body)
   (binding* ((name
@@ -531,7 +409,7 @@
                                ,@gensyms))
            ,@more-decls ,@forms))
        ,@(when (consp what)
-           `((setf (,(let ((*package* (symbol-package 'fun-info)))
+           `((setf (,(let ((*package* (sb-xc:symbol-package 'fun-info)))
                           (symbolicate "FUN-INFO-" (second what)))
                        (fun-info-or-lose ',(first what)))
                       #',name))))))
@@ -729,7 +607,7 @@
 ;;; :TEST keyword may be used to determine the name equality
 ;;; predicate.
 (defmacro lexenv-find (name slot &key test)
-  (once-only ((n-res `(assoc ,name (,(let ((*package* (symbol-package 'lexenv-funs)))
+  (once-only ((n-res `(assoc ,name (,(let ((*package* (sb-xc:symbol-package 'lexenv-funs)))
                                           (symbolicate "LEXENV-" slot))
                                      *lexenv*)
                              :test ,(or test '#'eq))))
@@ -756,8 +634,6 @@
 ;;; experimentation, not for ordinary use, so it should probably
 ;;; become conditional on SB-SHOW.
 
-(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
-
 (defstruct (event-info (:copier nil))
   ;; The name of this event.
   (name (missing-arg) :type symbol)
@@ -774,7 +650,7 @@
   (action nil :type (or function null)))
 
 ;;; A hashtable from event names to event-info structures.
-(defvar *event-info* (make-hash-table :test 'eq))
+(define-load-time-global *event-info* (make-hash-table :test 'eq))
 
 ;;; Return the event info for Name or die trying.
 (declaim (ftype (function (t) event-info) event-info-or-lose))
@@ -783,8 +659,6 @@
     (unless res
       (error "~S is not the name of an event." name))
     res))
-
-) ; EVAL-WHEN
 
 ;;; Return the number of times that EVENT has happened.
 (declaim (ftype (function (symbol) fixnum) event-count))
@@ -826,7 +700,7 @@
 (defmacro defevent (name description &optional (level 0))
   (let ((var-name (symbolicate "*" name "-EVENT-INFO*")))
     `(eval-when (:compile-toplevel :load-toplevel :execute)
-       (defvar ,var-name
+       (define-load-time-global ,var-name
          (make-event-info :name ',name
                           :description ',description
                           :var ',var-name
@@ -884,6 +758,7 @@
                 (key #'identity)
                 (test #'eql))
   (declare (type function next key test))
+  ;; #-sb-xc-host (declare (dynamic-extent next key test)) ; emits "unable" note
   (do ((current list (funcall next current)))
       ((null current) nil)
     (when (funcall test (funcall key current) element)
@@ -899,6 +774,7 @@
                     (key #'identity)
                     (test #'eql))
   (declare (type function next key test))
+  ;; #-sb-xc-host (declare (dynamic-extent next key test)) ; emits "unable" note
   (do ((current list (funcall next current))
        (i 0 (1+ i)))
       ((null current) nil)
@@ -907,7 +783,7 @@
 
 (defmacro deletef-in (next place item &environment env)
   (multiple-value-bind (temps vals stores store access)
-      (#+sb-xc sb!xc:get-setf-expansion #-sb-xc get-setf-expansion place env)
+      (#+sb-xc sb-xc:get-setf-expansion #-sb-xc get-setf-expansion place env)
     (when (cdr stores)
       (error "multiple store variables for ~S" place))
     (let ((n-item (gensym))
@@ -933,7 +809,7 @@
 ;;;
 (defmacro push-in (next item place &environment env)
   (multiple-value-bind (temps vals stores store access)
-      (#+sb-xc sb!xc:get-setf-expansion #-sb-xc get-setf-expansion place env)
+      (#+sb-xc sb-xc:get-setf-expansion #-sb-xc get-setf-expansion place env)
     (when (cdr stores)
       (error "multiple store variables for ~S" place))
     `(let (,@(mapcar #'list temps vals)

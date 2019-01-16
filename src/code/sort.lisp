@@ -9,9 +9,10 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 (defun sort-vector (vector start end predicate-fun key-fun-or-nil)
+  (declare (dynamic-extent predicate-fun key-fun-or-nil))
   (sort-vector vector start end predicate-fun key-fun-or-nil))
 
 ;;; This is MAYBE-INLINE because it's not too hard to have an
@@ -23,6 +24,7 @@
   "Destructively sort SEQUENCE. PREDICATE should return non-NIL if
    ARG1 is to precede ARG2."
   (declare (truly-dynamic-extent args))
+  (declare  (dynamic-extent predicate key))
   (let ((predicate-fun (%coerce-callable-to-fun predicate)))
     (seq-dispatch sequence
       (stable-sort-list sequence
@@ -35,13 +37,14 @@
                           :check-fill-pointer t)
           (sort-vector vector start end predicate-fun key-fun-or-nil))
         sequence)
-      (apply #'sb!sequence:sort sequence predicate args))))
+      (apply #'sb-sequence:sort sequence predicate args))))
 
 ;;;; stable sorting
 (defun stable-sort (sequence predicate &rest args &key key)
   "Destructively sort SEQUENCE. PREDICATE should return non-NIL if
    ARG1 is to precede ARG2."
   (declare (truly-dynamic-extent args))
+  (declare (dynamic-extent predicate key))
   (let ((predicate-fun (%coerce-callable-to-fun predicate)))
     (seq-dispatch sequence
       (stable-sort-list sequence
@@ -54,11 +57,11 @@
           (stable-sort-vector sequence
                               predicate-fun
                               (and key (%coerce-callable-to-fun key))))
-      (apply #'sb!sequence:stable-sort sequence predicate args))))
+      (apply #'sb-sequence:stable-sort sequence predicate args))))
 
 ;;; FUNCALL-USING-KEY saves us a function call sometimes.
 (eval-when (:compile-toplevel :execute)
-  (sb!xc:defmacro funcall2-using-key (pred key one two)
+  (sb-xc:defmacro funcall2-using-key (pred key one two)
     `(if ,key
          (funcall ,pred (funcall ,key ,one)
                   (funcall ,key  ,two))
@@ -79,6 +82,7 @@
   (declare (type cons head list1 list2)
            (type function test key)
            (optimize speed))
+  (declare (dynamic-extent test key))
   (let ((key1 (funcall key (car list1)))
         (key2 (funcall key (car list2))))
     (macrolet ((merge-one (l1 k1 l2)
@@ -162,6 +166,7 @@
            (type function test key)
            (dynamic-extent head))
   (declare (explicit-check))
+  (declare (dynamic-extent test key))
   (labels ((merge* (size list1 tail1 list2 tail2 rest)
              (declare (optimize speed)
                       (type (and fixnum unsigned-byte) size)
@@ -213,7 +218,7 @@
 ;;;    end-1 (inclusive) ... end-2 (exclusive),
 ;;; and merges them into a target vector starting at index start-1.
 
-(sb!xc:defmacro stable-sort-merge-vectors* (source target start-1 end-1 end-2
+(sb-xc:defmacro stable-sort-merge-vectors* (source target start-1 end-1 end-2
                                                      pred key source-ref
                                                      target-ref)
   (let ((i (gensym))
@@ -253,7 +258,7 @@
 ;;; but it uses a temporary vector. DIRECTION determines whether we
 ;;; are merging into the temporary (T) or back into the given vector
 ;;; (NIL).
-(sb!xc:defmacro vector-merge-sort (vector pred key vector-ref)
+(sb-xc:defmacro vector-merge-sort (vector pred key vector-ref)
   (with-unique-names
       (vector-len n direction unsorted start-1 end-1 end-2 temp i)
     `(let* ((,vector-len (length (the vector ,vector)))
@@ -319,12 +324,14 @@
            (type function pred)
            (type (or null function) key))
   (declare (explicit-check))
+  (declare (dynamic-extent pred key))
   (vector-merge-sort vector pred key svref))
 
 (defun stable-sort-vector (vector pred key)
   (declare (type function pred)
            (type (or null function) key))
   (declare (explicit-check))
+  (declare (dynamic-extent pred key))
   (vector-merge-sort vector pred key aref))
 
 ;;;; merging
@@ -335,7 +342,7 @@
 ;;; of the elements of VECTOR-1 and VECTOR-2. Elements from VECTOR-2
 ;;; are chosen only if they are strictly less than elements of
 ;;; VECTOR-1, (PRED ELT-2 ELT-1), as specified in the manual.
-(sb!xc:defmacro merge-vectors (vector-1 length-1 vector-2 length-2
+(sb-xc:defmacro merge-vectors (vector-1 length-1 vector-2 length-2
                                result-vector pred key access)
   (let ((result-i (gensym))
         (i (gensym))
@@ -379,6 +386,7 @@
   ;; full calls to SPECIFIER-TYPE at runtime; copying input vectors
   ;; to lists before doing MERGE-LISTS -- WHN 2003-01-05
   (declare (explicit-check))
+  (declare (dynamic-extent predicate key))
   (let ((type (specifier-type result-type))
         (pred-fun (%coerce-callable-to-fun predicate))
         ;; Avoid coercing NIL to a function since 2 out of 3 branches of the
@@ -412,7 +420,7 @@
                                                        (length s2)))))
          (if (cons-type-p type)
              (multiple-value-bind (min exactp)
-                 (sb!kernel::cons-type-length-info type)
+                 (sb-kernel::cons-type-length-info type)
                (let ((length (+ (length s1) (length s2))))
                  (if exactp
                      (unless (= length min)
@@ -448,6 +456,6 @@
               ;; sequence.  Note that the one builtin method optimizes
               ;; for NIL as the key fun, and we correctly preserve a
               ;; NIL here.
-              (sb!sequence:merge
+              (sb-sequence:merge
                prototype sequence1 sequence2 pred-fun :key key-fun))))
       (t (bad-sequence-type-error result-type)))))

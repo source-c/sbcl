@@ -393,7 +393,11 @@ request an input stream and get an output stream in response\)."
   (or (cdr (assoc err *conditions-for-errno* :test #'eql)) 'socket-error))
 
 (defun socket-error (where &optional (errno (socket-errno)))
-  ;; FIXME: Our Texinfo documentation extractor needs at least this to
-  ;; spit out the signature. Real documentation would be better...
-  ""
+  "Signal an appropriate error for syscall WHERE and ERRNO.
+
+WHERE should be a string naming the failed function.
+
+When supplied, ERRNO should be the UNIX error number associated to the
+failed call. The default behavior is to use the current value of the
+errno variable."
   (error (condition-for-errno errno) :errno errno :syscall where))

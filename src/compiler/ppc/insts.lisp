@@ -9,27 +9,18 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!PPC-ASM")
+(in-package "SB-PPC-ASM")
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   ;; Imports from this package into SB-VM
-  (import '(reg-tn-encoding) "SB!VM")
+  (import '(reg-tn-encoding) "SB-VM")
   ;; Imports from SB-VM into this package
   (import '(;; SBs and SCs
-            sb!vm::zero sb!vm::immediate-constant
-            sb!vm::registers sb!vm::float-registers
+            sb-vm::zero sb-vm::immediate-constant
+            sb-vm::registers sb-vm::float-registers
             ;; TNs and offsets
-            sb!vm::zero-tn sb!vm::lip-tn
-            sb!vm::zero-offset sb!vm::null-offset)))
-
-;;; needs a little more work in the assembler, to realise that the
-;;; delays requested here are not mandatory, so that the assembler
-;;; shouldn't fill gaps with NOPs but with real instructions.  -- CSR,
-;;; 2003-09-08
-#+nil
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (setf sb!assem:*assem-scheduler-p* t)
-  (setf sb!assem:*assem-max-locations* 70))
+            sb-vm::zero-tn sb-vm::lip-tn
+            sb-vm::zero-offset sb-vm::null-offset)))
 
 ;;;; Constants, types, conversion functions, some disassembler stuff.
 
@@ -81,7 +72,7 @@
        #'(lambda (name)
            (cond ((null name) nil)
                  (t (make-symbol (concatenate 'string "$" name)))))
-       sb!vm::*register-names*))
+       sb-vm::*register-names*))
 
 (define-arg-type reg
   :printer
@@ -229,7 +220,8 @@
        ;; stick a nop in the long branch and then we will be
        ;; preserving 8 byte alignment
        segment 8 2 ; 2^2 is 4 byte alignment.  I think
-       #'(lambda (segment posn magic-value)
+       #'(lambda (segment chooser posn magic-value)
+           (declare (ignore chooser))
            (let ((delta (ash (- (label-position target posn magic-value) posn)
                              -2)))
              (when (typep delta '(signed-byte 14))
@@ -544,9 +536,6 @@
 (define-bitfield-emitter emit-word 32
   (byte 32 0))
 
-(define-bitfield-emitter emit-short 16
-  (byte 16 0))
-
 (define-bitfield-emitter emit-i-form-inst 32
   (byte 6 26) (byte 24 2) (byte 1 1) (byte 1 0))
 
@@ -804,7 +793,7 @@
                     (when (typep si 'fixup)
                       (ecase ,fixup
                         ((:ha :l) (note-fixup segment ,fixup si)))
-                      (setq si (or (fixup-offset si) 0)))
+                      (setq si (fixup-offset si)))
                     (emit-d-form-inst segment ,op (reg-tn-encoding rt) (reg-tn-encoding ra) si)))))
 
            (define-d-rs-ui-instruction (name op &key (cost 1) other-dependencies)
@@ -876,6 +865,7 @@
                  (:delay ,cost)
                  (:dependencies (writes frt) (reads fra) (reads frb) (reads frc) ,@other-dependencies)
                  (:emitter
+                  (progn frc) ; unused sometimes. Why?
                   (emit-a-form-inst segment
                    ,op
                    (fp-reg-tn-encoding frt)
@@ -1753,10 +1743,6 @@
   (define-instruction-macro not. (ra rs)
     `(inst nor. ,ra ,rs ,rs))
 
-
-  (defun emit-nop (segment)
-                           (emit-word segment #x60000000))
-
   (define-instruction-macro extlwi (ra rs n b)
     `(inst rlwinm ,ra ,rs ,b 0 (1- ,n)))
 
@@ -1969,13 +1955,6 @@
      (integer
       (emit-word segment word)))))
 
-(define-instruction short (segment short)
-  (:declare (type (or (unsigned-byte 16) (signed-byte 16)) short))
-  :pinned
-  (:delay 0)
-  (:emitter
-   (emit-short segment short)))
-
 (define-instruction byte (segment byte)
   (:declare (type (or (unsigned-byte 8) (signed-byte 8)) byte))
   :pinned
@@ -1983,12 +1962,9 @@
   (:emitter
    (emit-byte segment byte)))
 
-(define-bitfield-emitter emit-header-object 32
-  (byte 24 8) (byte 8 0))
-
 (defun emit-header-data (segment type)
   (emit-back-patch
-   segment 4
+   segment n-word-bytes
    #'(lambda (segment posn)
        (emit-word segment
                   (logior type
@@ -2013,7 +1989,8 @@
   (emit-chooser
    ;; We emit either 12 or 4 bytes, so we maintain 8 byte alignments.
    segment 12 3
-   #'(lambda (segment posn delta-if-after)
+   #'(lambda (segment chooser posn delta-if-after)
+       (declare (ignore chooser))
        (let ((delta (funcall calc label posn delta-if-after)))
          (when (<= (- (ash 1 15)) delta (1- (ash 1 15)))
            (emit-back-patch segment 4

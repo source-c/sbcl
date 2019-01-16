@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; Make a fixnum out of NUM. (I.e. shift by two bits if it will fit.)
 (defun fixnumize (num)
@@ -24,7 +24,7 @@
   (if (< element-size n-byte-bits)
       nil
       (multiple-value-bind (min max)
-          (sb!impl::displacement-bounds lowtag element-size data-offset)
+          (displacement-bounds lowtag element-size data-offset)
         (<= min offset max))))
 
 
@@ -45,11 +45,13 @@
            (- list-pointer-lowtag)))
       0))
 
+(defconstant-eqx +all-static-fdefns+
+    #.(concatenate 'vector +c-callable-fdefns+ +static-fdefns+) #'equalp)
+
 ;;; Return the (byte) offset from NIL to the start of the fdefn object
 ;;; for the static function NAME.
 (defun static-fdefn-offset (name)
-  (let ((static-fun-index
-          (position name #.(concatenate 'vector +c-callable-fdefns+ +static-fdefns+))))
+  (let ((static-fun-index (position name +all-static-fdefns+)))
     (and static-fun-index
          (+ (* (length +static-symbols+) (pad-data-block symbol-size))
             (pad-data-block (1- symbol-size))
@@ -71,26 +73,6 @@
      (- other-pointer-lowtag)
      (* fdefn-raw-addr-slot n-word-bytes)))
 
-;;; Various error-code generating helpers
-(defvar *adjustable-vectors* nil)
-
-(defmacro with-adjustable-vector ((var) &rest body)
-  `(let ((,var (or (pop *adjustable-vectors*)
-                   (make-array 16
-                               :element-type '(unsigned-byte 8)
-                               :fill-pointer 0
-                               :adjustable t))))
-     ;; Don't declare the length - if it gets adjusted and pushed back
-     ;; onto the freelist, it's anyone's guess whether it was expanded.
-     ;; This code was wrong for >12 years, so nobody must have needed
-     ;; more than 16 elements. Maybe we should make it nonadjustable?
-     (declare (type (vector (unsigned-byte 8)) ,var))
-     (setf (fill-pointer ,var) 0)
-     (unwind-protect
-         (progn
-           ,@body)
-       (push ,var *adjustable-vectors*))))
-
 ;;;; interfaces to IR2 conversion
 
 ;;; Return a wired TN describing the N'th full call argument passing
@@ -102,12 +84,23 @@
                      (nth n *register-arg-offsets*))
       (make-wired-tn *backend-t-primitive-type* control-stack-sc-number n)))
 
+;;; Same as above but marks stack locations as :arg-pass
+(defun standard-call-arg-location (n)
+  (declare (type unsigned-byte n))
+  (if (< n register-arg-count)
+      (make-wired-tn *backend-t-primitive-type* descriptor-reg-sc-number
+                     (nth n *register-arg-offsets*))
+      (let ((tn
+              (make-wired-tn *backend-t-primitive-type* control-stack-sc-number n)))
+        (setf (tn-kind tn) :arg-pass)
+        tn)))
+
 (defun standard-arg-location-sc (n)
   (declare (type unsigned-byte n))
   (if (< n register-arg-count)
-      (make-sc-offset descriptor-reg-sc-number
+      (make-sc+offset descriptor-reg-sc-number
                       (nth n *register-arg-offsets*))
-      (make-sc-offset control-stack-sc-number n)))
+      (make-sc+offset control-stack-sc-number n)))
 
 ;;; Make a TN to hold the number-stack frame pointer.  This is allocated
 ;;; once per component, and is component-live.
@@ -124,7 +117,9 @@
    (make-representation-tn *fixnum-primitive-type* any-reg-sc-number)
    env))
 
-(defun make-stack-pointer-tn ()
+#!-x86-64
+(defun make-stack-pointer-tn (&optional nargs)
+  (declare (ignore nargs))
   (make-normal-tn *fixnum-primitive-type*))
 
 (defun make-number-stack-pointer-tn ()
@@ -135,9 +130,14 @@
 
 ;;; Return a list of TNs that can be used to represent an unknown-values
 ;;; continuation within a function.
-(defun make-unknown-values-locations ()
+(defun make-unknown-values-locations (&optional unused-count)
+  (declare (ignorable unused-count))
   (list (make-stack-pointer-tn)
-        (make-normal-tn *fixnum-primitive-type*)))
+        (cond #!+x86-64 ;; needs support from receive-unknown-values
+              (unused-count
+               (sb-c::make-unused-tn))
+              (t
+               (make-normal-tn *fixnum-primitive-type*)))))
 
 ;;; This function is called by the ENTRY-ANALYZE phase, allowing
 ;;; VM-dependent initialization of the IR2-COMPONENT structure. We
@@ -150,4 +150,29 @@
                         (ir2-component-constants (component-info component))))
   (values))
 
+(defun error-call (vop error-code &rest values)
+  "Cause an error.  ERROR-CODE is the error to cause."
+  (emit-error-break vop error-trap (error-number-or-lose error-code) values))
 
+(defun cerror-call (vop error-code &rest values)
+  "Cause a continuable error.  ERROR-CODE is the error to cause."
+  (emit-error-break vop cerror-trap (error-number-or-lose error-code) values))
+
+#!+sb-safepoint
+(define-vop (insert-safepoint)
+  (:policy :fast-safe)
+  (:translate sb-kernel::gc-safepoint)
+  (:generator 0
+    (emit-safepoint)))
+
+(defun other-pointer-tn-ref-p (tn-ref)
+  (and (sc-is (tn-ref-tn tn-ref) descriptor-reg)
+       (tn-ref-type tn-ref)
+       (not (types-equal-or-intersect
+             (tn-ref-type tn-ref)
+             (specifier-type '(or fixnum
+                               #!+64-bit single-float
+                               function
+                               list
+                               instance
+                               character))))))

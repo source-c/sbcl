@@ -9,10 +9,10 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
-(defconstant arg-count-sc (make-sc-offset immediate-arg-scn nargs-offset))
-(defconstant closure-sc (make-sc-offset descriptor-reg-sc-number lexenv-offset))
+(defconstant arg-count-sc (make-sc+offset immediate-arg-scn nargs-offset))
+(defconstant closure-sc (make-sc+offset descriptor-reg-sc-number lexenv-offset))
 
 ;;; Make a passing location TN for a local call return PC. If standard
 ;;; is true, then use the standard (full call) location, otherwise use
@@ -28,10 +28,11 @@
 ;;; standard convention, but is totally unrestricted in non-standard
 ;;; conventions, since we can always fetch it off of the stack using
 ;;; the arg pointer.
-(defun make-old-fp-passing-location (standard)
-  (if standard
-      (make-wired-tn *fixnum-primitive-type* immediate-arg-scn ocfp-offset)
-      (make-normal-tn *fixnum-primitive-type*)))
+(defun make-old-fp-passing-location ()
+  (make-wired-tn *fixnum-primitive-type* immediate-arg-scn ocfp-offset))
+
+(defconstant old-fp-passing-offset
+  (make-sc+offset descriptor-reg-sc-number ocfp-offset))
 
 ;;; These functions make the TNs used to hold Old-FP and Return-PC
 ;;; within the current function. We treat these specially so that the
@@ -108,8 +109,7 @@
     (emit-label start-lab)
     ;; Allocate function header.
     (inst simple-fun-header-word)
-    (dotimes (i (1- simple-fun-code-offset))
-      (inst lword 0))
+    (inst .skip (* (1- simple-fun-code-offset) n-word-bytes))
     ;; The start of the actual code.
     ;; Compute CODE from the address of this entry point.
     (let ((entry-point (gen-label)))
@@ -286,7 +286,7 @@ default-value-8
 
             (let ((defaults (defaults)))
               (aver defaults)
-              (assemble (*elsewhere*)
+              (assemble (:elsewhere)
                 (emit-label default-stack-vals)
                 (do ((remaining defaults (cdr remaining)))
                     ((null remaining))
@@ -335,7 +335,7 @@ default-value-8
 
     (emit-label done)
 
-    (assemble (*elsewhere*)
+    (assemble (:elsewhere)
       (emit-label variable-values)
       (when lra-label
         (inst compute-code-from-lra code-tn code-tn lra-label temp))
@@ -1072,7 +1072,28 @@ default-value-8
 ;;; &MORE args are stored consecutively on the stack, starting
 ;;; immediately at the context pointer. The context pointer is not
 ;;; typed, so the lowtag is 0.
-(define-full-reffer more-arg * 0 0 (descriptor-reg any-reg) * %more-arg)
+
+(define-vop (more-arg)
+  (:translate %more-arg)
+  (:policy :fast-safe)
+  (:args (context :scs (descriptor-reg)) (index :scs (any-reg)))
+  (:arg-types * tagged-num)
+  (:temporary (:scs (any-reg)) temp)
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:result-types *)
+  (:generator 5
+    (inst addq context index temp)
+    (inst ldl value 0 temp)))
+(define-vop (more-arg-c)
+  (:translate %more-arg)
+  (:policy :fast-safe)
+  (:args (context :scs (descriptor-reg)))
+  (:info index)
+  (:arg-types * (:constant (load/store-index 8 0 0)))
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:result-types *)
+  (:generator 4
+    (inst ldl value (* index n-word-bytes) context)))
 
 ;;; Turn &MORE arg (context, count) into a list.
 (define-vop (listify-rest-args)
@@ -1142,7 +1163,7 @@ default-value-8
 ;;; below the current stack top.
 (define-vop (more-arg-context)
   (:policy :fast-safe)
-  (:translate sb!c::%more-arg-context)
+  (:translate sb-c::%more-arg-context)
   (:args (supplied :scs (any-reg)))
   (:arg-types tagged-num (:constant fixnum))
   (:info fixed)
@@ -1154,33 +1175,12 @@ default-value-8
     (inst subq supplied (fixnumize fixed) count)
     (inst subq csp-tn count context)))
 
-;;; Signal wrong argument count error if NARGS isn't equal to COUNT.
-#!-precise-arg-count-error
-(define-vop (verify-arg-count)
-  (:policy :fast-safe)
-  (:translate sb!c::%verify-arg-count)
-  (:args (nargs :scs (any-reg)))
-  (:arg-types positive-fixnum (:constant t))
-  (:temporary (:scs (any-reg) :type fixnum) temp)
-  (:info count)
-  (:vop-var vop)
-  (:save-p :compute-only)
-  (:generator 3
-    (let ((err-lab
-           (generate-error-code vop 'invalid-arg-count-error nargs)))
-      (cond ((zerop count)
-             (inst bne nargs err-lab))
-            (t
-             (inst subq nargs (fixnumize count) temp)
-             (inst bne temp err-lab))))))
-
-#!+precise-arg-count-error
 (define-vop (verify-arg-count)
   (:policy :fast-safe)
   (:args (nargs :scs (any-reg)))
   (:arg-types positive-fixnum (:constant t) (:constant t))
   (:info min max)
-  (:temporary (:scs (any-reg) :type fixnum) temp)
+  (:temporary (:scs (unsigned-reg)) temp)
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 3
@@ -1190,7 +1190,7 @@ default-value-8
              (cond ((zerop max)
                     (inst bne nargs err-lab))
                    (t
-                    (inst subq nargs (fixnumize count) temp)
+                    (inst subq nargs (fixnumize max) temp)
                     (inst bne temp err-lab))))
             (max
              (when (plusp min)

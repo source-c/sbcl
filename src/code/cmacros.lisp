@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; We often use a source-transform to do macro-like rewriting of an
 ;;;; ordinary function call. Source-transforms seem to pre-date the ANSI
@@ -64,50 +64,9 @@
                           (:preserve-whitespace 2)
                           (otherwise (return-from read-from-string form))))
                  (var (if (logbitp index seen)
-                          (let ((x (sb!xc:gensym "IGNORE")))
+                          (let ((x (sb-xc:gensym "IGNORE")))
                             (push x ignore)
                             x)
                           (setf seen (logior (ash 1 index) seen)
                                 (nth index list) (copy-symbol key)))))
             (push (list var (pop keys)) bind))))))
-
-(eval-when (:compile-toplevel)
-  (flet ((uncross (form env)
-           (declare (ignore env))
-           (let ((s (cadr form)))
-             (when (stringp s)
-               (let ((new (!xc-preprocess-format-control s)))
-                 (when (string/= new s)
-                   (return-from uncross `(,(car form) ,new ,@(cddr form)))))))
-           (let* ((arg (cdr (member :format-control (cddr form))))
-                  (s (car arg)))
-             (flet ((subst-arg (new) `(,@(ldiff form arg) ,new ,@(cdr arg))))
-               (when (stringp s)
-                 (let ((new (!xc-preprocess-format-control s)))
-                   (when (string/= new s)
-                     (return-from uncross (subst-arg new)))))
-               (when (typep s '(cons (eql if) ; KLUDGE for 'ir1report'
-                                     (cons t (cons string (cons string null)))))
-                 (let ((new1 (!xc-preprocess-format-control (third s)))
-                       (new2 (!xc-preprocess-format-control (fourth s))))
-                   (when (or (string/= new1 (third s)) (string/= new2 (fourth s)))
-                     (return-from uncross
-                       (subst-arg `(if ,(second s) ,new1 ,new2))))))))
-           form))
-
-    (dolist (f '(bug error warn
-                 sb!c:compiler-error sb!c:compiler-notify
-                 sb!c:compiler-warn sb!c:compiler-style-warn
-                 sb!c::note-lossage sb!format::format-error))
-      (setf (sb!xc:compiler-macro-function f) #'uncross))
-
-    ;; FORMAT has a macro already. Do what it does, then uncross.
-    (let ((existing-macro (sb!xc:compiler-macro-function 'format)))
-      (setf (sb!xc:compiler-macro-function 'format)
-            (lambda (form env)
-              (funcall existing-macro form env) ; for effect only
-              (let* ((old (caddr form))
-                     (new (and (stringp old) (!xc-preprocess-format-control old))))
-                (if (and new (string/= new old))
-                    `(format ,(cadr form) ,new ,@(cdddr form))
-                    form)))))))

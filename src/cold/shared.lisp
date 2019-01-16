@@ -79,7 +79,7 @@
   ;; extensions, so we can use something arbitrary.
   ".lisp-obj")
 (defvar *target-assem-obj-suffix*
-  ;; Target fasl files from SB!C:ASSEMBLE-FILE are LOADed via GENESIS.
+  ;; Target fasl files from SB-C:ASSEMBLE-FILE are LOADed via GENESIS.
   ;; The source files are compiled once as assembly files and once as
   ;; normal lisp files.  In the past, they were kept separate by
   ;; clever symlinking in the source tree, but that became less clean
@@ -132,13 +132,51 @@
     (rename-file x path)))
 (compile 'rename-file-a-la-unix)
 
-;;; other miscellaneous tools
-(load "src/cold/read-from-file.lisp")
-(load "src/cold/rename-package-carefully.lisp")
-(load "src/cold/with-stuff.lisp")
+(export '(prepend-genfile-path read-from-file *generated-sources-root*))
+(defvar *generated-sources-root* "")
+
+;;; See remark in COMPILE-STEM about strings vs. The Common Lisp Way
+(defun prepend-genfile-path (namestring)
+  (concatenate 'string
+               ;; if exact match to "output/", or mismatch at the next character
+               (if (member (mismatch "output/" namestring) '(nil 7))
+                   *generated-sources-root*
+                   "")
+               namestring))
+(compile 'prepend-genfile-path) ; seems in vogue to compile everything in this file
+
+;;; Return an expression read from the file named NAMESTRING.
+;;; For user-supplied inputs, protect against more than one expression
+;;; appearing in the file. With trusted inputs we needn't bother.
+(defun read-from-file (namestring)
+  (with-open-file (s (prepend-genfile-path namestring))
+    (let* ((result (read s))
+           (eof-result (cons nil nil)))
+      (when (string= (pathname-name namestring) "build-order")
+        ;; build-order uses both host and target conditionals.
+        ;; Our sanity checks during make-host-1 would complain
+        ;; about #+feature when reading the second expression in the file
+        ;; whenever such feature is also a possible target feature.
+        (return-from read-from-file result))
+      (unless (eq (read s nil eof-result) eof-result)
+        (error "more than one expression in file ~S" namestring))
+      result)))
+(compile 'read-from-file)
 
 ;;; Try to minimize/conceal any non-standardness of the host Common Lisp.
-(load "src/cold/ansify.lisp")
+#-sbcl (load "src/cold/ansify.lisp")
+
+;;;; Do not put SBCL-specific things in 'ansify'. Put them here.
+;;;; And there had better not be a reason that SBCL needs ansification.
+#+sbcl
+(progn
+  (setq *compile-print* nil)
+  (load "src/cold/muffler.lisp")
+  ;; Let's just say we never care to see these.
+  (declaim (sb-ext:muffle-conditions
+            (satisfies unable-to-optimize-note-p)
+            (satisfies optional+key-style-warning-p)
+            sb-ext:code-deletion-note)))
 
 ;;;; special read-macros for building the cold system (and even for
 ;;;; building some of our tools for building the cold system)
@@ -148,20 +186,51 @@
 ;;; When cross-compiling, the *FEATURES* set for the target Lisp is
 ;;; not in general the same as the *FEATURES* set for the host Lisp.
 ;;; In order to refer to target features specifically, we refer to
-;;; *SHEBANG-FEATURES* instead of *FEATURES*, and use the #!+ and #!-
+;;; SB-XC:*FEATURES* instead of CL:*FEATURES*, and use the #!+ and #!-
 ;;; readmacros instead of the ordinary #+ and #- readmacros.
-(setf *shebang-features*
-      (let* ((default-features
-               (funcall (compile
-                         nil
-                         (read-from-file "local-target-features.lisp-expr"))
+;;;
+;;; To support building in a read-only filesystem, the 'local-target-features'
+;;; file might not be directly located here, since it's a generated file.
+;;; In as much as we use files as the means of passing parameters to
+;;; our Lisp scripts - because we can't in general assume that we can read
+;;; the command-line arguments in any Lisp - it doesn't make sense to have
+;;; another file specifying the name of the local-target-features file.
+;;; The compromise is to examine a variable specifying a path
+;;; (and it can't go in SB-COLD because the package is not made soon enough)
+(setf sb-xc:*features*
+      (let* ((pathname (let ((var 'cl-user::*sbcl-target-features-file*))
+                         (if (boundp var)
+                             (symbol-value var)
+                             "local-target-features.lisp-expr")))
+             (default-features
+               (funcall (compile nil (read-from-file pathname))
                         (read-from-file "base-target-features.lisp-expr")))
              (customizer-file-name "customize-target-features.lisp")
              (customizer (if (probe-file customizer-file-name)
                              (compile nil
                                       (read-from-file customizer-file-name))
-                             #'identity)))
-        (funcall customizer default-features)))
+                             #'identity))
+             (target-feature-list (funcall customizer default-features))
+             (arch (target-platform-keyword target-feature-list)))
+        ;; Sort the arch name to the front and de-dup the rest in case the
+        ;; command line had a redundant --with-mumble option and/or the
+        ;; customizer decided to return dups.
+        (cons arch (sort (remove-duplicates (remove arch target-feature-list))
+                         #'string<))))
+
+(defvar *build-features* (let ((filename "build-features.lisp-expr"))
+                           (when (probe-file filename)
+                             (read-from-file filename))))
+(dolist (target-feature '(:sb-after-xc-core :cons-profiling))
+  (when (member target-feature sb-xc:*features*)
+    (setf sb-xc:*features* (delete target-feature sb-xc:*features*))
+    ;; If you use --fancy and --with-sb-after-xc-core you might
+    ;; add the feature twice if you don't use pushnew
+    (pushnew target-feature *build-features*)))
+
+;; We update the host's features, because a build-feature is essentially
+;; an option to check in the host enviroment
+(setf *features* (append *build-features* *features*))
 
 (defvar *shebang-backend-subfeatures*
   (let* ((default-subfeatures nil)
@@ -172,19 +241,12 @@
                          #'identity)))
     (funcall customizer default-subfeatures)))
 
-(progn (write-string "target *FEATURES* = ")
-       (write *shebang-features* :pretty nil :length nil)
-       (terpri)
-       (write-string "*shebang-backend-subfeatures* = ")
-       (write *shebang-backend-subfeatures* :pretty nil :length nil)
-       (terpri))
-
 ;;; Call for effect of signaling an error if no target picked.
-(target-platform-name)
+(target-platform-keyword)
 
 ;;; You can get all the way through make-host-1 without either one of these
 ;;; features, but then 'bit-bash' will fail to cross-compile.
-(unless (intersection '(:big-endian :little-endian) *shebang-features*)
+(unless (intersection '(:big-endian :little-endian) sb-xc:*features*)
   (warn "You'll have bad time without either endian-ness defined"))
 
 ;;; Some feature combinations simply don't work, and sometimes don't
@@ -200,14 +262,20 @@
           ":GENCGC and :CHENEYGC are incompatible")
          ("(and cheneygc (not (or alpha arm hppa mips ppc sparc)))"
           ":CHENEYGC not supported on selected architecture")
-         ("(and gencgc (not (or sparc ppc x86 x86-64 arm arm64)))"
+         ("(and gencgc (not (or sparc ppc ppc64 x86 x86-64 arm arm64)))"
           ":GENCGC not supported on selected architecture")
          ("(not (or gencgc cheneygc))"
           "One of :GENCGC or :CHENEYGC must be enabled")
+         ("(and sb-safepoint (not (or arm64 ppc x86 x86-64)))"
+          ":SB-SAFEPOINT not supported on selected architecture")
+         ("(and sb-safepoint-strictly (not sb-safepoint))"
+          ":SB-SAFEPOINT-STRICTLY requires :SB-SAFEPOINT")
+         ("(not (or elf mach-o win32))"
+          "No execute object file format feature defined")
          ("(and sb-dynamic-core (not linkage-table))"
           ":SB-DYNAMIC-CORE requires :LINKAGE-TABLE")
-         ("(and relocatable-heap (or cheneygc win32))"
-          "Relocatable heap requires gencgc + not win32")
+         ("(and relocatable-heap win32)"
+          "Relocatable heap requires (not win32)")
          ("(and sb-linkable-runtime (not sb-dynamic-core))"
           ":SB-LINKABLE-RUNTIME requires :SB-DYNAMIC-CORE")
          ("(and sb-linkable-runtime (not (or x86 x86-64)))"
@@ -220,18 +288,20 @@
           "At most one interpreter can be selected")
          ("(and immobile-space (not x86-64))"
           ":IMMOBILE-SPACE is supported only on x86-64")
-        ("(and compact-instance-header (not immobile-space))"
+         ("(and immobile-space (not relocatable-heap))"
+          ":IMMOBILE-SPACE requires :RELOCATABLE-HEAP")
+         ("(and compact-instance-header (not immobile-space))"
           ":COMPACT-INSTANCE-HEADER requires :IMMOBILE-SPACE feature")
-        ("(and immobile-code (not immobile-space))"
+         ("(and immobile-code (not immobile-space))"
           ":IMMOBILE-CODE requires :IMMOBILE-SPACE feature")
-        ("(and immobile-symbols (not immobile-space))"
+         ("(and immobile-symbols (not immobile-space))"
           ":IMMOBILE-SYMBOLS requires :IMMOBILE-SPACE feature")
          ;; There is still hope to make multithreading on DragonFly x86-64
          ("(and sb-thread x86 dragonfly)"
           ":SB-THREAD not supported on selected architecture")))
       (failed-test-descriptions nil))
   (dolist (test feature-compatibility-tests)
-    (let ((*features* *shebang-features*))
+    (let ((cl:*features* sb-xc:*features*))
       (when (read-from-string (concatenate 'string "#+" (first test) "T NIL"))
         (push (second test) failed-test-descriptions))))
   (when failed-test-descriptions
@@ -256,7 +326,10 @@
 ;;; flags which can be used to describe properties of source files
 (defparameter
   *expected-stem-flags*
-  '(;; meaning: This file is not to be compiled when building the
+  '(;; meaning: This file is needed to generate C headers if doing so
+    ;; independently of make-host-1
+    :c-headers
+    ;; meaning: This file is not to be compiled when building the
     ;; cross-compiler which runs on the host ANSI Lisp. ("not host
     ;; code", i.e. does not execute on host -- but may still be
     ;; cross-compiled by the host, so that it executes on the target)
@@ -265,11 +338,6 @@
     ;; SBCL. ("not target code" -- but still presumably host code,
     ;; used to support the cross-compilation process)
     :not-target
-    ;; meaning: This file must always be compiled by 'slam.lisp' even if
-    ;; the object is not out of date with respect to its source.
-    ;; Necessary if there are compile-time-too effects that are not
-    ;; reflected into make-host-2 by load-time actions of make-host-1.
-    :slam-forcibly
     ;; meaning: The #'COMPILE-STEM argument :TRACE-FILE should be T.
     ;; When the compiler is SBCL's COMPILE-FILE or something like it,
     ;; compiling "foo.lisp" will generate "foo.trace" which contains lots
@@ -288,10 +356,7 @@
     ;; never figured out but which were apparently acceptable in CMU
     ;; CL. Eventually, it would be great to just get rid of all
     ;; warnings and remove support for this flag. -- WHN 19990323)
-    :ignore-failure-p
-    ;; meaning: Build this file, but don't put it on the list for
-    ;; genesis to include in the cold core.
-    :not-genesis))
+    :ignore-failure-p))
 
 (defvar *array-to-specialization* (make-hash-table :test #'eq))
 
@@ -310,14 +375,20 @@
     (if position
       (concatenate 'string
                    (subseq stem 0 (1+ position))
-                   (target-platform-name)
+                   (string-downcase (target-platform-keyword))
                    (subseq stem (+ position 7)))
       stem)))
 (compile 'stem-remap-target)
 
-;;; Determine the source path for a stem.
+;;; Determine the source path for a stem by remapping from the abstract name
+;;; if it contains "/target/" and appending a ".lisp" suffix.
+;;; Assume that STEM is source-tree-relative unless it starts with "output/"
+;;; in which case it could be elsewhere, if you prefer to keep the sources
+;;; devoid of compilation artifacts. (The production of out-of-tree artifacts
+;;; is not actually implemented in the generic build, however if your build
+;;; system does that by itself, then hooray for you)
 (defun stem-source-path (stem)
-  (concatenate 'string "" (stem-remap-target stem) ".lisp"))
+  (concatenate 'string (prepend-genfile-path (stem-remap-target stem)) ".lisp"))
 (compile 'stem-source-path)
 
 ;;; Determine the object path for a stem/flags/mode combination.
@@ -407,7 +478,7 @@
          (ignore-failure-p (find :ignore-failure-p flags)))
     (declare (type function compile-file))
 
-    (ensure-directories-exist obj :verbose t)
+    (ensure-directories-exist obj :verbose *compile-print*) ; host's value
 
     ;; We're about to set about building a new object file. First, we
     ;; delete any preexisting object file in order to avoid confusing
@@ -502,8 +573,7 @@
 (defun in-host-compilation-mode (fn)
   (declare (type function fn))
   (let ((*features* (cons :sb-xc-host *features*)))
-    (with-additional-nickname ("SB-XC" "SB!XC")
-      (funcall fn))))
+    (funcall fn)))
 (compile 'in-host-compilation-mode)
 
 ;;; Process a file as source code for the cross-compiler, compiling it
@@ -529,12 +599,24 @@
 ;;;; tools to compile SBCL sources to create object files which will
 ;;;; be used to create the target SBCL .core file
 
+(defun lpnify-stem (stem)
+  ;; Don't want genfiles path to sneak in - avoid (STEM-SOURCE-PATH ...) here.
+  (let ((string (stem-remap-target stem)))
+    ;; Distrust that random hosts don't bork up the translation.
+    ;; Simply replace '/' with ';' and be done.
+    (format nil "SYS:~:@(~A~).LISP" (substitute #\; #\/ string))))
+(compile 'lpnify-stem)
+
 ;;; Run the cross-compiler on a file in the source directory tree to
 ;;; produce a corresponding file in the target object directory tree.
 (defun target-compile-stem (stem flags)
   (funcall *in-target-compilation-mode-fn*
            (lambda ()
-             (compile-stem stem flags :target-compile))))
+             (progv (list (intern "*SOURCE-NAMESTRING*" "SB-C"))
+                    (list (lpnify-stem stem))
+               (loop
+                (with-simple-restart (recompile "Recompile")
+                  (return (compile-stem stem flags :target-compile))))))))
 (compile 'target-compile-stem)
 
 ;;; (This function is not used by the build process, but is intended

@@ -13,27 +13,27 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; ANSI limits on compilation
-(defconstant sb!xc:call-arguments-limit sb!xc:most-positive-fixnum
+(defconstant sb-xc:call-arguments-limit sb-xc:most-positive-fixnum
   "The exclusive upper bound on the number of arguments which may be passed
   to a function, including &REST args.")
-(defconstant sb!xc:lambda-parameters-limit sb!xc:most-positive-fixnum
+(defconstant sb-xc:lambda-parameters-limit sb-xc:most-positive-fixnum
   "The exclusive upper bound on the number of parameters which may be specified
   in a given lambda list. This is actually the limit on required and &OPTIONAL
   parameters. With &KEY and &AUX you can get more.")
-(defconstant sb!xc:multiple-values-limit sb!xc:most-positive-fixnum
+(defconstant sb-xc:multiple-values-limit sb-xc:most-positive-fixnum
   "The exclusive upper bound on the number of multiple VALUES that you can
   return.")
 
 ;;;; cross-compiler-only versions of CL special variables, so that we
 ;;;; don't have weird interactions with the host compiler
 
-(defvar sb!xc:*compile-file-pathname*)
-(defvar sb!xc:*compile-file-truename*)
-(defvar sb!xc:*compile-print*)
-(defvar sb!xc:*compile-verbose*)
+(defvar sb-xc:*compile-file-pathname*)
+(defvar sb-xc:*compile-file-truename*)
+(defvar sb-xc:*compile-print*)
+(defvar sb-xc:*compile-verbose*)
 
 ;;;; miscellaneous types used both in the cross-compiler and on the target
 
@@ -61,13 +61,23 @@
 ;;;             by APD on #lisp 2005-11-26: "MAYBE-INLINE lambda is
 ;;;             instantiated once per component, INLINE - for all
 ;;;             references (even under #'without FUNCALL)."
-(deftype inlinep ()
+(def!type inlinep ()
   '(member :inline :maybe-inline :notinline nil))
 (defconstant-eqx +inlinep-translations+
   '((inline . :inline)
     (notinline . :notinline)
     (maybe-inline . :maybe-inline))
   #'equal)
+
+(defstruct (dxable-args (:constructor make-dxable-args (list))
+                        (:predicate nil)
+                        (:copier nil))
+  (list nil :read-only t))
+(defstruct (inlining-data (:include dxable-args)
+                          (:constructor make-inlining-data (expansion list))
+                          (:predicate nil)
+                          (:copier nil))
+  (expansion nil :read-only t))
 
 ;;; *FREE-VARS* translates from the names of variables referenced
 ;;; globally to the LEAF structures for them. *FREE-FUNS* is like
@@ -89,10 +99,6 @@
 (defvar *allow-instrumenting*)
 
 ;;; miscellaneous forward declarations
-(defvar *code-segment*)
-;; FIXME: this is a kludge due to the absence of a 'vop' argument
-;; to ALLOCATION-TRAMP in the x86-64 backend.
-(defvar *code-is-immobile*)
 #!+sb-dyncount (defvar *collect-dynamic-statistics*)
 (defvar *component-being-compiled*)
 (defvar *compiler-error-context*)
@@ -105,27 +111,11 @@
 (defvar *current-path*)
 (defvar *current-component*)
 (defvar *delayed-ir1-transforms*)
-(defvar *eval-tlf-index*)
+#!+sb-dyncount
 (defvar *dynamic-counts-tn*)
-(defvar *elsewhere*)
 (defvar *elsewhere-label*)
-(defvar *event-info*)
 (defvar *event-note-threshold*)
 (defvar *failure-p*)
-(defvar *fixup-notes*)
-#!+inline-constants
-(progn
-  (defvar *unboxed-constants*)
-  (defstruct (unboxed-constants (:conc-name constant-)
-                                (:predicate nil) (:copier nil))
-    (table (make-hash-table :test #'equal) :read-only t)
-    (segment
-     (sb!assem:make-segment :type :elsewhere
-                            :run-scheduler nil
-                            :inst-hook (default-segment-inst-hook)
-                            :alignment 0) :read-only t)
-    (vector (make-array 16 :adjustable t :fill-pointer 0) :read-only t))
-  (declaim (freeze-type unboxed-constants)))
 (defvar *source-info*)
 (defvar *source-plist*)
 (defvar *source-namestring*)
@@ -133,6 +123,8 @@
 (defvar *warnings-p*)
 (defvar *lambda-conversions*)
 (defvar *compile-object* nil)
+(defvar *location-context* nil)
+(defvar *msan-unpoison* nil)
 
 (defvar *stack-allocate-dynamic-extent* t
   "If true (the default), the compiler respects DYNAMIC-EXTENT declarations
@@ -141,20 +133,20 @@ possible. Potentially long (over one page in size) vectors are, however, not
 stack allocated except in zero SAFETY code, as such a vector could overflow
 the stack without triggering overflow protection.")
 
-(!begin-collecting-cold-init-forms)
 ;;; This lock is seized in the compiler, and related areas -- like the
 ;;; classoid/layout/class system.
-(defglobal **world-lock** nil)
-(!cold-init-forms
- (setf **world-lock** (sb!thread:make-mutex :name "World Lock")))
-(!defun-from-collected-cold-init-forms !world-lock-cold-init)
+;;; Assigning a literal object enables genesis to dump and load it
+;;; without need of a cold-init function.
+#-sb-xc-host
+(!define-load-time-global **world-lock** #.(sb-thread:make-mutex :name "World Lock"))
+
+#-sb-xc-host
+(define-load-time-global *static-linker-lock*
+    (sb-thread:make-mutex :name "static linker"))
 
 (defmacro with-world-lock (() &body body)
-  `(sb!thread:with-recursive-lock (**world-lock**)
-     ,@body))
-
-(declaim (type fixnum *compiler-sset-counter*))
-(defvar *compiler-sset-counter* 0)
+  #+sb-xc-host `(progn ,@body)
+  #-sb-xc-host `(sb-thread:with-recursive-lock (**world-lock**) ,@body))
 
 ;;; unique ID for the next object created (to let us track object
 ;;; identity even across GC, useful for understanding weird compiler
@@ -174,10 +166,11 @@ the stack without triggering overflow protection.")
 ;;; Rather than registering listeners, they can detect changes by comparing
 ;;; their stored nonce to the current nonce. Additionally the observers
 ;;; can detect whether function definitions have occurred.
-(declaim (fixnum *type-cache-nonce*))
-(!defglobal *type-cache-nonce* 0)
+#-sb-xc-host
+(progn (declaim (fixnum *type-cache-nonce*))
+       (!define-load-time-global *type-cache-nonce* 0))
 
-(def!struct (undefined-warning
+(defstruct (undefined-warning
             #-no-ansi-print-object
             (:print-object (lambda (x s)
                              (print-unreadable-object (x s :type t)
@@ -235,25 +228,19 @@ the stack without triggering overflow protection.")
                 :format-arguments (list symbol)))
   (values))
 
-(def!struct (debug-name-marker (:print-function print-debug-name-marker)
-                               (:copier nil)))
+(defstruct (debug-name-marker (:print-function print-debug-name-marker)
+                              (:copier nil)))
 
 (defvar *debug-name-level* 4)
 (defvar *debug-name-length* 12)
 (defvar *debug-name-punt*)
-(defvar *debug-name-sharp*)
-(defvar *debug-name-ellipsis*)
+(define-load-time-global *debug-name-sharp* (make-debug-name-marker))
+(define-load-time-global *debug-name-ellipsis* (make-debug-name-marker))
 
 (defmethod make-load-form ((marker debug-name-marker) &optional env)
   (declare (ignore env))
-  (cond ((eq marker *debug-name-sharp*)
-         `(if (boundp '*debug-name-sharp*)
-              *debug-name-sharp*
-              (make-debug-name-marker)))
-        ((eq marker *debug-name-ellipsis*)
-         `(if (boundp '*debug-name-ellipsis*)
-              *debug-name-ellipsis*
-              (make-debug-name-marker)))
+  (cond ((eq marker *debug-name-sharp*) '*debug-name-sharp*)
+        ((eq marker *debug-name-ellipsis*) '*debug-name-ellipsis*)
         (t
          (warn "Dumping unknown debug-name marker.")
          '(make-debug-name-marker))))
@@ -266,9 +253,6 @@ the stack without triggering overflow protection.")
          (write-string "..." stream))
         (t
          (write-string "???" stream))))
-
-(setf *debug-name-sharp* (make-debug-name-marker)
-      *debug-name-ellipsis* (make-debug-name-marker))
 
 (declaim (ftype (sfunction () list) name-context))
 (defun debug-name (type thing &optional context)
@@ -304,11 +288,62 @@ the stack without triggering overflow protection.")
                 debug name." name))
         name))))
 
-;;; Set this to NIL to inhibit assembly-level optimization. (For
-;;; compiler debugging, rather than policy control.)
-(defvar *assembly-optimize* t)
+;;; Bound during eval-when :compile-time evaluation.
+(defvar *compile-time-eval* nil)
+(declaim (always-bound *compile-time-eval*))
 
-(in-package "SB!ALIEN")
+#!-immobile-code (defmacro code-immobile-p (thing) `(progn ,thing nil))
+
+;;; Various error-code generating helpers
+(defvar *adjustable-vectors*)
+
+(defmacro with-adjustable-vector ((var) &rest body)
+  `(let ((,var (or (pop *adjustable-vectors*)
+                   (make-array 16
+                               :element-type '(unsigned-byte 8)
+                               :fill-pointer 0
+                               :adjustable t))))
+     ;; Don't declare the length - if it gets adjusted and pushed back
+     ;; onto the freelist, it's anyone's guess whether it was expanded.
+     ;; This code was wrong for >12 years, so nobody must have needed
+     ;; more than 16 elements. Maybe we should make it nonadjustable?
+     (declare (type (vector (unsigned-byte 8)) ,var))
+     (setf (fill-pointer ,var) 0)
+     ;; No UNWIND-PROTECT here - semantics are unaffected by nonlocal exit,
+     ;; and this macro is about speeding up the compiler, not slowing it down.
+     ;; GC will clean up any debris, and since the vector does not point
+     ;; to anything, even an accidental promotion to a higher generation
+     ;; will not cause transitive garbage retention.
+     (prog1 (progn ,@body)
+       (push ,var *adjustable-vectors*))))
+
+
+;;; The allocation quantum for boxed code header words.
+;;; 2 implies an even length boxed header; 1 implies no restriction.
+(defconstant code-boxed-words-align (+ 2 #!+(or x86 x86-64) -1))
+
+;;; Used as the CDR of the code coverage instrumentation records
+;;; (instead of NIL) to ensure that any well-behaving user code will
+;;; not have constants EQUAL to that record. This avoids problems with
+;;; the records getting coalesced with non-record conses, which then
+;;; get mutated when the instrumentation runs. Note that it's
+;;; important for multiple records for the same location to be
+;;; coalesced. -- JES, 2008-01-02
+(defconstant +code-coverage-unmarked+ '%code-coverage-unmarked%)
+
+;;; Stores the code coverage instrumentation results.
+;;; The CAR is a hashtable. The CDR is a list of weak pointers to code objects
+;;; having coverage marks embedded in the unboxed constants.
+;;; Keys in the hashtable are namestrings, the
+;;; value is a list of (CONS PATH STATE), where STATE is +CODE-COVERAGE-UNMARKED+
+;;; for a path that has not been visited, and T for one that has.
+#-sb-xc-host
+(progn
+  (define-load-time-global *code-coverage-info*
+    (list (make-hash-table :test 'equal :synchronized t)))
+  (declaim (type (cons hash-table) *code-coverage-info*)))
+
+(in-package "SB-ALIEN")
 
 ;;; Information describing a heap-allocated alien.
 (def!struct (heap-alien-info (:copier nil))
@@ -319,3 +354,8 @@ the stack without triggering overflow protection.")
   ;; Data or code?
   (datap (missing-arg) :type boolean))
 (!set-load-form-method heap-alien-info (:xc :target))
+
+;; from 'llvm/projects/compiler-rt/lib/msan/msan.h':
+;;  "#define MEM_TO_SHADOW(mem) (((uptr)(mem)) ^ 0x500000000000ULL)"
+#!+linux ; shadow space differs by OS
+(defconstant sb-vm::msan-mem-to-shadow-xor-const #x500000000000)

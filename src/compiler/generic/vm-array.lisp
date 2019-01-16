@@ -11,7 +11,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (defstruct (specialized-array-element-type-properties
             (:conc-name saetp-)
@@ -53,8 +53,6 @@
   ;; we don't need to cons a new copy)
   (n-pad-elements (missing-arg) :type index :read-only t))
 
-;; Simulate DEFINE-LOAD-TIME-GLOBAL - always bound in the image
-;; but not eval'd in the compiler.
 (define-load-time-global *specialized-array-element-type-properties*
   (map 'simple-vector
        (lambda (args)
@@ -159,14 +157,14 @@
        (<= (saetp-n-bits saetp) n-word-bits)))
 
 #+sb-xc-host
-(defvar sb!kernel::*specialized-array-element-types*
+(defvar sb-kernel::*specialized-array-element-types*
   (map 'list
        #'saetp-specifier
        *specialized-array-element-type-properties*))
 
 #-sb-xc-host
-(!defglobal sb!kernel::*specialized-array-element-types*
-            '#.sb!kernel::*specialized-array-element-types*)
+(!define-load-time-global sb-kernel::*specialized-array-element-types*
+            '#.sb-kernel::*specialized-array-element-types*)
 
 (define-load-time-global *vector-without-complex-typecode-infos*
   #+sb-xc-host
@@ -188,12 +186,17 @@
   (max (1- (integer-length (saetp-n-bits saetp)))
        0)) ;; because of NIL
 
-(in-package "SB!C")
+(defun saetp-index-or-lose (element-type)
+  (or (position element-type sb-vm:*specialized-array-element-type-properties*
+                :key #'sb-vm:saetp-specifier :test #'equal)
+      (error "No saetp for ~S" element-type)))
+
+(in-package "SB-C")
 
 (defun find-saetp (element-type)
-  (find element-type sb!vm:*specialized-array-element-type-properties*
-        :key #'sb!vm:saetp-specifier :test #'equal))
+  (find element-type sb-vm:*specialized-array-element-type-properties*
+        :key #'sb-vm:saetp-specifier :test #'equal))
 
 (defun find-saetp-by-ctype (ctype)
-  (find ctype sb!vm:*specialized-array-element-type-properties*
-        :key #'sb!vm:saetp-ctype :test #'csubtypep))
+  (find ctype sb-vm:*specialized-array-element-type-properties*
+        :key #'sb-vm:saetp-ctype :test #'csubtypep))

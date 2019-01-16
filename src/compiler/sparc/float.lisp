@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; float move functions
 
@@ -832,7 +832,7 @@
                   (:variant :long ,yep ,nope)))))
   (frob < :l :ge </single-float </double-float #!+long-float </long-float)
   (frob > :g :le >/single-float >/double-float #!+long-float >/long-float)
-  (frob = :eq :ne eql/single-float eql/double-float #!+long-float eql/long-float))
+  (frob = :eq :ne =/single-float =/double-float #!+long-float =/long-float))
 
 #!+long-float
 (deftransform eql ((x y) (long-float long-float))
@@ -1240,7 +1240,7 @@
 
 ;;;; Float mode hackery:
 
-(sb!xc:deftype float-modes () '(unsigned-byte 32))
+(sb-xc:deftype float-modes () '(unsigned-byte 32))
 (defknown floating-point-modes () float-modes (flushable))
 (defknown ((setf floating-point-modes)) (float-modes)
   float-modes)
@@ -2501,7 +2501,7 @@
 ) ; PROGN
 
 #+nil
-(in-package "SB!C")
+(in-package "SB-C")
 ;;; FIXME
 #+nil
 (progn
@@ -2514,7 +2514,7 @@
       (case (length args)
         ((0 2) (values nil t))
         (1 `(values ,(first args)))
-        (t (sb!c::associate-arguments 'min (first args) (rest args))))
+        (t (sb-c::associate-arguments 'min (first args) (rest args))))
       (values nil t)))
 
 (define-source-transform max (&rest args)
@@ -2522,7 +2522,7 @@
       (case (length args)
         ((0 2) (values nil t))
         (1 `(values ,(first args)))
-        (t (sb!c::associate-arguments 'max (first args) (rest args))))
+        (t (sb-c::associate-arguments 'max (first args) (rest args))))
       (values nil t)))
 
 ;; Derive the types of max and min

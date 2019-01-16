@@ -24,20 +24,16 @@
 ;;;; warranty about the software, its performance or its conformity to any
 ;;;; specification.
 
-(in-package "SB!PCL")
+(in-package "SB-PCL")
 
 (declaim (type (member nil early braid complete) **boot-state**))
-(defglobal **boot-state** nil)
+(define-load-time-global **boot-state** nil)
 
-(/show0 "starting early-low.lisp")
 
 ;;; The PCL package is internal and is used by code in potential
 ;;; bottlenecks. And since it's internal, no one should be
 ;;; doing things like deleting and recreating it in a running target Lisp.
-;;; By the time we get to compiling the rest of PCL,
-;;; the package will have been renamed,
-;;; so subsequently compiled code should refer to "SB-PCL", not "SB!PCL".
-(define-symbol-macro *pcl-package* (load-time-value (find-package "SB-PCL") t))
+(define-symbol-macro *pcl-package* #.(find-package "SB-PCL"))
 
 (declaim (inline class-classoid))
 (defun class-classoid (class)
@@ -70,100 +66,29 @@
             (apply #'format nil format-string format-arguments))
            package)))
 
-(defun make-class-symbol (class-name)
-  ;; Reference a package that is now SB!PCL but later SB-PCL
-  (format-symbol (load-time-value (find-package "SB!PCL") t)
-                 "*THE-CLASS-~A*" (symbol-name class-name)))
-
 (defun condition-type-p (type)
   (and (symbolp type)
        (condition-classoid-p (find-classoid type nil))))
 
-#-sb-xc-host
-(declaim (global  *the-class-t*
-                  *the-class-vector* *the-class-symbol*
-                  *the-class-string* *the-class-sequence*
-                  *the-class-rational* *the-class-ratio*
-                  *the-class-number* *the-class-null* *the-class-list*
-                  *the-class-integer* *the-class-float* *the-class-cons*
-                  *the-class-complex* *the-class-character*
-                  *the-class-bit-vector* *the-class-array*
-                  *the-class-stream* *the-class-file-stream*
-                  *the-class-string-stream*
-
-                  *the-class-slot-object*
-                  *the-class-structure-object*
-                  *the-class-standard-object*
-                  *the-class-function*
-                  *the-class-funcallable-standard-object*
-                  *the-class-class*
-                  *the-class-generic-function*
-                  *the-class-system-class*
-                  *the-class-built-in-class*
-                  *the-class-slot-class*
-                  *the-class-condition-class*
-                  *the-class-structure-class*
-                  *the-class-std-class*
-                  *the-class-standard-class*
-                  *the-class-funcallable-standard-class*
-                  *the-class-forward-referenced-class*
-                  *the-class-method*
-                  *the-class-standard-method*
-                  *the-class-standard-reader-method*
-                  *the-class-standard-writer-method*
-                  *the-class-standard-boundp-method*
-                  *the-class-global-reader-method*
-                  *the-class-global-writer-method*
-                  *the-class-global-boundp-method*
-                  *the-class-standard-generic-function*
-                  *the-class-standard-direct-slot-definition*
-                  *the-class-standard-effective-slot-definition*
-                  *the-class-standard-specializer*
-
-                  *the-eslotd-standard-class-slots*
-                  *the-eslotd-funcallable-standard-class-slots*))
 ;;;; PCL instances
 
-(sb!kernel::!defstruct-with-alternate-metaclass standard-instance
+(sb-kernel::!defstruct-with-alternate-metaclass standard-instance
   ;; KLUDGE: arm64 needs to have CAS-HEADER-DATA-HIGH implemented
   :slot-names (slots #!-(and compact-instance-header x86-64) hash-code)
-  :boa-constructor %make-standard-instance
+  :constructor %make-standard-instance
   :superclass-name t
   :metaclass-name static-classoid
   :metaclass-constructor make-static-classoid
-  :dd-type structure
-  :runtime-type-checks-p nil)
+  :dd-type structure)
 
-;;; TODO: for x8-64 with #!+immobile-code, we would like 2 additional unboxed
-;;; words to hold the trampline instructions to avoid consing a piece of code
-;;; to jump to this function. It should be "as if" a simple-fun, in as much as
+;;; Note: for x8-64 with #!+immobile-code there are 2 additional raw slots which
+;;; hold machine instructions to load the funcallable-instance-fun and jump to
+;;; it, so that funcallable-instances can act like simple-funs, in as much as
 ;;; there's an address you can jump to without loading a register.
-(sb!kernel::!defstruct-with-alternate-metaclass standard-funcallable-instance
-  ;; KLUDGE: Note that neither of these slots is ever accessed by its
-  ;; accessor name as of sbcl-0.pre7.63. Presumably everything works
-  ;; by puns based on absolute locations. Fun fun fun.. -- WHN 2001-10-30
+(sb-kernel::!defstruct-with-alternate-metaclass standard-funcallable-instance
   :slot-names (clos-slots #!-compact-instance-header hash-code)
-  :boa-constructor %make-standard-funcallable-instance
+  :constructor %make-standard-funcallable-instance
   :superclass-name function
   :metaclass-name static-classoid
   :metaclass-constructor make-static-classoid
-  :dd-type funcallable-structure
-  ;; Only internal implementation code will access these, and these
-  ;; accesses (slot readers in particular) could easily be a
-  ;; bottleneck, so it seems reasonable to suppress runtime type
-  ;; checks.
-  ;;
-  ;; (Except note KLUDGE above that these accessors aren't used at all
-  ;; (!) as of sbcl-0.pre7.63, so for now it's academic.)
-  :runtime-type-checks-p nil)
-
-#!+(and compact-instance-header (not x86-64))
-(defconstant std-instance-hash-slot-index 1)
-#!-compact-instance-header
-(progn
-(defconstant std-instance-hash-slot-index 2)
-;; The first data slot (either index 0 or 1) in the primitive funcallable
-;; instance is the vector of CLOS slots. Following that is the hash.
-(defconstant fsc-instance-hash-slot-index (1+ sb!vm:instance-data-start)))
-
-(/show0 "finished with early-low.lisp")
+  :dd-type funcallable-structure)

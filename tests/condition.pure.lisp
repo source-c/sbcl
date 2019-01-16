@@ -13,8 +13,6 @@
 
 (cl:in-package :cl-user)
 
-(load "test-util.lisp")
-
 ;;; Until 0.7.7.21, (MAKE-CONDITION 'FILE-ERROR :PATHNAME "FOO")
 ;;; wasn't printable, because the REPORT function for FILE-ERROR
 ;;; referred to unbound slots. This was reported and fixed by Antonio
@@ -412,3 +410,10 @@ is not of type
         minimize len into min
         maximize len into max
         finally (assert (= min max))))
+
+(with-test (:name :allocate-condition-odd-length-keys)
+  (multiple-value-bind (newcond error)
+      (ignore-errors (make-condition 'warning :a 1 :b))
+    (declare (ignore newcond))
+    (assert (string= (write-to-string error :escape nil)
+                     "odd-length initializer list: (:A 1 :B)."))))

@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; A DEFINITION-SOURCE-LOCATION contains two packed fixnums in the INDICES slot,
 ;;; and unless there is a non-nil plist, does not store the plist.
@@ -95,24 +95,9 @@
             (setf tlf-number (1- (fill-pointer (file-info-forms it))))))
     (%make-definition-source-location namestring tlf-number form-number)))
 
-#+sb-xc-host
-(defun lpnify-namestring (untruename dir type)
-  (let ((src (position "src" dir :test #'string= :from-end t)))
-    (cond
-     ((and src (not (string= (car (last dir)) "output")))
-      (format nil "SYS:~{~:@(~A~);~}~:@(~A~).~:@(~A~)"
-              (subseq dir src) (pathname-name untruename) type))
-     (t (aver (string-equal (car (last dir)) "output"))
-        (aver (string-equal (pathname-name untruename) "stuff-groveled-from-headers"))
-        (format nil "SYS:OUTPUT;STUFF-GROVELED-FROM-HEADERS.~:@(~A~)" type)))))
-
 (defun make-file-info-namestring (name file-info)
-  #+sb-xc-host (declare (ignore name))
   (let* ((untruename (file-info-untruename file-info))
          (dir (and untruename (pathname-directory untruename))))
-    #+sb-xc-host
-    (lpnify-namestring untruename dir (pathname-type untruename))
-    #-sb-xc-host
     (if (and dir (eq (first dir) :absolute))
         (namestring untruename)
         (if name

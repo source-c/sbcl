@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!FASL")
+(in-package "SB-FASL")
 
 ;;;; various constants and essentially-constants
 
@@ -33,39 +33,44 @@
 ;;;   against.
 (defglobal *fasl-header-string-start-string* "# FASL")
 
-(macrolet ((define-fasl-format-features ()
-             (let (;; master value for *F-P-A-F-F*
-                   (fpaff '(:sb-thread :sb-package-locks :sb-unicode :gencgc :ud2-breakpoints)))
-               `(progn
-                  ;; a list of *(SHEBANG-)FEATURES* flags which affect
-                  ;; binary compatibility, i.e. which must be the same
-                  ;; between the SBCL which compiles the code and the
-                  ;; SBCL which executes the code
-                  ;;
-                  ;; This is a property of SBCL executables in the
-                  ;; abstract, not of this particular SBCL executable,
-                  ;; so any flag in this list may or may not be present
-                  ;; in the *FEATURES* list of this particular build.
-                  (defglobal *features-potentially-affecting-fasl-format*
-                    ',fpaff)
-                  ;; a string representing flags of *F-P-A-F-F* which
-                  ;; are in this particular build
-                  ;;
-                  ;; (A list is the natural logical representation for
-                  ;; this, but we represent it as a string because
-                  ;; that's physically convenient for writing to and
-                  ;; reading from fasl files, and because we don't
-                  ;; need to do anything sophisticated with its
-                  ;; logical structure, just test it for equality.)
-                  (defglobal *features-affecting-fasl-format*
-                    ,(let ((*print-pretty* nil))
-                       (prin1-to-string
-                        (sort
-                         (copy-seq
-                          (intersection sb-cold:*shebang-features* fpaff))
-                         #'string<
-                         :key #'symbol-name))))))))
-  (define-fasl-format-features))
+;;; a list of SB-XC:*FEATURES* flags which affect binary compatibility,
+;;; i.e. which must be the same between the SBCL which compiled the code
+;;; and the SBCL which executes the code. This is a property of SBCL executables
+;;; in the abstract, not of this particular SBCL executable,
+;;; so any flag in this list may or may not be present
+;;; in the *FEATURES* list of this particular build.
+(defglobal *features-potentially-affecting-fasl-format*
+    (append '(:sb-thread :sb-package-locks :sb-unicode :cheneygc
+              :gencgc :msan :sb-safepoint :sb-safepoint-strictly
+              :sb-dynamic-core)
+            #!+(or x86 x86-64) '(:int4-breakpoints :ud2-breakpoints)))
+
+;;; Return a string representing symbols in *FEATURES-POTENTIALLY-AFFECTING-FASL-FORMAT*
+;;; which are present in a particular compilation.
+(defun compute-features-affecting-fasl-format ()
+  (let ((list (sort (copy-list (intersection *features-potentially-affecting-fasl-format*
+                                             sb-xc:*features*))
+                    #'string< :key #'symbol-name)))
+    ;; Stringify the subset of *FEATURES* that affect fasl format.
+    ;; A list would be the natural representation choice for this, but a string
+    ;; is convenient for and a requirement for writing to and reading from fasls
+    ;; at this stage of the loading. WITH-STANDARD-IO-SYNTAX and WRITE-TO-STRING
+    ;; would work, but this is simple enough to do by hand.
+    (with-simple-output-to-string (stream)
+      (let ((delimiter #\())
+        (dolist (symbol list)
+          (write-char delimiter stream)
+          (write-string (string symbol) stream)
+          (setq delimiter #\Space)))
+      (write-char #\) stream))))
+
+#-sb-xc-host
+(eval-when (:compile-toplevel)
+  (let ((string (compute-features-affecting-fasl-format)))
+    (assert (and (> (length string) 2)
+                 (not (find #\newline string))
+                 (not (find #\# string))
+                 (not (search ".." string))))))
 
 ;;; the code for a character which terminates a fasl file header
 (defconstant +fasl-header-string-stop-char-code+ 255)
@@ -116,19 +121,13 @@
 ;;;     and FOP-MAYBE-COLD-LOAD.
 
 ;;; the conventional file extension for our fasl files
+;;; FIXME this should be (DEFCONSTANT-EQX +FASL-FILE-TYPE+ "fasl" #'EQUAL),
+;;; but renaming the variable would harm 'asdf-dependency-grovel' and other
+;;; random 3rd-party libraries. However, we can't keep the name and make it
+;;; constant, because the compiler warns about asterisks on constants.
+;;; So we keep the asterisks and make it defglobal.
 (declaim (type simple-string *fasl-file-type*))
-(defvar *fasl-file-type* "fasl")
-
-;;;; information about below-Lisp-level linkage
-
-;;; Note:
-;;;   Assembler routines are named by full Lisp symbols: they
-;;;     have packages and that sort of native Lisp stuff associated
-;;;     with them. We can compare them with EQ.
-(declaim (type hash-table *assembler-routines*))
-(defglobal *assembler-routines* (make-hash-table :test 'eq))
-(defglobal *assembler-objects* nil)
-
+(defglobal *fasl-file-type* "fasl")
 
 ;;;; the FOP database
 
@@ -175,5 +174,12 @@
   ;; function calls) while executing other FOPs. SKIP-UNTIL will
   ;; either contain the position where the skipping will stop, or
   ;; NIL if we're executing normally.
-  (skip-until nil))
+  (skip-until nil :type (or null fixnum)))
 (declaim (freeze-type fasl-input))
+
+;;; Unique number assigned into high 4 bytes of 64-bit code size slot
+;;; so that we can sort the contents of varyobj space in a more-or-less
+;;; predictable manner based on the order in which code was loaded.
+;;; This wraps around at 32 bits, but it's still deterministic.
+(define-load-time-global *code-serialno* 0)
+(declaim (fixnum *code-serialno*))

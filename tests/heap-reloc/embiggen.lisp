@@ -17,7 +17,7 @@
 ;;; But the test's entire purpose is to assign noncanonical bignums
 ;;; (that are equivalent to fixnums) into every layout.
 ;;;
-#-immobile-space
+#-(or immobile-space (and));; FIXME: it's breaking something
 (let ((ht (make-hash-table :test 'eql)))
   (flet ((bignumify (int)
            (or (gethash int ht)
@@ -25,7 +25,7 @@
                      (if (typep int 'fixnum)
                          (sb-bignum:make-small-bignum int)
                          int)))))
-    (sb-vm::map-allocated-objects
+    (sb-vm:map-allocated-objects
      (lambda (obj type size)
        (declare (ignore type size))
        (when (and (typep obj 'sb-kernel:layout)
@@ -47,5 +47,10 @@
                               ;; force the 0th bit to 1, for the layout
                               ;; (Shouldn't LENGTH be right? Doesn't seem to be)
                               (logior #-compact-instance-header 1
-                                      (1- (ash 1 len))))))))))))
+                                      (1- (ash 1 len)))))))))
+           (unless (plusp (length (sb-kernel:layout-equalp-tests obj)))
+             (let ((n (- (sb-kernel:layout-length obj) sb-vm:instance-data-start)))
+               (when (>= n 0)
+                 (setf (sb-kernel:layout-equalp-tests obj)
+                       (make-array n :initial-element 0))))))))
      :all)))

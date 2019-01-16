@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
 ;;;; Allocator for the array header.
@@ -68,14 +68,14 @@
 ;;;; Additional accessors and setters for the array header.
 (define-full-reffer %array-dimension *
   array-dimensions-offset other-pointer-lowtag
-  (any-reg) positive-fixnum sb!kernel:%array-dimension)
+  (any-reg) positive-fixnum sb-kernel:%array-dimension)
 
 (define-full-setter %set-array-dimension *
   array-dimensions-offset other-pointer-lowtag
-  (any-reg) positive-fixnum sb!kernel:%set-array-dimension)
+  (any-reg) positive-fixnum sb-kernel:%set-array-dimension)
 
 (define-vop (array-rank-vop)
-  (:translate sb!kernel:%array-rank)
+  (:translate sb-kernel:%array-rank)
   (:policy :fast-safe)
   (:args (x :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) temp)
@@ -90,17 +90,81 @@
 (define-vop (check-bound)
   (:translate %check-bound)
   (:policy :fast-safe)
-  (:args (array :scs (descriptor-reg))
-         (bound :scs (any-reg descriptor-reg))
-         (index :scs (any-reg descriptor-reg)))
+  (:args (array :scs (descriptor-reg constant))
+         (bound :scs (any-reg descriptor-reg)
+                :load-if (not (and (sc-is bound immediate)
+                                   (not (sc-is index immediate))
+                                   (typep (tn-value bound)
+                                          '(and sc-offset
+                                            (satisfies fixnum-add-sub-immediate-p))))))
+         (index :scs (any-reg descriptor-reg)
+                :load-if (not (and (sc-is index immediate)
+                                   (typep (tn-value index)
+                                          '(and sc-offset
+                                            (satisfies fixnum-add-sub-immediate-p)))))))
+  (:variant-vars %test-fixnum)
+  (:variant t)
   (:vop-var vop)
   (:save-p :compute-only)
-  (:generator 5
-    (let ((error (generate-error-code vop 'invalid-array-index-error array bound index)))
-      (%test-fixnum index error t)
-      (inst cmp index bound)
-      (inst b :hs error))))
+  (:generator 6
+    (let ((error (generate-error-code vop 'invalid-array-index-error
+                                      array bound index))
+          (bound (if (sc-is bound immediate)
+                     (let ((value (tn-value bound)))
+                       (cond ((and %test-fixnum
+                                   (power-of-two-limit-p (1- value)))
+                              (lognot (fixnumize (1- value))))
+                             ((sc-is index any-reg descriptor-reg)
+                              (fixnumize value))
+                             (t
+                              value)))
+                     bound))
+          (index (if (sc-is index immediate)
+                     (let ((value (tn-value index)))
+                       (if (sc-is bound any-reg descriptor-reg)
+                           (fixnumize value)
+                           value))
+                     index)))
+      (cond ((eql bound -1)
+             (inst cbnz index error))
+            ((typep bound '(integer * -1))
+             ;; Power of two bound, can be checked for fixnumness at
+             ;; the same time as it always occupies a consecutive bit
+             ;; range, everything else, including the tag, has to be
+             ;; zero.
+             (inst tst index bound)
+             (inst b :ne error))
+            (t
+             (when (and %test-fixnum (not (integerp index)))
+               (%test-fixnum index nil error t))
+             (cond ((integerp bound)
+                    (inst cmp index bound)
+                    (inst b :hs error))
+                   (t
+                    (inst cmp bound index)
+                    (inst b :ls error))))))))
 
+(define-vop (check-bound/fast check-bound)
+  (:policy :fast)
+  (:variant nil)
+  (:variant-cost 4))
+
+(define-vop (check-bound/fixnum check-bound)
+  (:args (array)
+         (bound)
+         (index :scs (any-reg)))
+  (:arg-types * * tagged-num)
+  (:variant nil)
+  (:variant-cost 4))
+
+(define-vop (check-bound/untagged check-bound)
+  (:args (array)
+         (bound :scs (unsigned-reg signed-reg))
+         (index :scs (unsigned-reg signed-reg)))
+  (:arg-types * (:or unsigned-num signed-num)
+                (:or unsigned-num signed-num))
+  (:variant nil)
+  (:variant-cost 5))
 ;;;; Accessors/Setters
 
 ;;; Variants built on top of word-index-ref, etc.  I.e. those vectors whos
@@ -110,7 +174,7 @@
   `(progn
      (define-full-reffer ,(symbolicate "DATA-VECTOR-REF/" type) ,type
        vector-data-offset other-pointer-lowtag
-       ,(remove-if #'(lambda (x) (member x '(null))) scs)
+       ,scs
        ,element-type
        data-vector-ref)
      (define-full-setter ,(symbolicate "DATA-VECTOR-SET/" type) ,type
@@ -127,7 +191,7 @@
        ,element-type data-vector-set))))
 
   (def-full-data-vector-frobs simple-vector *
-    descriptor-reg any-reg null)
+    descriptor-reg any-reg)
 
   (def-partial-data-vector-frobs simple-base-string character
     :byte nil character-reg)

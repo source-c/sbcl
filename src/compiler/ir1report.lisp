@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; compiler error context determination
 
@@ -38,25 +38,67 @@
             (:copier nil))
   ;; a list of the stringified CARs of the enclosing non-original source forms
   ;; exceeding the *enclosing-source-cutoff*
-  (enclosing-source nil :type list)
+  (%enclosing-source nil :type list)
   ;; a list of stringified enclosing non-original source forms
-  (source nil :type list)
-  ;; the stringified form in the original source that expanded into SOURCE
-  (original-source (missing-arg) :type simple-string)
+  (%source nil :type list)
+  (original-form (missing-arg))
+  (original-form-string nil)
   ;; a list of prefixes of "interesting" forms that enclose original-source
   (context nil :type list)
   ;; the FILE-INFO-NAME for the relevant FILE-INFO
   (file-name (missing-arg) :type (or pathname (member :lisp :stream)))
   ;; the file position at which the top level form starts, if applicable
   (file-position nil :type (or index null))
+  path
+  format-args
+  initialized
   ;; the original source part of the source path
   (original-source-path nil :type list)
   ;; the lexenv active at the time
   (lexenv nil :type (or null lexenv)))
 
+;;; Delay computing some source information, since it may not actually be ever used
+(defun compiler-error-context-original-source (context)
+  (let ((source (compiler-error-context-original-form-string context)))
+    (if (stringp source)
+        source
+        (setf (compiler-error-context-original-form-string context)
+              (stringify-form (compiler-error-context-original-form context))))))
+
+(defun compiler-error-context-source (context)
+  (setup-compiler-error-context context)
+  (compiler-error-context-%source context))
+
+(defun compiler-error-context-enclosing-source (context)
+  (setup-compiler-error-context context)
+  (compiler-error-context-%enclosing-source context))
+
+(defun setup-compiler-error-context (context)
+  (unless (compiler-error-context-initialized context)
+    (setf (compiler-error-context-initialized context) t)
+    (let ((path (compiler-error-context-path context))
+          (args (compiler-error-context-format-args context)))
+      (collect ((full nil cons)
+                (short nil cons))
+        (let ((forms (source-path-forms path))
+              (n 0))
+          (dolist (src (if (member (first forms) args)
+                           (rest forms)
+                           forms))
+            (if (>= n *enclosing-source-cutoff*)
+                (short (stringify-form (if (consp src)
+                                           (car src)
+                                           src)
+                                       nil))
+                (full (stringify-form src)))
+            (incf n))
+          (setf (compiler-error-context-%enclosing-source context) (short)
+                (compiler-error-context-%source context) (full)))))))
+
 ;;; If true, this is the node which is used as context in compiler warning
 ;;; messages.
-(declaim (type (or null compiler-error-context node) *compiler-error-context*))
+(declaim (type (or null compiler-error-context node
+                   lvar-annotation) *compiler-error-context*))
 (defvar *compiler-error-context* nil)
 
 ;;; a plist mapping macro names to source context parsers. Each parser
@@ -112,7 +154,7 @@
 (defun source-form-context (form)
   (flet ((get-it (form)
            (cond ((atom form) nil)
-                 ((>= (length form) 2)
+                 ((list-of-length-at-least-p form 2)
                   (let* ((context-fun-default
                            (lambda (x)
                              (declare (ignore x))
@@ -150,8 +192,8 @@
       (let ((form root)
             (current (rest rpath)))
         (loop
-         (when (sb!int:comma-p form)
-           (setf form (sb!int:comma-expr form)))
+         (when (comma-p form)
+           (setf form (comma-expr form)))
          (when (atom form)
             (aver (null current))
             (return))
@@ -177,10 +219,11 @@
 (defun stringify-form (form &optional (pretty t))
   (with-standard-io-syntax
     (with-compiler-io-syntax
-        (let ((*print-pretty* pretty))
-          (if pretty
-              (format nil "~<~@;  ~S~:>" (list form))
-              (prin1-to-string form))))))
+      (let ((*print-pretty* pretty)
+            (*print-ir-nodes-pretty* t))
+        (if pretty
+            (format nil "~<~@;  ~S~:>" (list form))
+            (prin1-to-string form))))))
 
 ;;; Return a COMPILER-ERROR-CONTEXT structure describing the current
 ;;; error context, or NIL if we can't figure anything out. ARGS is a
@@ -195,8 +238,12 @@
   (let ((context *compiler-error-context*))
     (if (compiler-error-context-p context)
         (values context t)
-        (let* ((path (or (and (node-p context) (node-source-path context))
-                         (and (boundp '*current-path*) *current-path*)))
+        (let* ((path (cond ((node-p context)
+                            (node-source-path context))
+                           ((lvar-annotation-p context)
+                            (lvar-annotation-source-path context))
+                           ((boundp '*current-path*)
+                            *current-path*)))
                (old
                 (find (when path (source-path-original-source path))
                       (remove-if #'null old-contexts)
@@ -205,38 +252,26 @@
           (if old
               (values old t)
               (when (and *source-info* path)
-                (multiple-value-bind (form src-context) (find-original-source path)
-                  (collect ((full nil cons)
-                            (short nil cons))
-                    (let ((forms (source-path-forms path))
-                          (n 0))
-                      (dolist (src (if (member (first forms) args)
-                                       (rest forms)
-                                       forms))
-                        (if (>= n *enclosing-source-cutoff*)
-                            (short (stringify-form (if (consp src)
-                                                       (car src)
-                                                       src)
-                                                   nil))
-                            (full (stringify-form src)))
-                        (incf n)))
-
-                    (let* ((tlf (source-path-tlf-number path))
-                           (file-info (source-info-file-info *source-info*)))
-                      (values
-                       (make-compiler-error-context
-                        :enclosing-source (short)
-                        :source (full)
-                        :original-source (stringify-form form)
-                        :context src-context
-                        :file-name (file-info-name file-info)
-                        :file-position
-                        (nth-value 1 (find-source-root tlf *source-info*))
-                        :original-source-path (source-path-original-source path)
-                        :lexenv (if context
-                                    (node-lexenv context)
-                                    (if (boundp '*lexenv*) *lexenv* nil)))
-                       nil))))))))))
+                (let ((tlf (source-path-tlf-number path))
+                      (file-info (source-info-file-info *source-info*)))
+                  (multiple-value-bind (form src-context) (find-original-source path)
+                    (values
+                     (make-compiler-error-context
+                      :original-form form
+                      :format-args args
+                      :context src-context
+                      :file-name (file-info-name file-info)
+                      :file-position
+                      (nth-value 1 (find-source-root tlf *source-info*))
+                      :path path
+                      :original-source-path (source-path-original-source path)
+                      :lexenv (cond ((node-p context)
+                                     (node-lexenv context))
+                                    ((lvar-annotation-p context)
+                                     (lvar-annotation-lexenv context))
+                                    ((boundp '*lexenv*)
+                                     *lexenv*)))
+                     nil)))))))))
 
 ;;;; printing error messages
 
@@ -244,31 +279,31 @@
 ;;; so that we don't print it out redundantly.
 
 ;;; The last COMPILER-ERROR-CONTEXT that we printed.
-(defvar *last-error-context* nil)
+(defvar *last-error-context*)
 (declaim (type (or compiler-error-context null) *last-error-context*))
 
 ;;; The format string and args for the last error we printed.
-(defvar *last-format-string* nil)
-(defvar *last-format-args* nil)
-(declaim (type (or string null) *last-format-string*))
-(declaim (type list *last-format-args*))
+(define-symbol-macro *last-format-string*
+  (the (or string null) (cadr *last-message-count*)))
+(define-symbol-macro *last-format-args* (cddr *last-message-count*))
 
 ;;; The number of times that the last error message has been emitted,
 ;;; so that we can compress duplicate error messages.
-(defvar *last-message-count* 0)
-(declaim (type index *last-message-count*))
+(defvar *last-message-count*)
+(declaim (type (cons index (cons (or string null) t)) *last-message-count*))
 
 ;;; If the last message was given more than once, then print out an
 ;;; indication of how many times it was repeated. We reset the message
 ;;; count when we are done.
-(defun note-message-repeats (stream &optional (terpri t))
-  (cond ((= *last-message-count* 1)
+(defun note-message-repeats (stream &optional (terpri t)
+                                    &aux (count (car *last-message-count*)))
+  (cond ((= count 1)
          (when terpri
            (terpri stream)))
-        ((> *last-message-count* 1)
+        ((> count 1)
          (format stream "~&; [Last message occurs ~W times.]~2%"
-                 *last-message-count*)))
-  (setq *last-message-count* 0))
+                 count)))
+  (setf (car *last-message-count*) 0))
 
 ;;; Print out the message, with appropriate context if we can find it.
 ;;; If the context is different from the context of the last message
@@ -356,7 +391,7 @@
       (format stream "~&~?" format-string format-args))
     (fresh-line stream))
 
-  (incf *last-message-count*)
+  (incf (car *last-message-count*))
   (values))
 
 (defun print-compiler-condition (condition)
@@ -406,7 +441,7 @@ has written, having proved that it is unreachable."))
      ;; Grammar note - starting a sentence with a numeral is wrong.
      (format stream
               "~@<~@(~D~) call~:P to ~
-               ~/sb!impl:print-symbol-with-prefix/ ~
+               ~/sb-ext:print-symbol-with-prefix/ ~
                ~2:*~[~;was~:;were~] compiled before a compiler-macro ~
                was defined for it. A declaration of NOTINLINE at the ~
                call site~:P will eliminate this warning, as will ~
@@ -458,7 +493,6 @@ has written, having proved that it is unreachable."))
 ;;; such like. We clear the current error context so that we know that
 ;;; it needs to be reprinted, and we also FORCE-OUTPUT so that the
 ;;; message gets seen right away.
-(declaim (ftype (function (string &rest t) (values)) compiler-mumble))
 (defun compiler-mumble (control &rest args)
   (let ((stream *standard-output*))
     (note-message-repeats stream)
@@ -480,7 +514,7 @@ has written, having proved that it is unreachable."))
       (let ((*print-level* 2)
             (*print-pretty* nil))
         ;; It's arbitrary how this name is stringified.
-        ;; Using ~A in lieu of ~S prevents "SB!" strings from getting in.
+        ;; Using ~A in lieu of ~S prevents "SB-" strings from getting in.
         (format nil
                 "~{~{~A~^ ~}~^ => ~}"
                 #+sb-xc-host (list (list (caar context)))
@@ -544,7 +578,7 @@ has written, having proved that it is unreachable."))
   ;; Whitelist functions are looked up prior to UNCROSS,
   ;; so that we can distinguish CL:SOMEFUN from SB-XC:SOMEFUN.
   (when (and (eq kind :function)
-             (gethash name sb-cold::*undefined-fun-whitelist*))
+             (gethash name *undefined-fun-whitelist*))
     (return-from note-undefined-reference (values)))
   (setq name (uncross name))
   (unless (and
@@ -603,7 +637,7 @@ has written, having proved that it is unreachable."))
 ;; The current approach is reliable, at a cost of ~3 words per function.
 ;;
 (defun warn-if-compiler-macro-dependency-problem (name)
-  (unless (sb!xc:compiler-macro-function name)
+  (unless (sb-xc:compiler-macro-function name)
     (let ((status (car (info :function :emitted-full-calls name)))) ; TODO use emitted-full-call-count?
       (when (and (integerp status) (oddp status))
         ;; Show the total number of calls, because otherwise the warning
@@ -626,7 +660,7 @@ has written, having proved that it is unreachable."))
     (let ((warning-count (emitted-full-call-count name)))
       (when (and warning-count
                  ;; Warn only if the the compiler did not have the expansion.
-                 (not (info :function :inline-expansion-designator name))
+                 (not (fun-name-inline-expansion name))
                  ;; and if nothing was previously known about inline status
                  ;; so that repeated proclamations don't warn. NIL is a valid
                  ;; value for :inlinep in the globaldb so use the 2nd result.
@@ -638,7 +672,7 @@ has written, having proved that it is unreachable."))
         (compiler-warn
          'inlining-dependency-failure
          :format-control
-         "~@<Proclaiming ~/sb!impl:print-symbol-with-prefix/ to be INLINE, but ~D call~:P to it ~
+         "~@<Proclaiming ~/sb-ext:print-symbol-with-prefix/ to be INLINE, but ~D call~:P to it ~
 ~:*~[~;was~:;were~] previously compiled. A declaration of NOTINLINE ~
 at the call site~:P will eliminate this warning, as will proclaiming ~
 and defining the function before its first potential use.~@:>"
@@ -669,7 +703,7 @@ and defining the function before its first potential use.~@:>"
   ;; Do nothing if the inline expansion is known - it wasn't used
   ;; because of the expansion limit, which is a different problem.
   (unless (or (logtest 2 (car count-cell)) ; warn at most once per name
-              (info :function :inline-expansion-designator name))
+              (fun-name-inline-expansion name))
     ;; This function is only called by PONDER-FULL-CALL when NAME
     ;; is not lexically NOTINLINE, so therefore if it is globally INLINE,
     ;; there was no local declaration to the contrary.
@@ -691,14 +725,16 @@ and defining the function before its first potential use.~@:>"
        'inlining-dependency-failure
        :format-control
        (if (info :function :assumed-type name)
-           "~@<Call to ~/sb!impl:print-symbol-with-prefix/ could not be inlined because no definition ~
-for it was seen prior to its first use.~:@>"
+           (sb-format:tokens "~@<Call to ~/sb-ext:print-symbol-with-prefix/ ~
+                              could not be inlined because no definition ~
+                              for it was seen prior to its first use.~:@>")
          ;; This message sort of implies that source form is the
          ;; only reasonable representation in which an inline definition
          ;; could have been saved, which isn't in general true - it could
          ;; be saved as a parsed AST - but I don't really know how else to
          ;; phrase this. And it happens to be true in SBCL, so it's not wrong.
-           "~@<Call to ~/sb!impl:print-symbol-with-prefix/ could not be inlined because its source code ~
-was not saved. A global INLINE or SB-EXT:MAYBE-INLINE proclamation must be ~
-in effect to save function definitions for inlining.~:@>")
+           (sb-format:tokens "~@<Call to ~/sb-ext:print-symbol-with-prefix/ could ~
+not be inlined because its source code was not saved. A global INLINE ~
+or SB-EXT:MAYBE-INLINE proclamation must be ~
+in effect to save function definitions for inlining.~:@>"))
        :format-arguments (list name)))))

@@ -10,7 +10,6 @@
 ;;;; more information.
 
 (load "compiler-test-util.lisp")
-(use-package "ASSERTOID")
 
 ;;;; examples from, or close to, the Common Lisp DEFSTRUCT spec
 
@@ -752,16 +751,15 @@
             (setf (find-class 'foo) nil)
             (defstruct foo slot-1)))))
 
-;;; bug 348, evaluation order of slot writer arguments. Fixed by Gabor
-;;; Melis.
 (defstruct bug-348 x)
 
-(assert (eql -1 (let ((i (eval '-2))
-                      (x (make-bug-348)))
-                  (funcall #'(setf bug-348-x)
-                           (incf i)
-                           (aref (vector x) (incf i)))
-                  (bug-348-x x))))
+(with-test (:name :eval-order-slot-writer-arguments)
+  (assert (eql -1 (let ((i (eval '-2))
+                        (x (make-bug-348)))
+                    (funcall #'(setf bug-348-x)
+                             (incf i)
+                             (aref (vector x) (incf i)))
+                    (bug-348-x x)))))
 
 ;;; obsolete instance trapping
 ;;;
@@ -1390,7 +1388,7 @@ redefinition."
                              :initial-element *c*))
 
 (test-util:with-test (:name :dfloat-endianness
-                      :skipped-on '(not (or :mips :x86))) ; only tested on these
+                      :skipped-on (not (or :mips :x86))) ; only tested on these
   (compare-memory pi 2 *adf* 2 2) ; Array
   (compare-memory pi 2 (make-struct-df) 2 2) ; Structure
 
@@ -1418,3 +1416,11 @@ redefinition."
              ;; RECKLESSLY-CONTINUE is offered.
              '(defstruct redefinable (a nil :type symbol))
              '(defstruct redefinable (a nil :type cons))))))
+
+(test-util:with-test (:name :non-total-satisfies-predicate)
+  ;; This definition is perfectly fine as long as you always pass
+  ;; only numbers to the constructor.
+  ;; In particular, the macroexpander must not test whether a random
+  ;; object (specifically NIL) meets the test for the slot.
+  (assert (macroexpand-1
+           '(defstruct strangestruct (a nil :type (satisfies plusp))))))

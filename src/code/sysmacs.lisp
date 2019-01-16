@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; these are initialized by create_thread_struct()
 
@@ -25,17 +25,12 @@
 #!+sb-thread
 (defvar *stop-for-gc-pending*)
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (dolist (symbol '(*gc-inhibit* *in-without-gcing*
-                    *gc-pending* *stop-for-gc-pending*))
-    (setf (info :variable :always-bound symbol) :always-bound)))
-
 ;;; This one is initialized by the runtime, at thread creation.  On
 ;;; non-x86oid gencgc targets, this is a per-thread list of objects
 ;;; which must not be moved during GC.  It is frobbed by the code for
 ;;; with-pinned-objects in src/compiler/target/macros.lisp.
 #!+(and gencgc (not (or x86 x86-64)))
-(defvar sb!vm::*pinned-objects*)
+(defvar sb-vm::*pinned-objects*)
 
 (defmacro without-gcing (&body body)
   "Executes the forms in the body without doing a garbage collection. It
@@ -74,7 +69,7 @@ maintained."
                (when (or *interrupt-pending*
                          *gc-pending*
                          #!+sb-thread *stop-for-gc-pending*)
-                 (sb!unix::receive-pending-interrupt))))))))
+                 (sb-unix::receive-pending-interrupt))))))))
 
 ;;; EOF-OR-LOSE is a useful macro that handles EOF.
 (defmacro eof-or-lose (stream eof-error-p eof-value)
@@ -270,7 +265,7 @@ maintained."
                        &body body)
   ;; If the &REST arg never needs to be reified, this is slightly quicker
   ;; than using a DX list.
-  (let ((index (sb!xc:gensym "INDEX")))
+  (let ((index (sb-xc:gensym "INDEX")))
     `(let ((,index ,start))
        (loop
         (cond ((< (truly-the index ,index) (length ,rest-var))

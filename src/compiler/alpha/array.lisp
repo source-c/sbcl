@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; allocator for the array header
 (define-vop (make-array-header)
@@ -70,7 +70,7 @@
   (:generator 5
     (let ((error (generate-error-code vop 'invalid-array-index-error
                                       array bound index)))
-      (%test-fixnum index error t :temp temp)
+      (%test-fixnum index temp error t)
       (inst cmpult index bound temp)
       (inst beq temp error))))
 
@@ -252,7 +252,7 @@
                                                (= (tn-value value)
                                                   ,(1- (ash 1 bits))))
                                     (cond #!+#.(cl:if
-                                                (cl:= sb!vm:n-word-bits sb!vm:n-machine-word-bits)
+                                                (cl:= sb-vm:n-word-bits sb-vm:n-machine-word-bits)
                                                 '(and) '(or))
                                           ((= extra ,(1- elements-per-word))
                                            (inst sll old ,bits old)

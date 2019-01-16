@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; Tags for the main low-level types are stored in the low n (usually three)
 ;;; bits to identify the type of a machine word.  Certain constraints
@@ -85,12 +85,12 @@
     other-immediate-1-lowtag
     other-pointer-lowtag))
 
-(def!constant nil-value
+(defconstant nil-value
     (+ static-space-start n-word-bytes other-pointer-lowtag))
 
 (defconstant-eqx fixnum-lowtags
     #.(let ((fixtags nil))
-        (do-external-symbols (sym "SB!VM")
+        (do-external-symbols (sym "SB-VM")
           (let* ((name (symbol-name sym))
                  (len (length name)))
             (when (and (boundp sym)
@@ -166,7 +166,7 @@
 ;; SIMPLE-VECTOR means the latter doesn't make it right for SBCL internals.
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
-(defenum (;; The first widetag must be greater than SB!VM:LOWTAG-LIMIT
+(defenum (;; The first widetag must be greater than SB-VM:LOWTAG-LIMIT
           ;; otherwise code in generic/early-type-vops will suffer
           ;; a long, horrible death.  --njf, 2004-08-09
           :start #.(+ (ash 1 n-lowtag-bits) other-immediate-0-lowtag)
@@ -208,8 +208,11 @@
   unused01-widetag                          ;  5E       5E
   #!+sb-simd-pack
   simd-pack-widetag                         ;       65       65
-  unused02-widetag                          ;  62   69  62   69
-  unused03-widetag                          ;  66   6D  66   6D
+  #!-sb-simd-pack-256
+  unused03-widetag                          ;  62   69  62   69
+  #!+sb-simd-pack-256
+  simd-pack-256-widetag                     ;  62   69  62   69
+  filler-widetag                            ;  66   6D  66   6D
   unused04-widetag                          ;  6A   71  6A   71
   unused05-widetag                          ;  6E   75  6E   75
   unused06-widetag                          ;  72   79  72   79
@@ -268,20 +271,18 @@
   complex-array-widetag                     ;  F2   FD  EA   F5
 ))
 
-(defconstant-eqx +fun-header-widetags+
+(defconstant-eqx +function-widetags+
     '#.(list funcallable-instance-widetag simple-fun-widetag closure-widetag)
   #'equal)
 
-;;; Don't use these. They're for Slime, ltk, Conium, hu.dwim.debug
-;;; and who-knows-what-else.
-(defconstant simple-fun-header-widetag simple-fun-widetag)
-(defconstant closure-header-widetag closure-widetag)
-
-;;; the different vector subtypes
-(defenum ()
-  vector-normal-subtype
-  vector-unused-subtype
-  vector-valid-hashing-subtype)
+;;; the different vector subtypes - these are flag bits, not an enumeration
+(defconstant vector-normal-subtype  0)
+;; If vector is weak but NOT a hash-table backing vector
+(defconstant vector-weak-subtype 1)
+(defconstant vector-weak-visited-subtype 2) ; weak + GC bit
+;; a valid-hashing vector might also be weak,
+;; but we set ONLY the hashing bit when it backs a hash-table
+(defconstant vector-valid-hashing-subtype 4)
 
 ;;; These next two constants must not occupy the same byte of a
 ;;; vector header word as the values in the preceding defenum.
@@ -292,7 +293,7 @@
 ;; often the print-name of a symbol, or was a literal in source code
 ;; and loaded from a fasl, or used in a few others situations
 ;; which warrant sharing.
-(def!constant +vector-shareable+ #x100)
+(defconstant +vector-shareable+ #x100)
 
 ;; A vector tagged as +VECTOR-SHAREABLE-NONSTD+ is logically readonly,
 ;; and *not* technically permitted by the standard to be shared.
@@ -305,6 +306,7 @@
 
 ;;; This is so that COMPILE-FILE knows that things like :ALLOW-OTHER-KEYS
 ;;; can be immediate constants.
+;;; Note also that sb-fasteval uses 2 bits of the symbol header.
 #!+(and immobile-space (not immobile-symbols))
 (defconstant +initial-core-symbol-bit+ 8) ; bit index, not bit value
 
@@ -315,15 +317,16 @@
 
   ;; FUNCTION-LAYOUT is a fixnum whose bits are ORed in "as-is" with the
   ;; low half of a closure header to form the full header word.
-  #-sb-xc-host (defglobal function-layout 0) ; set by genesis
+  #!+(and (not (host-feature sb-xc-host)) (not sb-thread))
+  (defglobal function-layout 0)         ; set by genesis
 
   ;; The cross-compiler stores FUNCTION-LAYOUT in a more obvious way.
   #+sb-xc-host
   (defconstant function-layout ; kludge - verified by genesis
-    (logior (+ immobile-space-start layout-align) instance-pointer-lowtag)))
+    (logior (+ fixedobj-space-start (* 3 layout-align)) instance-pointer-lowtag)))
 
 #|
-;; Run this in the SB-VM or SB!VM package once for each target feature combo.
+;; Run this in the SB-VM or SB-VM package once for each target feature combo.
 (defun rewrite-widetag-comments ()
   (rename-file "src/compiler/generic/early-objdef.lisp" "early-objdef.old")
   (with-open-file (in "src/compiler/generic/early-objdef.old")
@@ -331,7 +334,7 @@
                          :direction :output :if-exists :supersede)
       (let* ((target-features
               (if (find-package "SB-COLD")
-                  (symbol-value (find-symbol "*SHEBANG-FEATURES*" "SB-COLD"))
+                  (symbol-value (find-symbol "*FEATURES*" "SB-XC"))
                   *features*))
              (feature-bits
               (+ (if (= n-word-bits 64) 1 0)

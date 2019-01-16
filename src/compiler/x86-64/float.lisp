@@ -9,13 +9,10 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (macrolet ((ea-for-xf-desc (tn slot)
-             `(make-ea
-               :qword :base ,tn
-               :disp (- (* ,slot n-word-bytes)
-                        other-pointer-lowtag))))
+             `(ea (- (* ,slot n-word-bytes) other-pointer-lowtag) ,tn)))
   (defun ea-for-df-desc (tn)
     (ea-for-xf-desc tn double-float-value-slot))
   ;; complex floats
@@ -35,9 +32,7 @@
 
 (macrolet ((ea-for-xf-stack (tn kind)
              (declare (ignore kind))
-             `(make-ea
-               :qword :base rbp-tn
-               :disp (frame-byte-offset (tn-offset ,tn)))))
+             `(ea (frame-byte-offset (tn-offset ,tn)) rbp-tn)))
   (defun ea-for-sf-stack (tn)
     (ea-for-xf-stack tn :single))
   (defun ea-for-df-stack (tn)
@@ -45,9 +40,7 @@
 
 ;;; complex float stack EAs
 (macrolet ((ea-for-cxf-stack (tn kind slot &optional base)
-             `(make-ea
-               :qword :base ,base
-               :disp (frame-byte-offset
+             `(ea (frame-byte-offset
                       (+ (tn-offset ,tn)
                        (cond ((= (tn-offset ,base) rsp-offset)
                               sp->fp-offset)
@@ -60,7 +53,8 @@
                          (:double
                             (ecase ,slot
                               (:real 1)
-                              (:imag 0)))))))))
+                              (:imag 0))))))
+                  ,base)))
   (defun ea-for-csf-data-stack (tn &optional (base rbp-tn))
     (ea-for-cxf-stack tn :single :real base))
   (defun ea-for-csf-real-stack (tn &optional (base rbp-tn))
@@ -167,9 +161,9 @@
   (:results (y :scs (descriptor-reg)))
   (:note "float to pointer coercion")
   (:generator 4
-    (inst movd (reg-in-size y :dword) x)
+    (inst movd y x)
     (inst shl y 32)
-    (inst or y single-float-widetag)))
+    (inst or :byte y single-float-widetag)))
 
 (define-move-vop move-from-single :move
   (single-reg) (descriptor-reg))
@@ -180,33 +174,29 @@
   (:node-var node)
   (:note "float to pointer coercion")
   (:generator 13
-     (with-fixed-allocation (y
-                             double-float-widetag
-                             double-float-size
-                             node)
-       (inst movsd (ea-for-df-desc y) x))))
+     (fixed-alloc y double-float-widetag double-float-size node)
+     (inst movsd (ea-for-df-desc y) x)))
 (define-move-vop move-from-double :move
   (double-reg) (descriptor-reg))
 
 ;;; Move from a descriptor to a float register.
 (define-vop (move-to-single-reg)
-   (:args (x :scs (descriptor-reg) :target tmp
+   (:args (x :scs (descriptor-reg)
              :load-if (not (sc-is x control-stack))))
-   (:temporary (:sc unsigned-reg :from :argument :to :result) tmp)
    (:results (y :scs (single-reg)))
-   (:note "pointer to float coercion")
+   (:note "descriptor to float coercion")
    (:generator 2
      (sc-case x
        (descriptor-reg
-        (move tmp x)
-        (inst shr tmp 32)
-        (inst movd y (reg-in-size tmp :dword)))
-       (control-stack
-        ;; When the single-float descriptor is in memory, the untagging
-        ;; is done in the target XMM register. This is faster than going
-        ;; through a general-purpose register and the code is smaller.
+        ;; After MOVQ, vector element 0 holds a single-float whose bits are
+        ;; SINGLE-FLOAT-WIDETAG. That's fine, it's an ordinary denormal float.
         (inst movq y x)
-        (inst shufps y y #4r3331)))))
+        ;; Move bits [63:32] into [31:0] and move bits [127:96]
+        ;; into the other 3 vector elements so that [63:32] is zeroed.
+        (inst shufps y y #4r3331))
+       (control-stack
+        ;; Directly load high 4 bytes of descriptor from its stack address
+        (inst movss y (ea (+ (frame-byte-offset (tn-offset x)) 4) rbp-tn))))))
 (define-move-vop move-to-single-reg :move (descriptor-reg) (single-reg))
 
 ;;; Move from a descriptor to a float stack.
@@ -218,9 +208,7 @@
   (:generator 2
     (move tmp x)
     (inst shr tmp 32)
-    (let ((slot (make-ea :dword :base rbp-tn
-                         :disp (frame-byte-offset (tn-offset y)))))
-      (inst mov slot (reg-in-size tmp :dword)))))
+    (inst mov :dword (ea (frame-byte-offset (tn-offset y)) rbp-tn) tmp)))
 (define-move-vop move-to-single-stack :move (descriptor-reg) (single-stack))
 
 (define-vop (move-to-double)
@@ -240,11 +228,8 @@
   (:node-var node)
   (:note "complex float to pointer coercion")
   (:generator 13
-     (with-fixed-allocation (y
-                             complex-single-float-widetag
-                             complex-single-float-size
-                             node)
-       (inst movq (ea-for-csf-data-desc y) x))))
+     (fixed-alloc y complex-single-float-widetag complex-single-float-size node)
+     (inst movlps (ea-for-csf-data-desc y) x)))
 (define-move-vop move-from-complex-single :move
   (complex-single-reg) (descriptor-reg))
 
@@ -254,11 +239,8 @@
   (:node-var node)
   (:note "complex float to pointer coercion")
   (:generator 13
-     (with-fixed-allocation (y
-                             complex-double-float-widetag
-                             complex-double-float-size
-                             node)
-       (inst movapd (ea-for-cdf-data-desc y) x))))
+     (fixed-alloc y complex-double-float-widetag complex-double-float-size node)
+     (inst movapd (ea-for-cdf-data-desc y) x)))
 (define-move-vop move-from-complex-double :move
   (complex-double-reg) (descriptor-reg))
 
@@ -272,6 +254,10 @@
                   (:generator 2
                     ,(ecase format
                       (:single
+                       ;; Use an integer move since there's no better choice.
+                       ;; - movaps moves 128 bits of data, which is wrong.
+                       ;; - movsd moves 64 bits as one double-float
+                       ;; - movlps moves 64 bits, but doesn't zero the upper bits
                          '(inst movq y (ea-for-csf-data-desc x)))
                       (:double
                          '(inst movapd y (ea-for-cdf-data-desc x))))))
@@ -300,13 +286,11 @@
                       (,stack-sc
                        (if (= (tn-offset fp) esp-offset)
                            (let* ((offset (* (tn-offset y) n-word-bytes))
-                                  (ea (make-ea :dword :base fp :disp offset)))
+                                  (ea (ea offset fp)))
                              ,@(ecase format
                                       (:single '((inst movss ea x)))
                                       (:double '((inst movsd ea x)))))
-                           (let ((ea (make-ea
-                                      :dword :base fp
-                                      :disp (frame-byte-offset (tn-offset y)))))
+                           (let ((ea (ea (frame-byte-offset (tn-offset y)) fp)))
                              ,@(ecase format
                                  (:single '((inst movss ea x)))
                                  (:double '((inst movsd ea x))))))))))
@@ -400,7 +384,7 @@
                              ((eq (tn-kind arg) :constant)
                               (tn-value arg))
                              (t
-                              (make-sc-offset (sc-number (tn-sc arg))
+                              (make-sc+offset (sc-number (tn-sc arg))
                                               (or (tn-offset arg) 0))))))))
     (note-this-location vop :internal-error)))
 
@@ -912,7 +896,7 @@
                             :target mask))
                   (:arg-types ,type ,type)
                   (:temporary (:sc ,sc :from :eval) mask)
-                  (:temporary (:sc dword-reg) bits)
+                  (:temporary (:sc unsigned-reg) bits)
                   (:conditional :e)
                   (:generator ,cost
                     (when (location= y mask)
@@ -922,8 +906,7 @@
                       (setf y (register-inline-constant :aligned (tn-value y))))
                     (inst pcmpeqd mask y)
                     (inst movmskps bits mask)
-                    (inst cmp (if (location= bits eax-tn) al-tn bits)
-                          #b1111)))))
+                    (inst cmp :byte bits #b1111)))))
   (define-float-eql eql/single-float 4
     single-reg fp-single-immediate single-float)
   (define-float-eql eql/double-float 4
@@ -971,8 +954,7 @@
   (:vop-var vop)
   (:generator 3
     (when (or (location= y xmm)
-              (and (not (xmm-register-p x))
-                   (xmm-register-p y)))
+              (and (not (xmm-tn-p x)) (xmm-tn-p y)))
       (rotatef x y))
     (sc-case x
       (single-reg (setf xmm x))
@@ -1004,8 +986,7 @@
   (:vop-var vop)
   (:generator 3
     (when (or (location= y xmm)
-              (and (not (xmm-register-p x))
-                   (xmm-register-p y)))
+              (and (not (xmm-tn-p x)) (xmm-tn-p y)))
       (rotatef x y))
     (sc-case x
       (double-reg
@@ -1043,7 +1024,7 @@
                               :load-if (not (sc-is y ,complex-constant-sc))))
                     (:arg-types ,complex-type ,complex-type)
                     (:temporary (:sc ,complex-sc :from :eval) cmp)
-                    (:temporary (:sc dword-reg) bits)
+                    (:temporary (:sc unsigned-reg) bits)
                     (:info)
                     (:conditional :e)
                     (:generator 3
@@ -1063,8 +1044,7 @@
                         (setf y (register-inline-constant :aligned (tn-value y))))
                       (inst ,cmp-inst :eq cmp y)
                       (inst ,mask-inst bits cmp)
-                      (inst cmp (if (location= bits eax-tn) al-tn bits)
-                            ,mask)))
+                      (inst cmp :byte bits ,mask)))
                   (define-vop (,complex-real-name ,complex-complex-name)
                     (:args (x :scs (,complex-sc ,complex-constant-sc)
                               :target cmp
@@ -1122,7 +1102,9 @@
                         (t))
                       (inst comiss x y))))))
   (define-</> < <single-float <double-float not :p :nc)
-  (define-</> > >single-float >double-float not :p :na))
+  (define-</> > >single-float >double-float not :p :na)
+  (define-</> <= <=single-float <=double-float not :p :a)
+  (define-</> >= >=single-float >=double-float not :p :b))
 
 
 ;;;; conversion
@@ -1229,11 +1211,10 @@
        (single-reg
         (sc-case bits
           (signed-reg
-           (inst movd res (reg-in-size bits :dword)))
+           (inst movd res bits))
           (signed-stack
            (inst movss res
-                 (make-ea :dword :base rbp-tn
-                          :disp (frame-byte-offset (tn-offset bits))))))))))
+                 (ea (frame-byte-offset (tn-offset bits)) rbp-tn))))))))
 
 (define-vop (make-single-float-c)
   (:results (res :scs (single-reg single-stack descriptor-reg)))
@@ -1263,11 +1244,24 @@
   (:translate make-double-float)
   (:policy :fast-safe)
   (:vop-var vop)
-  (:generator 2
+  (:generator 4
     (move temp hi-bits)
     (inst shl temp 32)
     (inst or temp lo-bits)
-    (inst movd res temp)))
+    (inst movq res temp)))
+(define-vop (make-double-float/sse4) ; 2 instructions and no temp
+  (:args (hi-bits :scs (signed-reg))
+         (lo-bits :scs (unsigned-reg)))
+  (:results (res :scs (double-reg)))
+  (:arg-types signed-num unsigned-num)
+  (:result-types double-float)
+  (:translate make-double-float)
+  (:policy :fast-safe)
+  (:vop-var vop)
+  (:guard (member :sse4 *backend-subfeatures*))
+  (:generator 2
+    (inst movd res lo-bits)
+    (inst pinsrd res hi-bits 1)))
 
 (define-vop (make-double-float-c)
   (:results (res :scs (double-reg)))
@@ -1291,66 +1285,108 @@
   (:generator 4
      (sc-case float
        (single-reg
-        (let ((dword-bits (reg-in-size bits :dword)))
-          (inst movd dword-bits float)
-          (inst movsxd bits dword-bits)))
-       (single-stack
-        (inst movsxd bits (make-ea :dword ; c.f. ea-for-sf-stack
-                                   :base rbp-tn
-                                   :disp (frame-byte-offset (tn-offset float)))))
+        (inst movd bits float)
+        (inst movsx '(:dword :qword) bits bits))
+       (single-stack ; c.f. ea-for-sf-stack
+        (inst movsx '(:dword :qword)
+              bits (ea (frame-byte-offset (tn-offset float)) rbp-tn)))
        (descriptor-reg
         (move bits float)
         (inst sar bits 32)))))
+
+(define-vop (single-float-sign)
+  (:translate single-float-sign)
+  (:args (float :scs (descriptor-reg)))
+  (:arg-types single-float)
+  (:results (res :scs (descriptor-reg)))
+  (:policy :fast-safe)
+  (:generator 3
+    (move res float)
+    ;; preserve only the sign bit and widetag
+    (inst and res (constantize (ash #x80000000 32)))
+    ;; set the bits of corresponding to 1.0f0
+    (inst or  res (constantize (logior (ash #x3F800000 32)
+                                       single-float-widetag)))))
+;;; Return Y with its sign changed to that of X.
+;;; The arguments match FLOAT-SIGN which is the opposite of C's copysign().
+(define-vop (single-float-copysign)
+  (:translate single-float-copysign)
+  (:args (x :scs (descriptor-reg))
+         (y :scs (descriptor-reg)))
+  (:arg-types single-float single-float)
+  (:results (res :scs (descriptor-reg)))
+  (:temporary (:sc unsigned-reg :from (:argument 0)) temp)
+  (:policy :fast-safe)
+  (:generator 3
+    (move temp x)
+    (move res y)
+    (inst shl res 1)   ; discard result's sign bit
+    (inst shl temp 1)  ; copy X's sign bit into the carry flag
+    (inst rcr res 1))) ; rotate carry into the result
+
+(define-vop (double-float-bits)
+  (:args (float :scs (double-reg descriptor-reg)
+                :load-if (not (sc-is float double-stack))))
+  (:results (bits :scs (signed-reg)))
+  (:arg-types double-float)
+  (:result-types signed-num)
+  (:translate double-float-bits)
+  (:policy :fast-safe)
+  (:generator 5
+     (sc-case float
+       (double-reg
+        (inst movq bits float))
+       (double-stack
+        (inst mov bits (ea (frame-byte-offset (tn-offset float)) rbp-tn)))
+       (descriptor-reg
+        (inst mov bits (ea (- (ash double-float-value-slot word-shift)
+                              other-pointer-lowtag)
+                           float))))))
 
 (define-vop (double-float-high-bits)
   (:args (float :scs (double-reg descriptor-reg)
                 :load-if (not (sc-is float double-stack))))
   (:results (hi-bits :scs (signed-reg)))
-  (:temporary (:sc signed-stack :from :argument :to :result) temp)
   (:arg-types double-float)
   (:result-types signed-num)
   (:translate double-float-high-bits)
   (:policy :fast-safe)
-  (:vop-var vop)
   (:generator 5
      (sc-case float
        (double-reg
-        (inst movsd temp float)
-        (move hi-bits temp))
+        (inst movq hi-bits float)
+        (inst sar hi-bits 32))
        (double-stack
-        (loadw hi-bits ebp-tn (frame-word-offset (tn-offset float))))
+        (inst movsx '(:dword :qword) hi-bits
+              (ea (+ 4 (frame-byte-offset (tn-offset float))) rbp-tn)))
        (descriptor-reg
-        (loadw hi-bits float double-float-value-slot
-               other-pointer-lowtag)))
-     (inst sar hi-bits 32)))
+        (inst movsx '(:dword :qword) hi-bits
+              (ea (+ 4 (ash double-float-value-slot word-shift)
+                       (- other-pointer-lowtag))
+                  float))))))
 
 (define-vop (double-float-low-bits)
   (:args (float :scs (double-reg descriptor-reg)
                 :load-if (not (sc-is float double-stack))))
   (:results (lo-bits :scs (unsigned-reg)))
-  (:temporary (:sc signed-stack :from :argument :to :result) temp)
   (:arg-types double-float)
   (:result-types unsigned-num)
   (:translate double-float-low-bits)
   (:policy :fast-safe)
-  (:vop-var vop)
   (:generator 5
-     (let ((dword-lo-bits (reg-in-size lo-bits :dword)))
-       (sc-case float
+     (sc-case float
         (double-reg
-         (inst movsd temp float)
-         (inst mov dword-lo-bits
-               (make-ea :dword :base rbp-tn
-                        :disp (frame-byte-offset (tn-offset temp)))))
+         ;; It might be more technically correct to use MOVQ followed by zeroing
+         ;; the high 32 bits of the GPR with "MOV :dword lo-bits lo-bits",
+         ;; but we know that MOVD moves exactly the right bits.
+         (inst movd lo-bits float))
         (double-stack
-         (inst mov dword-lo-bits
-               (make-ea :dword :base rbp-tn
-                        :disp (frame-byte-offset (tn-offset float)))))
+         (inst mov :dword lo-bits
+               (ea (frame-byte-offset (tn-offset float)) rbp-tn)))
         (descriptor-reg
-         (inst mov dword-lo-bits
-               (make-ea-for-object-slot-half float double-float-value-slot
-                                             other-pointer-lowtag)))))))
-
+         (inst mov :dword lo-bits
+               (make-ea-for-object-slot float double-float-value-slot
+                                        other-pointer-lowtag))))))
 
 
 ;;;; complex float VOPs
@@ -1513,7 +1549,7 @@
 (defknown swap-complex ((complex float)) (complex float)
     (foldable flushable movable always-translatable))
 (defoptimizer (swap-complex derive-type) ((x))
-  (sb!c::lvar-type x))
+  (sb-c::lvar-type x))
 (defun swap-complex (x)
   (complex (imagpart x) (realpart x)))
 (define-vop (swap-complex-single-float)

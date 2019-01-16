@@ -36,9 +36,9 @@
 #include "thread.h"
 #include "arch.h"
 #include "pseudo-atomic.h"
-
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
+#include "immobile-space.h"
 
 #ifdef LISP_FEATURE_SB_CORE_COMPRESSION
 # include <zlib.h>
@@ -46,26 +46,21 @@
 
 #define GENERAL_WRITE_FAILURE_MSG "error writing to core file"
 
-/* write_runtime_options uses a simple serialization scheme that
- * consists of one word of magic, one word indicating whether options
- * are actually saved, and one word per struct field. */
+/* write_memsize_options uses a simple serialization scheme that
+ * consists of one word of magic, one word indicating the size of the
+ * core entry, and one word per struct field. */
 static void
-write_runtime_options(FILE *file, struct runtime_options *options)
+write_memsize_options(FILE *file)
 {
-    size_t optarray[RUNTIME_OPTIONS_WORDS];
-
-    memset(&optarray, 0, sizeof(optarray));
-    optarray[0] = RUNTIME_OPTIONS_MAGIC;
-
-    if (options != NULL) {
-        /* optarray[1] is a flag indicating that options are present */
-        optarray[1] = 1;
-        optarray[2] = options->dynamic_space_size;
-        optarray[3] = options->thread_control_stack_size;
-    }
+    core_entry_elt_t optarray[RUNTIME_OPTIONS_WORDS] = {
+      RUNTIME_OPTIONS_MAGIC,
+      4, // number of words in this core header entry
+      dynamic_space_size,
+      thread_control_stack_size
+    };
 
     if (RUNTIME_OPTIONS_WORDS !=
-        fwrite(optarray, sizeof(size_t), RUNTIME_OPTIONS_WORDS, file)) {
+        fwrite(optarray, sizeof(core_entry_elt_t), RUNTIME_OPTIONS_WORDS, file)) {
         perror("Error writing runtime options to file");
     }
 }
@@ -148,13 +143,10 @@ write_bytes_to_file(FILE * file, char *addr, long bytes, int compression)
 };
 
 
-static long
-write_and_compress_bytes(FILE *file, char *addr, long bytes, os_vm_offset_t file_offset,
-                         int compression)
+static long write_bytes(FILE *file, char *addr, long bytes,
+                        os_vm_offset_t file_offset, int compression)
 {
     long here, data;
-
-    bytes = (bytes+os_vm_page_size-1)&~(os_vm_page_size-1);
 
 #ifdef LISP_FEATURE_WIN32
     long count;
@@ -167,21 +159,12 @@ write_and_compress_bytes(FILE *file, char *addr, long bytes, os_vm_offset_t file
     fflush(file);
     here = ftell(file);
     fseek(file, 0, SEEK_END);
-    data = (ftell(file)+os_vm_page_size-1)&~(os_vm_page_size-1);
+    data = ALIGN_UP(ftell(file), os_vm_page_size);
     fseek(file, data, SEEK_SET);
     write_bytes_to_file(file, addr, bytes, compression);
     fseek(file, here, SEEK_SET);
     return ((data - file_offset) / os_vm_page_size) - 1;
 }
-
-static long __attribute__((__unused__))
-write_bytes(FILE *file, char *addr, long bytes, os_vm_offset_t file_offset)
-{
-    return write_and_compress_bytes(file, addr, bytes, file_offset,
-                                    COMPRESSION_LEVEL_NONE);
-}
-
-extern struct lisp_startup_options lisp_startup_options;
 
 static void
 output_space(FILE *file, int id, lispobj *addr, lispobj *end,
@@ -206,15 +189,15 @@ output_space(FILE *file, int id, lispobj *addr, lispobj *end,
         printf("writing %lu bytes from the %s space at %p\n",
                (long unsigned)bytes, names[id], addr);
 
-    data = write_and_compress_bytes(file, (char *)addr, bytes, file_offset,
-                                    core_compression_level);
+    data = write_bytes(file, (char *)addr, ALIGN_UP(bytes, os_vm_page_size),
+                       file_offset, core_compression_level);
 
     write_lispobj(data, file);
-    write_lispobj((uword_t)addr / 1024, file); // units as per core.h
+    write_lispobj((uword_t)addr, file);
     write_lispobj((bytes + os_vm_page_size - 1) / os_vm_page_size, file);
 }
 
-FILE *
+static FILE *
 open_core_for_saving(char *filename)
 {
     /* Open the output file. We don't actually need the file yet, but
@@ -224,34 +207,10 @@ open_core_for_saving(char *filename)
     return fopen(filename, "wb");
 }
 
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-extern void prepare_immobile_space_for_save();
-#  define N_SPACES_TO_SAVE 5
-#  ifdef LISP_FEATURE_IMMOBILE_CODE
-lispobj code_component_order;
-extern void defrag_immobile_space(lispobj,boolean);
-#  endif
-#else
-#  define N_SPACES_TO_SAVE 3
-#endif
-boolean
-save_to_filehandle(FILE *file, char *filename, lispobj init_function,
-                   boolean make_executable,
-                   boolean save_runtime_options,
-                   int core_compression_level)
+void unwind_binding_stack()
 {
-    struct thread *th = all_threads;
-    os_vm_offset_t core_start_pos;
     boolean verbose = !lisp_startup_options.noinform;
-
-    // Since SB-IMPL::DEINIT already checked for exactly 1 thread,
-    // losing here probably can't happen.
-    if (th->next)
-        lose("Can't save image with more than one executing thread");
-
-#ifdef LISP_FEATURE_X86_64
-    untune_asm_routines_for_microarch();
-#endif
+    struct thread *th = all_threads;
 
     /* Smash the enclosing state. (Once we do this, there's no good
      * way to go back, which is a sufficient reason that this ends up
@@ -264,22 +223,15 @@ save_to_filehandle(FILE *file, char *filename, lispobj init_function,
     write_TLS(CURRENT_CATCH_BLOCK, 0, th); // If set to 0 on start, why here too?
     write_TLS(CURRENT_UNWIND_PROTECT_BLOCK, 0, th);
     if (verbose) printf("done]\n");
-#ifdef LISP_FEATURE_IMMOBILE_CODE
-    // It's better to wait to defrag until after the binding stack is undone,
-    // because we explicitly don't fixup code refs from stacks.
-    // i.e. if there *were* something on the binding stack that cared that code
-    // moved, it would be wrong. This way we can be sure we don't care.
-    if (code_component_order) {
-        // Assert that defrag will not move the init_function
-        gc_assert(!immobile_space_p(init_function));
-        if (verbose) {
-            printf("[defragmenting immobile space... ");
-            fflush(stdout);
-        }
-        defrag_immobile_space(code_component_order, verbose);
-        if (verbose) printf("done]\n");
-    }
-#endif
+}
+
+boolean
+save_to_filehandle(FILE *file, char *filename, lispobj init_function,
+                   boolean make_executable,
+                   boolean save_runtime_options,
+                   int core_compression_level)
+{
+    boolean verbose = !lisp_startup_options.noinform;
 
     /* (Now we can actually start copying ourselves into the output file.) */
 
@@ -288,11 +240,18 @@ save_to_filehandle(FILE *file, char *filename, lispobj init_function,
         fflush(stdout);
     }
 
-    core_start_pos = ftell(file);
+    os_vm_offset_t core_start_pos = ftell(file);
     write_lispobj(CORE_MAGIC, file);
 
+    /* If 'save_runtime_options' is specified then the saved thread stack size
+     * and dynamic space size are used in the restarted image and
+     * all command-line arguments are available to Lisp in SB-EXT:*POSIX-ARGV*.
+     * Otherwise command-line processing is performed as normal */
+    if (save_runtime_options)
+        write_memsize_options(file);
+
     int stringlen = strlen((const char *)build_id);
-    int string_words = CEILING(stringlen, sizeof (core_entry_elt_t))
+    int string_words = ALIGN_UP(stringlen, sizeof (core_entry_elt_t))
         / sizeof (core_entry_elt_t);
     int pad = string_words * sizeof (core_entry_elt_t) - stringlen;
     /* Write 3 word entry header: a word for entry-type-code, a word for
@@ -306,10 +265,10 @@ save_to_filehandle(FILE *file, char *filename, lispobj init_function,
     if (nwrote != (int)(sizeof (core_entry_elt_t) * string_words))
         perror(GENERAL_WRITE_FAILURE_MSG);
 
-    write_lispobj(NEW_DIRECTORY_CORE_ENTRY_TYPE_CODE, file);
+    write_lispobj(DIRECTORY_CORE_ENTRY_TYPE_CODE, file);
     write_lispobj(/* (word count = N spaces described by 5 words each, plus the
           * entry type code, plus this count itself) */
-         (5*N_SPACES_TO_SAVE)+2, file);
+         (5 * MAX_CORE_SPACE_ID) + 2, file);
     output_space(file,
                  READ_ONLY_CORE_SPACE_ID,
                  (lispobj *)READ_ONLY_SPACE_START,
@@ -322,32 +281,30 @@ save_to_filehandle(FILE *file, char *filename, lispobj init_function,
                  static_space_free_pointer,
                  core_start_pos,
                  core_compression_level);
-#ifdef LISP_FEATURE_GENCGC
-    /* Flush the current_region, updating the tables. */
-    gc_alloc_update_all_page_tables(1);
-    update_dynamic_space_free_pointer();
-#endif
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-    prepare_immobile_space_for_save();
-    output_space(file,
-                 IMMOBILE_FIXEDOBJ_CORE_SPACE_ID,
-                 (lispobj *)IMMOBILE_SPACE_START,
-                 immobile_fixedobj_free_pointer,
-                 core_start_pos,
-                 core_compression_level);
-    output_space(file,
-                 IMMOBILE_VARYOBJ_CORE_SPACE_ID,
-                 (lispobj *)IMMOBILE_VARYOBJ_SUBSPACE_START,
-                 immobile_space_free_pointer,
-                 core_start_pos,
-                 core_compression_level);
-#endif
     output_space(file,
                  DYNAMIC_CORE_SPACE_ID,
                  current_dynamic_space,
                  (lispobj *)get_alloc_pointer(),
                  core_start_pos,
                  core_compression_level);
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    output_space(file,
+                 IMMOBILE_FIXEDOBJ_CORE_SPACE_ID,
+                 (lispobj *)FIXEDOBJ_SPACE_START,
+                 fixedobj_free_pointer,
+                 core_start_pos,
+                 core_compression_level);
+    // Leave this space for last! Things are easier when splitting a core into
+    // code and non-code if we don't have to compensate for removal of pages.
+    // i.e. if code resided between dynamic and fixedobj space, then dynamic
+    // space would need to have it pages renumbered when code is pulled out.
+    output_space(file,
+                 IMMOBILE_VARYOBJ_CORE_SPACE_ID,
+                 (lispobj *)VARYOBJ_SPACE_START,
+                 varyobj_free_pointer,
+                 core_start_pos,
+                 core_compression_level);
+#endif
 
     write_lispobj(INITIAL_FUN_CORE_ENTRY_TYPE_CODE, file);
     write_lispobj(3, file);
@@ -355,27 +312,20 @@ save_to_filehandle(FILE *file, char *filename, lispobj init_function,
 
 #ifdef LISP_FEATURE_GENCGC
     {
-        size_t true_size = sizeof last_free_page
-            + (last_free_page * sizeof(struct corefile_pte));
-        size_t rounded_size = CEILING(true_size, os_vm_page_size);
-        char* data = successful_malloc(rounded_size);
-        *(page_index_t*)data = last_free_page;
-        struct corefile_pte *ptes = (struct corefile_pte*)(data + sizeof(page_index_t));
-        page_index_t i;
-        for (i = 0; i < last_free_page; i++) {
-                /* Thanks to alignment requirements, the two low bits
-                 * are always zero, so we can use them to store the
-                 * allocation type -- region is always closed, so only
-                 * the two low bits of allocation flags matter. */
-                uword_t word = page_scan_start_offset(i);
-                gc_assert((word & 0x03) == 0);
-                ptes[i].sso = word | (0x03 & page_table[i].allocated);
-                ptes[i].bytes_used = page_bytes_used(i);
-        }
+        extern void gc_store_corefile_ptes(struct corefile_pte*);
+        size_t true_size = next_free_page * sizeof(struct corefile_pte);
+        size_t aligned_size = ALIGN_UP(true_size, N_WORD_BYTES);
+        char* data = successful_malloc(aligned_size);
+        // Zeroize the final few bytes of data that get written out
+        // but might be untouched by gc_store_corefile_ptes().
+        memset(data + aligned_size - N_WORD_BYTES, 0, N_WORD_BYTES);
+        gc_store_corefile_ptes((struct corefile_pte*)data);
         write_lispobj(PAGE_TABLE_CORE_ENTRY_TYPE_CODE, file);
-        write_lispobj(4, file);
-        write_lispobj(rounded_size, file);
-        sword_t offset = write_bytes(file, data, rounded_size, core_start_pos);
+        write_lispobj(5, file); // 5 = # of words in this core header entry
+        write_lispobj(next_free_page, file);
+        write_lispobj(aligned_size, file);
+        sword_t offset = write_bytes(file, data, aligned_size, core_start_pos,
+                                     COMPRESSION_LEVEL_NONE);
         write_lispobj(offset, file);
     }
 #endif
@@ -386,14 +336,6 @@ save_to_filehandle(FILE *file, char *filename, lispobj init_function,
      * This is used to locate the start of the core when the runtime is
      * prepended to it. */
     fseek(file, 0, SEEK_END);
-
-    /* If NULL runtime options are passed to write_runtime_options,
-     * command-line processing is performed as normal in the SBCL
-     * executable. Otherwise, the saved runtime options are used and
-     * all command-line arguments are available to Lisp in
-     * SB-EXT:*POSIX-ARGV*. */
-    write_runtime_options(file,
-                          (save_runtime_options ? runtime_options : NULL));
 
     if (1 != fwrite(&core_start_pos, sizeof(os_vm_offset_t), 1, file)) {
         perror("Error writing core starting position to file");
@@ -411,11 +353,10 @@ save_to_filehandle(FILE *file, char *filename, lispobj init_function,
     if (verbose) printf("done]\n");
     exit(0);
 }
-#undef N_SPACES_TO_SAVE
 
 /* Check if the build_id for the current runtime is present in a
  * buffer. */
-int
+static int
 check_runtime_build_id(void *buf, size_t size)
 {
     size_t idlen;
@@ -436,7 +377,7 @@ check_runtime_build_id(void *buf, size_t size)
  * and return it.  Places the size in bytes of the runtime into
  * 'size_out'.  Returns NULL if the runtime cannot be loaded from
  * 'runtime_path'. */
-void *
+static void *
 load_runtime(char *runtime_path, size_t *size_out)
 {
     void *buf = NULL;
@@ -444,7 +385,7 @@ load_runtime(char *runtime_path, size_t *size_out)
     size_t size, count;
     os_vm_offset_t core_offset;
 
-    core_offset = search_for_embedded_core (runtime_path);
+    core_offset = search_for_embedded_core (runtime_path, 0);
     if ((input = fopen(runtime_path, "rb")) == NULL) {
         fprintf(stderr, "Unable to open runtime: %s\n", runtime_path);
         goto lose;
@@ -483,7 +424,7 @@ lose:
 
 boolean
 save_runtime_to_filehandle(FILE *output, void *runtime, size_t runtime_size,
-                           int application_type)
+                           int __attribute__((unused)) application_type)
 {
     size_t padding;
     void *padbytes;
@@ -537,6 +478,14 @@ prepare_to_save(char *filename, boolean prepend_runtime, void **runtime_bytes,
 {
     FILE *file;
     char *runtime_path;
+    extern char *saved_runtime_path; // path computed from argv[0]
+
+    // SB-IMPL::DEINIT already checked for exactly 1 thread,
+    // so this really shouldn't happen.
+    if (all_threads->next) {
+        fprintf(stderr, "Can't save image with more than one executing thread");
+        return NULL;
+    }
 
     if (prepend_runtime) {
         runtime_path = os_get_runtime_executable_path(0);
@@ -584,6 +533,11 @@ save(char *filename, lispobj init_function, boolean prepend_runtime,
     if (prepend_runtime)
         save_runtime_to_filehandle(file, runtime_bytes, runtime_size, application_type);
 
+    /* This unwinding is necessary for proper restoration of the
+     * symbol-value slots to their toplevel values, but it occurs
+     * too late to remove old references from the binding stack.
+     * There's probably no safe way to do that from Lisp */
+    unwind_binding_stack();
     return save_to_filehandle(file, filename, init_function, prepend_runtime,
                               save_runtime_options,
                               compressed ? compressed : COMPRESSION_LEVEL_NONE);

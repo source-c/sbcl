@@ -10,18 +10,17 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!ARM-ASM")
+(in-package "SB-ARM-ASM")
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   ;; Imports from this package into SB-VM
   (import '(conditional-opcode emit-word
             composite-immediate-instruction encodable-immediate
-            lsl lsr asr ror cpsr @) "SB!VM")
+            lsl lsr asr ror cpsr @) "SB-VM")
   ;; Imports from SB-VM into this package
-  (import '(sb!vm::nil-value sb!vm::registers sb!vm::null-tn sb!vm::null-offset
-            sb!vm::pc-tn sb!vm::pc-offset sb!vm::code-offset)))
+  (import '(sb-vm::nil-value sb-vm::registers sb-vm::null-tn sb-vm::null-offset
+            sb-vm::pc-tn sb-vm::pc-offset sb-vm::code-offset)))
 
-(setf *disassem-inst-alignment-bytes* 4)
 
 
 (defconstant-eqx +conditions+
@@ -41,17 +40,12 @@
     (:le . 13)
     (:al . 14))
   #'equal)
-(defconstant-eqx sb!vm::+condition-name-vec+
+(defconstant-eqx sb-vm::+condition-name-vec+
   #.(let ((vec (make-array 16 :initial-element nil)))
       (dolist (cond +conditions+ vec)
         (when (null (aref vec (cdr cond)))
           (setf (aref vec (cdr cond)) (car cond)))))
   #'equalp)
-
-;;; Set assembler parameters. (In CMU CL, this was done with
-;;; a call to a macro DEF-ASSEMBLER-PARAMS.)
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (setf sb!assem:*assem-scheduler-p* nil))
 
 (defun conditional-opcode (condition)
   (cdr (assoc condition +conditions+ :test #'eq)))
@@ -323,28 +317,6 @@
 (define-bitfield-emitter emit-word 32
   (byte 32 0))
 
-;;;; fixup emitters
-#|
-(defun emit-absolute-fixup (segment fixup)
-  (note-fixup segment :absolute fixup)
-  (let ((offset (fixup-offset fixup)))
-    (if (label-p offset)
-        (emit-back-patch segment
-                         4 ; FIXME: n-word-bytes
-                         (lambda (segment posn)
-                           (declare (ignore posn))
-                           (emit-dword segment
-                                       (- (+ (component-header-length)
-                                             (or (label-position offset)
-                                                 0))
-                                          other-pointer-lowtag))))
-        (emit-dword segment (or offset 0)))))
-
-(defun emit-relative-fixup (segment fixup)
-  (note-fixup segment :relative fixup)
-  (emit-dword segment (or (fixup-offset fixup) 0)))
-|#
-
 ;;;; miscellaneous hackery
 
 (defun register-p (thing)
@@ -512,9 +484,9 @@
   (max 0 (1- (integer-length (logand integer-value (- integer-value))))))
 
 ;; FIXME: it would be idiomatic to use (DEFINE-INSTRUCTION-MACRO COMPOSITE ...)
-;; instead of exporting another instruction-generating macro into SB!VM.
+;; instead of exporting another instruction-generating macro into SB-VM.
 ;; An invocation would resemble (INST COMPOSITE {ADD|SUB|whatever| ARGS ...)
-(defmacro composite-immediate-instruction (op r x y &key fixnumize neg-op invert-y invert-r single-op-op first-op first-no-source)
+(defmacro composite-immediate-instruction (op r x y &key fixnumize neg-op invert-y invert-r single-op-op first-op first-no-source temporary)
   ;; Successively applies 8-bit wide chunks of Y to X using OP storing the result in R.
   ;;
   ;; If FIXNUMIZE is true, Y is fixnumized before being used.
@@ -526,17 +498,22 @@
   ;; it is used for a single operation instead of OP.
   ;; If FIRST-OP is given, it is used in the first iteration instead of OP.
   ;; If FIRST-NO-SOURCE is given, there will be ne source register (X) in the first iteration.
+  ;; If TEMPORARY is given, it should be a non-descriptor register
+  ;; used for the accumulation of a temporary non-descriptor.  Only makes sense with INVERT-R
+  (when temporary
+    (aver invert-r))
   (let ((bytespec (gensym "bytespec"))
         (value (gensym "value"))
-        (transformed (gensym "transformed")))
+        (transformed (gensym "transformed"))
+        (acc (gensym "acc")))
     (labels ((instruction (source-reg op neg-op &optional no-source)
                `(,@(if neg-op
                         `((if (< ,y 0)
-                              (inst ,neg-op ,r ,@(when (not no-source)`(,source-reg))
+                              (inst ,neg-op ,acc ,@(when (not no-source)`(,source-reg))
                                     (mask-field ,bytespec ,value))
-                              (inst ,op ,r ,@(when (not no-source) `(,source-reg))
+                              (inst ,op ,acc ,@(when (not no-source) `(,source-reg))
                                     (mask-field ,bytespec ,value))))
-                        `((inst ,op ,r ,@(when (not no-source) `(,source-reg))
+                        `((inst ,op ,acc ,@(when (not no-source) `(,source-reg))
                                 (mask-field ,bytespec ,value))))
                   (setf (ldb ,bytespec ,value) 0)))
              (composite ()
@@ -545,9 +522,9 @@
                   (do ((,bytespec (byte 8 (logandc1 1 (lowest-set-bit-index ,value)))
                                   (byte 8 (logandc1 1 (lowest-set-bit-index ,value)))))
                       ((zerop ,value))
-                    ,@(instruction r op neg-op)
-                    ,@(when invert-r
-                            `((inst mvn ,r ,r)))))))
+                    ,@(instruction acc op neg-op))
+                  ,@(when invert-r
+                      `((inst mvn ,r ,acc))))))
       `(let* ((,transformed ,(if fixnumize
                                  `(fixnumize ,y)
                                  `,y))
@@ -556,13 +533,12 @@
                                  `((if (< ,transformed 0) (- ,transformed) ,transformed))
                                  (if invert-y
                                      `((lognot ,transformed))
-                                     `(,transformed))))))
+                                   `(,transformed)))))
+              (,acc (or ,temporary ,r)))
          ,@(if single-op-op
-              `((handler-case
-                    (progn
-                      (inst ,single-op-op ,r ,x ,transformed))
-                  (cannot-encode-immediate-operand ()
-                    ,@(composite))))
+              `((if (encodable-immediate ,transformed)
+                    (inst ,single-op-op ,r ,x ,transformed)
+                    (progn ,@(composite))))
               (composite))))))
 
 
@@ -1188,7 +1164,7 @@
         ;; And finally we use the header value (a count in words),
         ;; plus the fact that the top two bits of the widetag are
         ;; clear (SIMPLE-FUN-WIDETAG is #x2A and
-        ;; RETURN-PC-HEADER-WIDETAG is #x36) to compute the boxed
+        ;; RETURN-PC-WIDETAG is #x36) to compute the boxed
         ;; address of the code component.
         (inst sub code lip (lsr temp (- 8 word-shift))))))))
 
@@ -1247,14 +1223,16 @@
                   (load-chunk segment delta
                               dest pc-tn absolute-delta))))
 
-            (two-instruction-maybe-shrink (segment posn magic-value)
+            (two-instruction-maybe-shrink (segment chooser posn magic-value)
+              (declare (ignore chooser))
               (let ((delta (compute-delta posn magic-value)))
                 (when (<= (integer-length delta) 8)
                   (emit-back-patch segment 4
                                    #'one-instruction-emitter)
                   t)))
 
-            (three-instruction-maybe-shrink (segment posn magic-value)
+            (three-instruction-maybe-shrink (segment chooser posn magic-value)
+              (declare (ignore chooser))
               (let ((delta (compute-delta posn magic-value)))
                 (when (<= (integer-length delta) 16)
                   (emit-chooser segment 8 2
@@ -1309,7 +1287,8 @@
                   (assemble (segment vop)
                     (inst ldr condition dest (@ pc-tn delta)))))
 
-              (two-instruction-maybe-shrink (segment posn magic-value)
+              (two-instruction-maybe-shrink (segment chooser posn magic-value)
+                (declare (ignore chooser))
                 (let ((delta (compute-delta posn magic-value)))
                   (when (<= (integer-length delta) 12)
                     (emit-back-patch segment 4

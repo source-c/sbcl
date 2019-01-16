@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; Return the maximum number of bits an integer of the supplied type
 ;;; can take up, or NIL if it is unbounded. The second (third) value
@@ -173,6 +173,34 @@
                   (specifier-type `(signed-byte ,(1+ (max x-len y-len))))
                   ;; We can't tell squat about the result.
                   (specifier-type 'integer)))))))
+
+(defun make-modular-fun-type-deriver (prototype kind width signedp)
+  (declare (ignore kind))
+  #!-sb-fluid
+  (binding* ((info (info :function :info prototype) :exit-if-null)
+             (fun (fun-info-derive-type info) :exit-if-null)
+             (mask-type (specifier-type
+                         (ecase signedp
+                             ((nil) (let ((mask (1- (ash 1 width))))
+                                      `(integer ,mask ,mask)))
+                             ((t) `(signed-byte ,width))))))
+    (lambda (call)
+      (let ((res (funcall fun call)))
+        (when res
+          (if (eq signedp nil)
+              (logand-derive-type-aux res mask-type))))))
+  #!+sb-fluid
+  (lambda (call)
+    (binding* ((info (info :function :info prototype) :exit-if-null)
+               (fun (fun-info-derive-type info) :exit-if-null)
+               (res (funcall fun call) :exit-if-null)
+               (mask-type (specifier-type
+                           (ecase signedp
+                             ((nil) (let ((mask (1- (ash 1 width))))
+                                      `(integer ,mask ,mask)))
+                             ((t) `(signed-byte ,width))))))
+      (if (eq signedp nil)
+          (logand-derive-type-aux res mask-type)))))
 
 (defun logior-derive-unsigned-bounds (x y)
   (let* ((a (numeric-type-low x))

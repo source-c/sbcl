@@ -19,46 +19,26 @@
   (:use "CL"))
 (in-package "SB-COLD")
 
+(sb-ext:unlock-package "CL")
+(rename-package "COMMON-LISP" "COMMON-LISP"
+                (cons "SB-XC" (package-nicknames "CL")))
+;; Unlock all other SB- packages
+(dolist (package (list-all-packages))
+  (let ((name (package-name package)))
+    (when (eql (mismatch name "SB-") 3)
+      (sb-ext:unlock-package package))))
+
 ;;; We need the #! readtable modifications.
 (load (merge-pathnames "shebang.lisp" *load-truename*))
 
-;;; #!+ and #!- now refer to *FEATURES* values (as opposed to the way
-;;; that they referred to special target-only *SHEBANG-FEATURES* values
-;;; during cold init).
-(setf sb-cold:*shebang-features* *features*)
 ;;; Just in case we want to play with the initial value of
 ;;; backend-subfeatures
 (setf sb-cold:*shebang-backend-subfeatures* sb-c:*backend-subfeatures*)
 
-(handler-bind (#+sb-package-locks (sb-ext:package-locked-error #'continue))
-  ;; The nickname SB!XC now refers to the CL package.
-  (rename-package "COMMON-LISP" "COMMON-LISP"
-                  (cons "SB!XC" (package-nicknames "CL")))
-  #+sb-package-locks (sb-ext:unlock-package "CL")
-
-  ;; Any other name SB!FOO refers to the package now called SB-FOO.
-  (dolist (package (list-all-packages))
-    (let ((name (package-name package))
-          (nicknames (package-nicknames package))
-          (warm-name-prefix "SB-")
-          (cold-name-prefix "SB!"))
-      (when (and (> (length name) (length warm-name-prefix))
-                 (string= name warm-name-prefix
-                          :end1 (length warm-name-prefix)))
-        (let* ((stem (subseq name (length cold-name-prefix)))
-               (cold-name (concatenate 'simple-string cold-name-prefix stem)))
-          (rename-package package name (cons cold-name nicknames)))
-        #+sb-package-locks (sb-ext:unlock-package package)))))
-
-;; Reinstate the pre-cold-init variable-defining macros.
-(let ((*package* (find-package "SB-INT")))
-  (flet ((def (real-name)
-           (let ((alias (sb-int:symbolicate "!" real-name)))
-             (export alias)
-             (setf (macro-function alias) (macro-function real-name)))))
-    (def 'sb-ext:defglobal)
-    (def 'defparameter)
-    (def 'defvar)))
+;; Restore !DEFINE-LOAD-TIME-GLOBAL macro
+(export 'sb-int::!define-load-time-global 'sb-int)
+(setf (macro-function 'sb-int::!define-load-time-global)
+      (macro-function 'sb-ext:define-load-time-global))
 
 (export '(sb-int::!cold-init-forms
           sb-int::!coerce-to-specialized

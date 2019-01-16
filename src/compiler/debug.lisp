@@ -10,43 +10,12 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
-(defvar *args* ()
-  "This variable is bound to the format arguments when an error is signalled
-by BARF or BURP.")
-
-(defvar *ignored-errors* (make-hash-table :test 'equal))
-
-;;; A definite inconsistency has been detected. Signal an error with
-;;; *args* bound to the list of the format args.
+;;; A definite inconsistency has been detected. Signal an error.
 (declaim (ftype (function (string &rest t) (values)) barf))
-(defun barf (string &rest *args*)
-  (unless (gethash string *ignored-errors*)
-    (restart-case
-        (apply #'error string *args*)
-      (continue ()
-        :report "Ignore this error.")
-      (ignore-all ()
-        :report "Ignore this and all future occurrences of this error."
-        (setf (gethash string *ignored-errors*) t))))
-  (values))
-
-(defvar *burp-action* :warn
-  "Action taken by the BURP function when a possible compiler bug is detected.
-One of :WARN, :ERROR or :NONE.")
-(declaim (type (member :warn :error :none) *burp-action*))
-
-;;; Called when something funny but possibly correct is noticed.
-;;; Otherwise similar to BARF.
-(declaim (ftype (function (string &rest t) (values)) burp))
-(defun burp (string &rest *args*)
-  (declare (notinline warn)) ; See COMPILER-WARN for rationale
-  (ecase *burp-action*
-    (:warn (apply #'warn string *args*))
-    (:error (apply #'cerror "press on anyway." string *args*))
-    (:none))
-  (values))
+(defun barf (string &rest args)
+  (apply #'bug string args))
 
 ;;; *SEEN-BLOCKS* is a hashtable with true values for all blocks which
 ;;; appear in the DFO for one of the specified components.
@@ -67,8 +36,8 @@ One of :WARN, :ERROR or :NONE.")
   (values))
 
 ;;; Check everything that we can think of for consistency. When a
-;;; definite inconsistency is detected, we BARF. Possible problems
-;;; just cause us to BURP. Our argument is a list of components, but
+;;; definite inconsistency is detected, we BARF.
+;;; Our argument is a list of components, but
 ;;; we also look at the *FREE-VARS*, *FREE-FUNS* and *CONSTANTS*.
 ;;;
 ;;; First we do a pre-pass which finds all the CBLOCKs and CLAMBDAs,
@@ -573,10 +542,11 @@ One of :WARN, :ERROR or :NONE.")
         (barf "The WRITE-P in ~S isn't ~S." vop write-p))
       (unless (find-in #'tn-ref-next-ref ref vop-refs)
         (barf "~S not found in REFS for ~S" ref vop))
-      (unless (find-in #'tn-ref-next ref
-                       (if (tn-ref-write-p ref)
-                           (tn-writes (tn-ref-tn ref))
-                           (tn-reads (tn-ref-tn ref))))
+      (unless (or (eq (tn-kind (tn-ref-tn ref)) :unused)
+                  (find-in #'tn-ref-next ref
+                           (if (tn-ref-write-p ref)
+                               (tn-writes (tn-ref-tn ref))
+                               (tn-reads (tn-ref-tn ref)))))
         (barf "~S not found in reads/writes for its TN" ref))
 
       (let ((target (tn-ref-target ref)))
@@ -855,12 +825,14 @@ One of :WARN, :ERROR or :NONE.")
            (do ((scs scs (cdr scs))
                 (op ops (tn-ref-across op)))
                ((null scs))
-             (let ((load-tn (tn-ref-load-tn op)))
-               (unless (eq (svref (car scs)
-                                  (sc-number
-                                   (tn-sc
-                                    (or load-tn (tn-ref-tn op)))))
-                           t)
+             (let ((tn (tn-ref-tn op))
+                   (load-tn (tn-ref-load-tn op)))
+               (unless (or (eq (tn-kind tn) :unused)
+                           (eq (svref (car scs)
+                                      (sc-number
+                                       (tn-sc
+                                        (or load-tn tn))))
+                               t))
                  (barf "operand restriction not satisfied: ~S" op))))))
     (do-ir2-blocks (block component)
       (do ((vop (ir2-block-last-vop block) (vop-prev vop)))
@@ -906,7 +878,13 @@ One of :WARN, :ERROR or :NONE.")
     (global-var
      (format stream "~S {~A}" (leaf-debug-name leaf) (global-var-kind leaf)))
     (functional
-     (format stream "~S ~S" (type-of leaf) (functional-debug-name leaf)))))
+     (format stream "~S ~S ~S" (type-of leaf) (functional-debug-name leaf)
+             (mapcar #'leaf-debug-name
+                     (typecase leaf
+                       (clambda
+                        (lambda-vars leaf))
+                       (optional-dispatch
+                        (optional-dispatch-arglist leaf))))))))
 
 ;;; Attempt to find a block given some thing that has to do with it.
 (declaim (ftype (sfunction (t) cblock) block-or-lose))
@@ -951,6 +929,8 @@ One of :WARN, :ERROR or :NONE.")
       (format t " <deleted>"))
 
     (pprint-newline :mandatory)
+    (when (block-start-cleanup block)
+      (format t "cleanup ~s~%" (cleanup-kind (block-start-cleanup block))))
     (awhen (block-info block)
       (format t "start stack: ")
       (print-lvar-stack (ir2-block-start-stack it))
@@ -974,7 +954,8 @@ One of :WARN, :ERROR or :NONE.")
              (dolist (arg (basic-combination-args node))
                (if arg
                    (print-lvar arg)
-                   (format t "<none> ")))))
+                   (format t "<none> "))))
+           (format t "{derived ~a}" (type-specifier (basic-combination-derived-type node))))
           (cset
            (write-string "set ")
            (print-leaf (set-var node))
@@ -1030,7 +1011,9 @@ One of :WARN, :ERROR or :NONE.")
       (pprint-newline :mandatory))
     (let ((succ (block-succ block)))
       (format t "successors~{ c~D~}~%"
-              (mapcar (lambda (x) (cont-num (block-start x))) succ))))
+              (mapcar (lambda (x) (cont-num (block-start x))) succ)))
+    (when (block-end-cleanup block)
+      (format t "cleanup ~s~%" (cleanup-kind (block-end-cleanup block)))))
   (values))
 
 ;;; Print the guts of a TN. (logic shared between PRINT-OBJECT (TN T)
@@ -1044,7 +1027,8 @@ One of :WARN, :ERROR or :NONE.")
           (t
            (format stream "t~D" (tn-id tn))))
     (when (and (tn-sc tn) (tn-offset tn))
-      (format stream "[~A]" (location-print-name tn)))))
+      (format stream "[~A]" (location-print-name tn)))
+    (format stream " ~s" (tn-kind tn))))
 
 ;;; Print the TN-REFs representing some operands to a VOP, linked by
 ;;; TN-REF-ACROSS.
@@ -1162,7 +1146,7 @@ One of :WARN, :ERROR or :NONE.")
         (format t "~&~A...~%" condition))))
   (values))
 
-(defvar *list-conflicts-table* (make-hash-table :test 'eq))
+(defvar *list-conflicts-table*)
 
 ;;; Add all ALWAYS-LIVE TNs in BLOCK to the conflicts. TN is ignored
 ;;; when it appears in the global conflicts.
@@ -1246,3 +1230,32 @@ One of :WARN, :ERROR or :NONE.")
     (do ((i 0 (1+ i))
          (vop (ir2-block-start-vop block) (vop-next vop)))
         ((= i n) vop))))
+
+(defun ir1-to-dot (component output-file)
+  (with-open-file (stream output-file :if-exists :supersede
+                                      :if-does-not-exist :create
+                                      :direction :output)
+    (write-line "digraph G {" stream)
+    (do-blocks (block component)
+      (when (typep (block-out block) '(cons (eql :graph) cons))
+        (format stream "~a[style=filled color=~a];~%"
+                (block-number block)
+                (case (cadr (block-out block))
+                  (:marked "green")
+                  (:remarked "aquamarine")
+                  (:start "lightblue")
+                  (:end "red"))))
+      (let ((succ (block-pred block)))
+        (when succ
+          (loop for succ in succ
+                for attr = "[style=bold]" then ""
+                do
+                (format stream "~a -> ~a~a;~%"
+                        (block-number block)
+                        (block-number succ)
+                        attr)))
+        (when (nle-block-p block)
+          (format stream "~a -> ~a [style=dotted];~%"
+                  (block-number block)
+                  (block-number (nle-block-entry-block block))))))
+    (write-line "}" stream)))

@@ -17,7 +17,7 @@
 (cl:in-package #:thread-test)
 
 (with-test (:name atomic-update
-            :skipped-on '(not :sb-thread))
+            :skipped-on (not :sb-thread))
   (let ((x (cons :count 0))
         (nthreads (ecase sb-vm:n-word-bits (32 100) (64 1000))))
     (mapc #'join-thread
@@ -39,20 +39,22 @@
 
 ;;; Terminating a thread that's waiting for the terminal.
 
-#+sb-thread
-(let ((thread (make-thread (lambda ()
-                             (sb-thread::get-foreground)))))
-  (sleep 1)
-  (assert (thread-alive-p thread))
-  (terminate-thread thread)
-  (sleep 1)
-  (assert (not (thread-alive-p thread))))
+(with-test (:name (:terminate-thread :get-foreground)
+                  :skipped-on (not :sb-thread)
+                  :broken-on :win32)
+ (let ((thread (make-thread (lambda ()
+                              (sb-thread::get-foreground)))))
+   (sleep 1)
+   (assert (thread-alive-p thread))
+   (terminate-thread thread)
+   (sleep 1)
+   (assert (not (thread-alive-p thread)))))
 
 ;;; Condition-wait should not be interruptible under WITHOUT-INTERRUPTS
 
 (with-test (:name :without-interrupts+condition-wait
-            :skipped-on '(not :sb-thread)
-            :fails-on '(and :win32 :sb-futex))
+            :skipped-on (not :sb-thread)
+            :broken-on :win32)
   (let* ((lock (make-mutex))
          (queue (make-waitqueue))
          (thread (make-thread (lambda ()
@@ -70,7 +72,9 @@
 
 ;;; GRAB-MUTEX should not be interruptible under WITHOUT-INTERRUPTS
 
-(with-test (:name :without-interrupts+grab-mutex :skipped-on '(not :sb-thread))
+(with-test (:name :without-interrupts+grab-mutex
+            :skipped-on (not :sb-thread)
+            :broken-on :win32)
   (let* ((lock (make-mutex))
          (bar (progn (grab-mutex lock) nil))
          (thread (make-thread (lambda ()
@@ -88,7 +92,7 @@
     (assert (eq :aborted (join-thread thread :default :aborted)))
     (assert bar)))
 
-(with-test (:name :parallel-find-class :skipped-on '(not :sb-thread))
+(with-test (:name :parallel-find-class :skipped-on (not :sb-thread))
   (let* ((oops nil)
          (threads (loop repeat 10
                         collect (make-thread (lambda ()
@@ -100,7 +104,7 @@
     (mapc #'join-thread threads)
     (assert (not oops))))
 
-(with-test (:name :semaphore-multiple-waiters :skipped-on '(not :sb-thread))
+(with-test (:name :semaphore-multiple-waiters :skipped-on (not :sb-thread))
   (let ((semaphore (make-semaphore :name "test sem")))
     (labels ((make-readers (n i)
                (values
@@ -155,7 +159,7 @@
 
 ;;;; Printing waitqueues
 
-(with-test (:name :waitqueue-circle-print :skipped-on '(not :sb-thread))
+(with-test (:name :waitqueue-circle-print :skipped-on (not :sb-thread))
   (let* ((*print-circle* nil)
          (lock (make-mutex))
          (wq (make-waitqueue)))
@@ -173,7 +177,7 @@
     (assert (= 123 (symbol-value-in-thread '* *current-thread*)))
     (assert (= 123 *))))
 
-(with-test (:name :symbol-value-in-thread.2 :skipped-on '(not :sb-thread))
+(with-test (:name :symbol-value-in-thread.2 :skipped-on (not :sb-thread))
   (let* ((parent *current-thread*)
          (semaphore (make-semaphore))
          (child (make-thread (lambda ()
@@ -186,11 +190,9 @@
       (assert (= 42 (join-thread child)))
       (assert (eq :from-child (symbol-value 'this-is-new))))))
 
-;;; Disabled on Darwin due to deadlocks caused by apparent OS specific deadlocks,
-;;; wich _appear_ to be caused by malloc() and free() not being thread safe: an
-;;; interrupted malloc in one thread can apparently block a free in another.
 (with-test (:name :symbol-value-in-thread.3
-            :skipped-on '(not :sb-thread))
+            :skipped-on (not :sb-thread)
+            :broken-on :sb-safepoint)
   (let* ((parent *current-thread*)
          (semaphore (make-semaphore))
          (running t)
@@ -211,20 +213,22 @@
         (force-output))
       (let* ((mom-mark (cons t t))
              (kid-mark (cons t t))
-             (child (make-thread (lambda ()
-                                   (wait-on-semaphore semaphore)
-                                   (let ((old (symbol-value-in-thread 'this-is-new parent)))
-                                     (setf (symbol-value-in-thread 'this-is-new parent)
-                                           (make-array 24 :initial-element kid-mark))
-                                     old)))))
+             (child (make-thread
+                     (lambda ()
+                       (if (wait-on-semaphore semaphore :timeout 10)
+                           (let ((old (symbol-value-in-thread 'this-is-new parent)))
+                             (setf (symbol-value-in-thread 'this-is-new parent)
+                                   (make-array 24 :initial-element kid-mark))
+                             old)
+                           :timeout)))))
         (progv '(this-is-new) (list (make-array 24 :initial-element mom-mark))
           (signal-semaphore semaphore)
-          (assert (eq mom-mark (aref (join-thread child) 0)))
+          (assert (eq mom-mark (aref (join-thread child :timeout 10) 0)))
           (assert (eq kid-mark (aref (symbol-value 'this-is-new) 0))))))
     (setf running nil)
     (join-thread noise)))
 
-(with-test (:name :symbol-value-in-thread.4 :skipped-on '(not :sb-thread))
+(with-test (:name :symbol-value-in-thread.4 :skipped-on (not :sb-thread))
   (let* ((parent *current-thread*)
          (semaphore (make-semaphore))
          (child (make-thread (lambda ()
@@ -233,7 +237,7 @@
     (signal-semaphore semaphore)
     (assert (equal '(nil nil) (multiple-value-list (join-thread child))))))
 
-(with-test (:name :symbol-value-in-thread.5 :skipped-on '(not :sb-thread))
+(with-test (:name :symbol-value-in-thread.5 :skipped-on (not :sb-thread))
   (let* ((parent *current-thread*)
          (semaphore (make-semaphore))
          (child (make-thread (lambda ()
@@ -245,10 +249,10 @@
                                          (cell-error-name e)
                                          (sb-thread::symbol-value-in-thread-error-info e))))))))
     (signal-semaphore semaphore)
-    (assert (equal (list *current-thread* 'this-is-new (list :read :unbound-in-thread))
+    (assert (equal (list *current-thread* 'this-is-new (list :read :no-tls-value))
                    (join-thread child)))))
 
-(with-test (:name :symbol-value-in-thread.6 :skipped-on '(not :sb-thread))
+(with-test (:name :symbol-value-in-thread.6 :skipped-on (not :sb-thread))
   (let* ((parent *current-thread*)
          (semaphore (make-semaphore))
          (name (gensym))
@@ -266,7 +270,7 @@
       (unless (equal res want)
         (error "wanted ~S, got ~S" want res)))))
 
-(with-test (:name :symbol-value-in-thread.7 :skipped-on '(not :sb-thread))
+(with-test (:name :symbol-value-in-thread.7 :skipped-on (not :sb-thread))
   (let ((child (make-thread (lambda ())))
         (error-occurred nil))
     (join-thread child)
@@ -280,7 +284,7 @@
                        (sb-thread::symbol-value-in-thread-error-info e)))))
     (assert error-occurred)))
 
-(with-test (:name :symbol-value-in-thread.8 :skipped-on '(not :sb-thread))
+(with-test (:name :symbol-value-in-thread.8 :skipped-on (not :sb-thread))
   (let ((child (make-thread (lambda ())))
         (error-occurred nil))
     (join-thread child)
@@ -294,7 +298,7 @@
                        (sb-thread::symbol-value-in-thread-error-info e)))))
     (assert error-occurred)))
 
-(with-test (:name :deadlock-detection.1 :skipped-on '(not :sb-thread))
+(with-test (:name :deadlock-detection.1 :skipped-on (not :sb-thread))
   (loop
     repeat 1000
     do (flet ((test (ma mb sa sb)
@@ -322,7 +326,7 @@
              (assert (or (equal '(:deadlock :ok) res)
                          (equal '(:ok :deadlock) res))))))))
 
-(with-test (:name :deadlock-detection.2 :skipped-on '(not :sb-thread))
+(with-test (:name :deadlock-detection.2 :skipped-on (not :sb-thread))
   (let* ((m1 (make-mutex :name "M1"))
          (m2 (make-mutex :name "M2"))
          (s1 (make-semaphore :name "S1"))
@@ -357,7 +361,7 @@
        (assert (stringp err)))
     (assert (eq :ok (join-thread t1)))))
 
-(with-test (:name :deadlock-detection.3  :skipped-on '(not :sb-thread))
+(with-test (:name :deadlock-detection.3  :skipped-on (not :sb-thread))
   (let* ((m1 (make-mutex :name "M1"))
          (m2 (make-mutex :name "M2"))
          (s1 (make-semaphore :name "S1"))
@@ -438,7 +442,7 @@
                    (condition-wait waitqueue mutex :timeout 0.01))))))
 
 (with-test (:name (:condition-wait :timeout :many-threads)
-            :skipped-on '(not :sb-thread))
+            :skipped-on (not :sb-thread))
   (let* ((mutex (make-mutex))
          (waitqueue (make-waitqueue))
          (sem (make-semaphore))
@@ -474,7 +478,7 @@
       (assert (equal (remove nil values) expected)))))
 
 (with-test (:name (wait-on-semaphore :timeout :many-threads)
-            :skipped-on '(not :sb-thread))
+            :skipped-on (not :sb-thread))
   (let* ((count 10)
          (semaphore (make-semaphore)))
     ;; Add 10 tokens right away.
@@ -502,7 +506,7 @@
         (assert (find 0 values))))))
 
 (with-test (:name (:join-thread :timeout)
-                  :skipped-on '(not :sb-thread))
+                  :skipped-on (not :sb-thread))
   (assert-error
    (join-thread (make-join-thread (lambda () (sleep 10))) :timeout 0.01)
    join-thread-error)
@@ -513,8 +517,10 @@
                              :default cookie)))))
 
 (with-test (:name (wait-on-semaphore semaphore-notification :lp-1038034)
-            :skipped-on '(not :sb-thread)
-            :fails-on :sb-thread)
+            :skipped-on (not :sb-thread)
+            :fails-on (and :sb-thread
+                           (not :darwin)) ;; Maybe because it doesn't use futexes?
+            :broken-on :win32)
   ;; Test robustness of semaphore acquisition and notification with
   ;; asynchronous thread termination...  Which we know is currently
   ;; fragile.
@@ -560,60 +566,13 @@
     (write-char #\.)
     (force-output)))
 
-(with-test (:name (wait-on-semaphore semaphore-notification)
-            :skipped-on '(not :sb-thread))
-  (let ((sem (make-semaphore))
-        (ok nil)
-        (n 0))
-    (flet ((critical ()
-             (let ((note (make-semaphore-notification)))
-               (sb-sys:without-interrupts
-                 (unwind-protect
-                      (progn
-                        (sb-sys:with-local-interrupts
-                          (wait-on-semaphore sem :notification note)
-                          (sleep (random 0.1)))
-                        (incf n))
-                   ;; Re-increment on exit if we decremented it.
-                   (when (semaphore-notification-status note)
-                     (signal-semaphore sem))
-                   ;; KLUDGE: Prevent interrupts after this point from
-                   ;; unwinding us, so that we can reason about the counts.
-                   #+sb-thread
-                   (sb-thread::block-deferrable-signals))))))
-      (let* ((threads (loop for i from 1 upto 100
-                            collect (make-join-thread #'critical :name (format nil "T~A" i))))
-             (safe nil)
-             (unsafe nil)
-             (interruptor (make-thread (lambda ()
-                                         (loop until ok)
-                                         (let (x)
-                                           (dolist (thread threads)
-                                             (cond (x
-                                                    (push thread unsafe)
-                                                    (sleep (random 0.1))
-                                                    (ignore-errors
-                                                     (terminate-thread thread)))
-                                                   (t
-                                                    (push thread safe)))
-                                             (setf x (not x))))))))
-        (signal-semaphore sem)
-        (setf ok t)
-        (join-thread interruptor)
-        (mapc #'join-thread safe)
-        (let ((k (count-if (lambda (th)
-                             (join-thread th :default nil))
-                           unsafe)))
-          (assert (= n (+ k (length safe))))
-          (assert unsafe))))))
-
 (with-test (:name (wait-on-semaphore :n))
   (let ((semaphore (make-semaphore :count 3)))
     (assert (= 1 (wait-on-semaphore semaphore :n 2)))
     (assert (= 1 (semaphore-count semaphore)))))
 
 (with-test (:name (try-semaphore semaphore-notification)
-            :skipped-on '(not :sb-thread))
+            :skipped-on (not :sb-thread))
   (let* ((sem (make-semaphore))
          (note (make-semaphore-notification)))
     (assert (eql nil (try-semaphore sem 1 note)))
@@ -623,7 +582,7 @@
     (assert (semaphore-notification-status note))))
 
 (with-test (:name (return-from-thread :normal-thread)
-            :skipped-on '(not :sb-thread))
+            :skipped-on (not :sb-thread))
   (let ((thread (make-thread (lambda ()
                                (return-from-thread (values 1 2 3))
                                :foo))))
@@ -634,7 +593,7 @@
   (assert-error (return-from-thread t) thread-error))
 
 (with-test (:name (abort-thread :normal-thread)
-            :skipped-on '(not :sb-thread))
+            :skipped-on (not :sb-thread))
   (let ((thread (make-thread (lambda ()
                                (abort-thread)
                                :foo))))
@@ -656,21 +615,25 @@
 ;; See (:TIMER :DISPATCH-THREAD :MAKE-THREAD :BUG-1180102) in
 ;; timer.impure.lisp.
 (with-test (:name (make-thread :interrupt-with make-thread :bug-1180102)
-            :skipped-on '(not :sb-thread))
+            :skipped-on (not :sb-thread)
+            :broken-on :win32)
   (fresh-line)
   (write-string "; ")
   (force-output)
   (dotimes (i 100)
-    (let ((threads '())
+    (let (outer-threads
+          (inner-threads (list nil))
           (parent *current-thread*))
       (dotimes (i 100)
         (push (make-thread
                (lambda ()
                  (interrupt-thread
                   parent
-                  (lambda () (push (make-thread (lambda ())) threads)))))
-              threads)
-        (push (make-thread (lambda ())) threads))
-      (mapc #'join-thread threads))
+                  (lambda () (atomic-push (make-thread (lambda ()))
+                                          (car inner-threads))))))
+              outer-threads)
+        (push (make-thread (lambda ())) outer-threads))
+      (mapc #'join-thread outer-threads)
+      (mapc #'join-thread (car inner-threads)))
     (write-char #\.)
     (force-output)))

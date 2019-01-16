@@ -9,7 +9,6 @@
  * files for more information.
  */
 
-# define _GNU_SOURCE /* needed for RTLD_DEFAULT from dlfcn.h */
 #include <stdio.h>
 
 #include "sbcl.h"
@@ -27,26 +26,25 @@
 #include "breakpoint.h"
 #include "thread.h"
 #include "pseudo-atomic.h"
+#include "unaligned.h"
 
-#include "genesis/code.h"
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
 
-#if defined(LISP_FEATURE_OS_PROVIDES_DLOPEN) && !defined(LISP_FEATURE_WIN32)
-# include <dlfcn.h>
-#endif
 
-#define BREAKPOINT_INST 0xcc    /* INT3 */
+#ifdef LISP_FEATURE_UD2_BREAKPOINTS
 #define UD2_INST 0x0b0f         /* UD2 */
-
-#ifndef LISP_FEATURE_UD2_BREAKPOINTS
-#define BREAKPOINT_WIDTH 1
-#else
 #define BREAKPOINT_WIDTH 2
+#else
+#ifdef LISP_FEATURE_INT4_BREAKPOINTS
+# define BREAKPOINT_INST 0xce    /* INTO */
+#else
+# define BREAKPOINT_INST 0xcc    /* INT3 */
 #endif
-
+#define BREAKPOINT_WIDTH 1
+#endif
 unsigned int cpuid_fn1_ecx;
-unsigned int avx_supported = 0;
+int avx_supported = 0, avx2_supported = 0;
 
 static void cpuid(unsigned info, unsigned subinfo,
                   unsigned *eax, unsigned *ebx, unsigned *ecx, unsigned *edx)
@@ -70,29 +68,34 @@ static void cpuid(unsigned info, unsigned subinfo,
 
 static void xgetbv(unsigned *eax, unsigned *edx)
 {
-  __asm__("xgetbv;"
-          :"=a" (*eax), "=d" (*edx)
-          : "c" (0));
+    __asm__("xgetbv;"
+            :"=a" (*eax), "=d" (*edx)
+            : "c" (0));
 }
 
 void arch_init(void)
 {
-  unsigned int eax, ebx, ecx, edx;
+    unsigned int eax, ebx, ecx, edx;
 
-  cpuid(0, 0, &eax, &ebx, &ecx, &edx);
-  if (eax >= 1) { // see if we can execute basic id function 1
-      unsigned avx_mask = 0x18000000; // OXSAVE and AVX
-      cpuid(1, 0, &eax, &ebx, &ecx, &edx);
-      cpuid_fn1_ecx = ecx;
-      if ((ecx & avx_mask) == avx_mask) {
-          xgetbv(&eax, &edx);
-          if ((eax & 0x06) == 0x06) // YMM and XMM
-              avx_supported = 1;
-      }
-  }
+    cpuid(0, 0, &eax, &ebx, &ecx, &edx);
+    if (eax >= 1) { // see if we can execute basic id function 1
+        unsigned avx_mask = 0x18000000; // OXSAVE and AVX
+        cpuid(1, 0, &eax, &ebx, &ecx, &edx);
+        cpuid_fn1_ecx = ecx;
+        if ((ecx & avx_mask) == avx_mask) {
+            xgetbv(&eax, &edx);
+            if ((eax & 0x06) == 0x06) { // YMM and XMM
+                avx_supported = 1;
+                cpuid(7, 0, &eax, &ebx, &ecx, &edx);
+                if  (ebx & 0x20)  {
+                    avx2_supported = 1;
+                }
+            }
+        }
+    }
 }
 
-#define FILL_VECTOR_T "FILL-VECTOR/T"
+#define VECTOR_FILL_T "VECTOR-FILL/T"
 
 // Poke in a byte that changes an opcode to enable faster vector fill.
 // Using fixed offsets and bytes is no worse than what we do elsewhere.
@@ -105,7 +108,7 @@ void tune_asm_routines_for_microarch(void)
     if (eax >= 7) {
         cpuid(7, 0, &eax, &ebx, &ecx, &edx);
         if (ebx & (1<<9)) // Enhanced Repeat Movs/Stos
-          asm_routine_poke(FILL_VECTOR_T, 0x12, 0x7C); // Change JMP to JL
+          asm_routine_poke(VECTOR_FILL_T, 0x12, 0x7C); // Change JMP to JL
     }
 #endif
 }
@@ -116,12 +119,14 @@ void tune_asm_routines_for_microarch(void)
    instructions that don't exist on some cpu family members */
 void untune_asm_routines_for_microarch(void)
 {
-    asm_routine_poke(FILL_VECTOR_T, 0x12, 0xEB); // Change JL to JMP
+    asm_routine_poke(VECTOR_FILL_T, 0x12, 0xEB); // Change JL to JMP
 }
 
 #ifndef _WIN64
 os_vm_address_t
-arch_get_bad_addr(int sig, siginfo_t *code, os_context_t *context)
+arch_get_bad_addr(int __attribute__((unused)) sig,
+                  siginfo_t *code,
+                  os_context_t __attribute__((unused)) *context)
 {
     return (os_vm_address_t)code->si_addr;
 }
@@ -212,20 +217,20 @@ arch_internal_error_arguments(os_context_t *context)
 }
 
 boolean
-arch_pseudo_atomic_atomic(os_context_t *context)
+arch_pseudo_atomic_atomic(os_context_t __attribute__((unused)) *context)
 {
     return get_pseudo_atomic_atomic(arch_os_get_current_thread());
 }
 
 void
-arch_set_pseudo_atomic_interrupted(os_context_t *context)
+arch_set_pseudo_atomic_interrupted(os_context_t __attribute__((unused)) *context)
 {
     struct thread *thread = arch_os_get_current_thread();
     set_pseudo_atomic_interrupted(thread);
 }
 
 void
-arch_clear_pseudo_atomic_interrupted(os_context_t *context)
+arch_clear_pseudo_atomic_interrupted(os_context_t __attribute__((unused)) *context)
 {
     struct thread *thread = arch_os_get_current_thread();
     clear_pseudo_atomic_interrupted(thread);
@@ -350,7 +355,9 @@ restore_breakpoint_from_single_step(os_context_t * context)
 }
 
 void
-sigtrap_handler(int signal, siginfo_t *info, os_context_t *context)
+sigtrap_handler(int __attribute__((unused)) signal,
+                siginfo_t __attribute__((unused)) *info,
+                os_context_t *context)
 {
     unsigned int trap;
 
@@ -374,7 +381,9 @@ sigtrap_handler(int signal, siginfo_t *info, os_context_t *context)
 }
 
 void
-sigill_handler(int signal, siginfo_t *siginfo, os_context_t *context) {
+sigill_handler(int __attribute__((unused)) signal,
+               siginfo_t __attribute__((unused)) *siginfo,
+               os_context_t *context) {
     /* Triggering SIGTRAP using int3 is unreliable on OS X/x86, so
      * we need to use illegal instructions for traps.
      */
@@ -383,10 +392,15 @@ sigill_handler(int signal, siginfo_t *siginfo, os_context_t *context) {
         *os_context_pc_addr(context) += 2;
         return sigtrap_handler(signal, siginfo, context);
     }
+#elif defined(LISP_FEATURE_INT4_BREAKPOINTS) && !defined(LISP_FEATURE_MACH_EXCEPTION_HANDLER)
+    if (*((unsigned char *)*os_context_pc_addr(context)) == BREAKPOINT_INST) {
+        *os_context_pc_addr(context) += BREAKPOINT_WIDTH;
+        return sigtrap_handler(signal, siginfo, context);
+    }
 #endif
 
     fake_foreign_function_call(context);
-    lose("Unhandled SIGILL at %p.", *os_context_pc_addr(context));
+    lose("Unhandled SIGILL at %p.", (void*)*os_context_pc_addr(context));
 }
 
 #ifdef X86_64_SIGFPE_FIXUP
@@ -470,27 +484,19 @@ arch_install_interrupt_handlers()
 }
 
 #ifdef LISP_FEATURE_LINKAGE_TABLE
-/* FIXME: It might be cleaner to generate these from the lisp side of
- * things.
- */
-
 void
-arch_write_linkage_table_jmp(char *reloc_addr, void *target_addr)
+arch_write_linkage_table_entry(char *reloc_addr, void *target_addr, int datap)
 {
+    if (datap) {
+        *(uword_t *)reloc_addr = (uword_t)target_addr;
+        return;
+    }
     reloc_addr[0] = 0xFF; /* Opcode for near jump to absolute reg/mem64. */
     reloc_addr[1] = 0x25; /* ModRM #b00 100 101, i.e. RIP-relative. */
-    *(uint32_t*)(reloc_addr+2) = 0; /* 32-bit displacement field = 0 */
-    *(uword_t *)(reloc_addr+6) = (uword_t)target_addr;
-    /* write a nop for good measure. */
-    reloc_addr[14] = 0x90;
+    UNALIGNED_STORE32((reloc_addr+2), 2); /* 32-bit displacement field = 2 */
+    reloc_addr[6] = 0x66; reloc_addr[7] = 0x90; /* 2-byte NOP */
+    *(void**)(reloc_addr+8) = target_addr;
 }
-
-void
-arch_write_linkage_table_ref(void *reloc_addr, void *target_addr)
-{
-    *(uword_t *)reloc_addr = (uword_t)target_addr;
-}
-
 #endif
 
 /* These setup and check *both* the sse2 and x87 FPUs. While lisp code
@@ -547,9 +553,7 @@ arch_set_fp_modes(unsigned int mxcsr)
     asm ("ldmxcsr %0" : : "m" (temp));
 }
 
-#ifndef LISP_FEATURE_IMMOBILE_CODE
-void arch_os_link_runtime() {}
-#else
+#ifdef LISP_FEATURE_IMMOBILE_CODE
 /// Return the Lisp object that fdefn's raw_addr slot jumps to.
 /// This will either be:
 /// (1) a simple-fun,
@@ -557,39 +561,171 @@ void arch_os_link_runtime() {}
 ///     it resemble a simple-fun in terms of call convention, or
 /// (3) a code-component with no simple-fun within it, that makes
 ///     closures and other funcallable-instances look like simple-funs.
-lispobj fdefn_callee_lispobj(struct fdefn* fdefn) {
-    extern unsigned asm_routines_end;
-    if (((lispobj)fdefn->raw_addr & 0xFE) == 0xE8) {  // looks good
-        unsigned int raw_fun = (int)(long)&fdefn->raw_addr + 5 // length of "JMP rel32"
-          + *(int*)((char*)&fdefn->raw_addr + 1);
-        switch (((unsigned char*)&fdefn->raw_addr)[5]) {
-        case 0x00: // no closure/fin trampoline
-          // If the target is an assembly routine, there is no simple-fun
-          // that corresponds to the entry point. The code is kept live
-          // by *ASSEMBLER-OBJECTS*. Otherwise, return the simple-fun.
-          return raw_fun < asm_routines_end ? 0 : raw_fun - FUN_RAW_ADDR_OFFSET;
-        case 0x48: // embedded funcallable instance trampoline
-          return (raw_fun - (4<<WORD_SHIFT)) | FUN_POINTER_LOWTAG;
-        case 0x90: // general closure/fin trampoline
-          return (raw_fun - offsetof(struct code, constants)) | OTHER_POINTER_LOWTAG;
-        }
-    } else if (fdefn->raw_addr == 0)
+/// If the fdefn jumps to the UNDEFINED-FDEFN routine, then return 0.
+lispobj virtual_fdefn_callee_lispobj(struct fdefn* fdefn, uword_t vaddr) {
+    unsigned char tagged_ptr_bias = ((unsigned char*)&fdefn->raw_addr)[7];
+    // If the pointer bias is 0, then this fdefn's raw_addr must
+    // point to an assembler routine entry point.
+    if (tagged_ptr_bias == 0)
         return 0;
-    lose("Can't decode fdefn raw addr @ %p: %p\n", fdefn, fdefn->raw_addr);
+    int32_t offs = UNALIGNED_LOAD32((char*)&fdefn->raw_addr + 1);
+    // Base the callee address off where the fdefn virtually is.
+    // Compensate for the offset of the raw_addr slot,
+    // and add 5 for the length of "JMP rel32" instruction.
+    return vaddr + offsetof(struct fdefn,raw_addr) + 5 + offs - tagged_ptr_bias;
 }
-
-void arch_os_link_runtime()
-{
-    struct code* code = (struct code*)(IMMOBILE_SPACE_START +
-                                       IMMOBILE_FIXEDOBJ_SUBSPACE_SIZE);
-    char* link_target = (char*)code->constants;
-    // I wish it were possible to assert that this is the correct code object
-    // about to be touched, but I don't see what else to assert.
-    gc_assert(code->code_size >= make_fixnum(2*LINKAGE_TABLE_ENTRY_SIZE));
-    arch_write_linkage_table_jmp(link_target,
-                                 dlsym(RTLD_DEFAULT, "alloc_tramp"));
-    link_target += LINKAGE_TABLE_ENTRY_SIZE,
-    arch_write_linkage_table_jmp(link_target,
-                                 dlsym(RTLD_DEFAULT, "alloc_to_r11"));
+lispobj fdefn_callee_lispobj(struct fdefn* fdefn) {
+  return virtual_fdefn_callee_lispobj(fdefn, (uword_t)fdefn);
 }
 #endif
+
+#include "genesis/vector.h"
+#define LOCK_PREFIX 0xF0
+#undef SHOW_PC_RECORDING
+
+extern unsigned int alloc_profile_n_counters;
+extern unsigned int max_alloc_point_counters;
+#ifdef LISP_FEATURE_SB_THREAD
+extern pthread_mutex_t alloc_profiler_lock;
+#endif
+
+static unsigned int claim_index(int qty)
+{
+    static boolean warning_issued;
+    unsigned int index = alloc_profile_n_counters;
+    alloc_profile_n_counters += qty;
+    if (alloc_profile_n_counters <= max_alloc_point_counters)
+       return index;
+    if (!warning_issued) {
+       fprintf(stderr, "allocation profile buffer overflowed\n");
+       warning_issued = 1;
+    }
+    return 0; // use the overflow bin(s)
+}
+
+static boolean instrumentp(uword_t* sp, uword_t** pc, uword_t* old_word)
+{
+    int __attribute__((unused)) ret = thread_mutex_lock(&alloc_profiler_lock);
+    gc_assert(ret == 0);
+    uword_t next_pc = *sp;
+    // The instrumentation site was 8-byte aligned
+    uword_t return_pc = ALIGN_DOWN(next_pc, 8);
+#if 0
+    if (!(return_pc >= instrument_from && return_pc < instrument_to))
+        return 0;
+#endif
+    uword_t word = *(uword_t*)return_pc;
+    unsigned char opcode = word & 0xFF;
+    // Adjust the return PC to where the call instruction was,
+    // not the instruction after it.
+    *sp = return_pc;
+    // If > 1 thread called this routine at the same time,
+    // one of them would already have patched the call site.
+    if (opcode == LOCK_PREFIX)
+        return 0;
+    *pc = (uword_t*)return_pc;
+    *old_word = word;
+    return 1;
+}
+
+// logical index 'index' in the metadata array stores the code component
+// and pc-offset relative to the component base address
+static void record_pc(uword_t* pc, unsigned int index, boolean sizedp)
+{
+    lispobj *code = component_ptr_from_pc(pc);
+    if (!code) {
+        fprintf(stderr, "can't identify code @ %p\n", pc);
+    } else {
+#ifdef SHOW_PC_RECORDING
+        fprintf(stderr, "%#lx (%#lx) -> %d%s\n",
+                (uword_t)pc, make_lispobj(code, OTHER_POINTER_LOWTAG),
+                index, sizedp?" (sized)":"");
+#endif
+    }
+#if 0
+    if (!code) {
+        int ret = thread_mutex_lock(&free_pages_lock);
+        gc_assert(ret == 0);
+        ensure_region_closed(code_region);
+        int ret = thread_mutex_unlock(&free_pages_lock);
+        gc_assert(ret == 0);
+        code = component_ptr_from_pc((lispobj*)pc);
+    }
+#endif
+    struct vector* v = VECTOR(alloc_profile_data);
+    index <<= 1;
+    if (sizedp) {
+       v->data[index] = v->data[index+1] = NIL;
+       index += 2;
+    }
+    if (code) {
+        v->data[index] = make_lispobj(code, OTHER_POINTER_LOWTAG);
+        v->data[index+1] = make_fixnum((lispobj)pc - (lispobj)code);
+    } else {
+        gc_assert(!((uword_t)pc & LOWTAG_MASK));
+        v->data[index] = make_fixnum(-1); // no code component found
+        v->data[index+1] = (lispobj)pc;
+    }
+}
+
+void AMD64_SYSV_ABI
+allocation_tracker_counted(uword_t* sp)
+{
+    uword_t *pc, word_at_pc;
+    if (instrumentp(sp, &pc, &word_at_pc)) {
+        unsigned int index = claim_index(1);
+        if (index == 0)
+            index = 2; // reserved overflow counter for fixed-size alloc
+        // rewrite call into: LOCK INC QWORD PTR, [R11+n] ; opcode = 0xFF / 0
+        uword_t new_inst =
+          0xF0 | (0x49 << 8) | (0xFF << 16) | (0x83L << 24) | ((index*8L) << 32);
+        // Ensure atomicity of the write. A plain store would probably do,
+        // but since this is self-modifying code, the most stringent memory
+        // order is prudent.
+        if (!__sync_bool_compare_and_swap(pc, word_at_pc, new_inst))
+            lose("alloc profiler failed to rewrite instruction @ %p", pc);
+        if (index != 2)
+            record_pc(pc, index, 0);
+    }
+    int __attribute__((unused)) ret = thread_mutex_unlock(&alloc_profiler_lock);
+    gc_assert(ret == 0);
+}
+
+void AMD64_SYSV_ABI
+allocation_tracker_sized(uword_t* sp)
+{
+    uword_t *pc, word_at_pc;
+    if (instrumentp(sp, &pc, &word_at_pc)) {
+        int index = claim_index(2);
+        uword_t word_after_pc = pc[1];
+        unsigned char prefix = word_after_pc & 0xFF;
+        unsigned char opcode = (word_after_pc >>  8) & 0xFF;
+        unsigned char modrm  = (word_after_pc >> 16) & 0xFF;
+        if ((prefix == 0x48 || prefix == 0x4D) && /* REX w=1 or w=r=b=1 */
+            (opcode == 0x85) && /* TEST */
+            (modrm & 0xC0) == 0xC0 && /* register-direct mode */
+            ((modrm >> 3) & 0x7) == (modrm & 0x7)) { /* same register */
+        } else {
+            lose("Can't decode instruction @ pc %p\n", pc);
+        }
+        // rewrite call into:
+        //  LOCK INC QWORD PTR, [R11+n] ; opcode = 0xFF / 0
+        uword_t new_inst1 =
+          0xF0 | (0x49 << 8) | (0xFF << 16) | (0x83L << 24) | ((index * 8L) << 32);
+        //  LOCK ADD [R11+n], Rxx ; opcode = 0x01
+        prefix = 0x49 | ((prefix & 1) << 2); // 'b' bit becomes 'r' bit
+        modrm  = 0x83 | (modrm & (7<<3)); // copy 'reg' into new modrm byte
+        uword_t new_inst2 =
+          0xF0 | (prefix << 8) | (0x01 << 16) | ((long)modrm << 24)
+            | (((1 + index) * 8L) << 32);
+        // Overwrite the second instruction first, because as soon as the CALL
+        // opcode is changed, fallthrough to the next instruction occurs.
+        if (!__sync_bool_compare_and_swap(pc+1, word_after_pc, new_inst2) ||
+            !__sync_bool_compare_and_swap(pc,   word_at_pc,    new_inst1))
+            lose("alloc profiler failed to rewrite instructions @ %p", pc);
+        if (index != 0) // can't record a PC for the overflow counts
+            record_pc(pc, index, 1);
+    }
+    int __attribute__((unused)) ret = thread_mutex_unlock(&alloc_profiler_lock);
+    gc_assert(ret == 0);
+}

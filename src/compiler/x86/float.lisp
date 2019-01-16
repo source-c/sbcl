@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (macrolet ((ea-for-xf-desc (tn slot)
              `(make-ea-for-object-slot ,tn ,slot other-pointer-lowtag)))
@@ -412,11 +412,7 @@
   (:node-var node)
   (:note "float to pointer coercion")
   (:generator 13
-     (with-fixed-allocation (y
-                             single-float-widetag
-                             single-float-size node)
-       ;; w-f-a checks for empty body
-       nil)
+     (fixed-alloc y single-float-widetag single-float-size node)
      (with-tn@fp-top(x)
        (inst fst (ea-for-sf-desc y)))))
 (define-move-vop move-from-single :move
@@ -428,11 +424,7 @@
   (:node-var node)
   (:note "float to pointer coercion")
   (:generator 13
-     (with-fixed-allocation (y
-                             double-float-widetag
-                             double-float-size
-                             node)
-       nil)
+     (fixed-alloc y double-float-widetag double-float-size node)
      (with-tn@fp-top(x)
        (inst fstd (ea-for-df-desc y)))))
 (define-move-vop move-from-double :move
@@ -445,11 +437,7 @@
   (:node-var node)
   (:note "float to pointer coercion")
   (:generator 13
-     (with-fixed-allocation (y
-                             long-float-widetag
-                             long-float-size
-                             node)
-       nil)
+     (fixed-alloc y long-float-widetag long-float-size node)
      (with-tn@fp-top(x)
        (store-long-float (ea-for-lf-desc y)))))
 #!+long-float
@@ -460,7 +448,7 @@
   (:args (x :scs (fp-constant)))
   (:results (y :scs (descriptor-reg)))
   (:generator 2
-     (ecase (sb!c::constant-value (sb!c::tn-leaf x))
+     (ecase (sb-c::constant-value (sb-c::tn-leaf x))
        (0f0 (load-symbol-value y *fp-constant-0f0*))
        (1f0 (load-symbol-value y *fp-constant-1f0*))
        (0d0 (load-symbol-value y *fp-constant-0d0*))
@@ -522,16 +510,13 @@
   (:node-var node)
   (:note "complex float to pointer coercion")
   (:generator 13
-    (with-fixed-allocation (y
-                            complex-single-float-widetag
-                            complex-single-float-size
-                            node)
-      (let ((real-tn (complex-single-reg-real-tn x)))
-        (with-tn@fp-top(real-tn)
-          (inst fst (ea-for-csf-real-desc y))))
-      (let ((imag-tn (complex-single-reg-imag-tn x)))
-        (with-tn@fp-top(imag-tn)
-          (inst fst (ea-for-csf-imag-desc y)))))))
+    (fixed-alloc y complex-single-float-widetag complex-single-float-size node)
+    (let ((real-tn (complex-single-reg-real-tn x)))
+      (with-tn@fp-top(real-tn)
+        (inst fst (ea-for-csf-real-desc y))))
+    (let ((imag-tn (complex-single-reg-imag-tn x)))
+      (with-tn@fp-top(imag-tn)
+        (inst fst (ea-for-csf-imag-desc y))))))
 (define-move-vop move-from-complex-single :move
   (complex-single-reg) (descriptor-reg))
 
@@ -541,16 +526,13 @@
   (:node-var node)
   (:note "complex float to pointer coercion")
   (:generator 13
-     (with-fixed-allocation (y
-                             complex-double-float-widetag
-                             complex-double-float-size
-                             node)
-       (let ((real-tn (complex-double-reg-real-tn x)))
-         (with-tn@fp-top(real-tn)
-           (inst fstd (ea-for-cdf-real-desc y))))
-       (let ((imag-tn (complex-double-reg-imag-tn x)))
-         (with-tn@fp-top(imag-tn)
-           (inst fstd (ea-for-cdf-imag-desc y)))))))
+     (fixed-alloc y complex-double-float-widetag complex-double-float-size node)
+     (let ((real-tn (complex-double-reg-real-tn x)))
+       (with-tn@fp-top(real-tn)
+         (inst fstd (ea-for-cdf-real-desc y))))
+     (let ((imag-tn (complex-double-reg-imag-tn x)))
+       (with-tn@fp-top(imag-tn)
+         (inst fstd (ea-for-cdf-imag-desc y))))))
 (define-move-vop move-from-complex-double :move
   (complex-double-reg) (descriptor-reg))
 
@@ -561,16 +543,13 @@
   (:node-var node)
   (:note "complex float to pointer coercion")
   (:generator 13
-     (with-fixed-allocation (y
-                             complex-long-float-widetag
-                             complex-long-float-size
-                             node)
-       (let ((real-tn (complex-long-reg-real-tn x)))
-         (with-tn@fp-top(real-tn)
-           (store-long-float (ea-for-clf-real-desc y))))
-       (let ((imag-tn (complex-long-reg-imag-tn x)))
-         (with-tn@fp-top(imag-tn)
-           (store-long-float (ea-for-clf-imag-desc y)))))))
+     (fixed-alloc y complex-long-float-widetag complex-long-float-size node)
+     (let ((real-tn (complex-long-reg-real-tn x)))
+       (with-tn@fp-top(real-tn)
+         (store-long-float (ea-for-clf-real-desc y))))
+     (let ((imag-tn (complex-long-reg-imag-tn x)))
+       (with-tn@fp-top(imag-tn)
+         (store-long-float (ea-for-clf-imag-desc y))))))
 #!+long-float
 (define-move-vop move-from-complex-long :move
   (complex-long-reg) (descriptor-reg))
@@ -1729,7 +1708,7 @@
                    '((note-this-location vop :internal-error)
                      ;; Catch any pending FPE exceptions.
                      (inst wait)))
-                (,(if round-p 'progn 'pseudo-atomic)
+                (,@(if round-p '(progn) '(pseudo-atomic ()))
                  ;; Normal mode (for now) is "round to best".
                  (with-tn@fp-top (x)
                    ,@(unless round-p
@@ -2063,7 +2042,7 @@
 
 ;;;; float mode hackery
 
-(sb!xc:deftype float-modes () '(unsigned-byte 32)) ; really only 16
+(sb-xc:deftype float-modes () '(unsigned-byte 32)) ; really only 16
 (defknown floating-point-modes () float-modes (flushable))
 (defknown ((setf floating-point-modes)) (float-modes)
   float-modes)
@@ -2233,7 +2212,7 @@
                     (emit-label DONE)
                     (unless (zerop (tn-offset y))
                       (inst fstd y))
-                    (assemble (*elsewhere*)
+                    (assemble (:elsewhere)
                       (emit-label REDUCE)
                       ;; Else x was out of range so reduce it; ST0 is unchanged.
                       (with-empty-tn@fp-top (fr1)
@@ -2286,7 +2265,7 @@
       (inst fnstsw)                        ; status word to ax
       (inst and ah-tn #x04)                ; C2
       (inst jmp :nz REDUCE)
-      (assemble (*elsewhere*)
+      (assemble (:elsewhere)
         (emit-label REDUCE)
         ;; Else x was out of range so reduce it; ST0 is unchanged.
         (with-empty-tn@fp-top (fr1)
@@ -2345,7 +2324,7 @@
      (inst jmp :z DONE)          ; +Inf gives +Inf.
      (inst fstp fr0)                ; -Inf gives 0
      (inst fldz)
-     (inst jmp-short DONE)
+     (inst jmp DONE)
      NOINFNAN
      (inst fstp fr1)
      (inst fldl2e)
@@ -2402,7 +2381,7 @@
      (inst fstp fr0)                ; -Inf gives -1.0
      (inst fld1)
      (inst fchs)
-     (inst jmp-short DONE)
+     (inst jmp DONE)
      NOINFNAN
      ;; Free two stack slots leaving the argument on top.
      (inst fstp fr2)
@@ -3324,7 +3303,7 @@
      (inst jmp :z DONE)          ; +Inf gives +Inf.
      (inst fstp fr0)                ; -Inf gives 0
      (inst fldz)
-     (inst jmp-short DONE)
+     (inst jmp DONE)
      NOINFNAN
      (inst fstp fr1)
      (inst fldl2e)
@@ -3381,7 +3360,7 @@
      (inst fstp fr0)                ; -Inf gives -1.0
      (inst fld1)
      (inst fchs)
-     (inst jmp-short DONE)
+     (inst jmp DONE)
      NOINFNAN
      ;; Free two stack slots leaving the argument on top.
      (inst fstp fr2)

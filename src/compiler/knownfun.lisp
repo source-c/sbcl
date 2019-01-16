@@ -12,7 +12,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 (/show0 "knownfun.lisp 17")
 
@@ -41,7 +41,8 @@
   ;; notes about failed transformation due to types even though it
   ;; wouldn't have been applied with the right types anyway,
   ;; or if another transform could be applied with the right policy.
-  (policy nil :type (or null function)))
+  (policy nil :type (or null function))
+  (extra-type nil))
 
 (defprinter (transform) type note important)
 
@@ -51,16 +52,16 @@
   (let* ((ctype (specifier-type type))
          (note (or note "optimize"))
          (info (fun-info-or-lose name))
-         (old (find-if (lambda (x)
-                         (and (type= (transform-type x) ctype)
-                              (string-equal (transform-note x) note)
-                              (eq (transform-important x) important)))
-                       (fun-info-transforms info))))
+         (old (find ctype (fun-info-transforms info)
+                    :test #'type=
+                    :key #'transform-type)))
     (cond (old
            (style-warn 'redefinition-with-deftransform
                        :transform old)
            (setf (transform-function old) fun
-                 (transform-note old) note))
+                 (transform-note old) note
+                 (transform-important old) important
+                 (transform-policy old) policy))
           (t
            (push (make-transform :type ctype :function fun :note note
                                  :important important
@@ -71,11 +72,15 @@
 ;;; Make a FUN-INFO structure with the specified type, attributes
 ;;; and optimizers.
 (defun %defknown (names type attributes location
-                  &key derive-type optimizer destroyed-constant-args result-arg
+                  &key derive-type optimizer result-arg
                        overwrite-fndb-silently
-                       callable-map
-                       call-type-deriver)
-  (let ((ctype (specifier-type type)))
+                       call-type-deriver
+                       annotation)
+  (let* ((ctype (specifier-type type))
+         (type-to-store (if (contains-unknown-type-p ctype)
+                            ;; unparse it, so SFUNCTION -> FUNCTION
+                            (type-specifier ctype)
+                            ctype)))
     (dolist (name names)
       (unless overwrite-fndb-silently
         (let ((old-fun-info (info :function :info name)))
@@ -92,22 +97,148 @@
             (cerror "Go ahead, overwrite it."
                     "~@<overwriting old FUN-INFO ~2I~_~S ~I~_for ~S~:>"
                     old-fun-info name))))
-      (setf (info :function :type name) ctype)
+      (setf (info :function :type name) type-to-store)
       (setf (info :function :where-from name) :declared)
       (setf (info :function :kind name) :function)
       (setf (info :function :info name)
             (make-fun-info :attributes attributes
                            :derive-type derive-type
                            :optimizer optimizer
-                           :destroyed-constant-args destroyed-constant-args
                            :result-arg result-arg
-                           :callable-map callable-map
-                           :call-type-deriver call-type-deriver))
+                           :call-type-deriver call-type-deriver
+                           :annotation annotation))
       (if location
           (setf (getf (info :source-location :declaration name) 'defknown)
                 location)
           (remf (info :source-location :declaration name) 'defknown))))
   names)
+
+
+;;; This macro should be the way that all implementation independent
+;;; information about functions is made known to the compiler.
+;;;
+;;; FIXME: The comment above suggests that perhaps some of my added
+;;; FTYPE declarations are in poor taste. Should I change my
+;;; declarations, or change the comment, or what?
+;;;
+;;; FIXME: DEFKNOWN is needed only at build-the-system time. Figure
+;;; out some way to keep it from appearing in the target system.
+;;;
+;;; Declare the function NAME to be a known function. We construct a
+;;; type specifier for the function by wrapping (FUNCTION ...) around
+;;; the ARG-TYPES and RESULT-TYPE. ATTRIBUTES is an unevaluated list
+;;; of boolean attributes of the function. See their description in
+;;; (!DEF-BOOLEAN-ATTRIBUTE IR1). NAME may also be a list of names, in
+;;; which case the same information is given to all the names. The
+;;; keywords specify the initial values for various optimizers that
+;;; the function might have.
+(defmacro defknown (name arg-types result-type &optional (attributes '(any))
+                    &body keys)
+  #-sb-xc-host
+  (when (member 'unsafe attributes)
+    (style-warn "Ignoring legacy attribute UNSAFE. Replaced by its inverse: DX-SAFE.")
+    (setf attributes (remove 'unsafe attributes)))
+  (when (and (intersection attributes '(any call unwind))
+             (intersection attributes '(movable)))
+    (error "function cannot have both good and bad attributes: ~S" attributes))
+
+  (when (member 'any attributes)
+    (setq attributes (union '(unwind) attributes)))
+  (when (member 'flushable attributes)
+    (pushnew 'unsafely-flushable attributes))
+  (multiple-value-bind (type annotation)
+      (split-type-info arg-types result-type)
+    `(%defknown ',(if (and (consp name)
+                           (not (legal-fun-name-p name)))
+                      name
+                      (list name))
+                ',type
+                (ir1-attributes ,@attributes)
+                (source-location)
+                :annotation ,annotation
+                ,@keys)))
+
+(defstruct (fun-type-annotation
+            (:copier nil))
+  positional ;; required and &optional
+  rest
+  key
+  returns)
+
+(defun split-type-info (arg-types result-type)
+  (if (eq arg-types '*)
+      `(sfunction ,arg-types ,result-type)
+      (multiple-value-bind (llks required optional rest keys)
+          (parse-lambda-list
+           arg-types
+           :context :function-type
+           :accept (lambda-list-keyword-mask
+                    '(&optional &rest &key &allow-other-keys))
+           :silent t)
+        (let ((i -1)
+              positional-annotation
+              rest-annotation
+              key-annotation
+              return-annotation)
+          (labels ((annotation-p (x)
+                     (typep x '(or (cons (member function function-designator modifying
+                                          inhibit-flushing))
+                                (member type-specifier proper-sequence proper-list
+                                 proper-or-dotted-list proper-or-circular-list))))
+                   (strip-annotation (x)
+                     (if (consp x)
+                         (ecase (car x)
+                           ((function function-designator) (car x))
+                           ((modifying inhibit-flushing) (cadr x)))
+                         (case x
+                           (proper-sequence 'sequence)
+                           ((proper-list proper-or-dotted-list proper-or-circular-list) 'list)
+                           (t x))))
+                   (process-positional (type)
+                     (incf i)
+                     (cond ((annotation-p type)
+                            (push (cons i (ensure-list type)) positional-annotation)
+                            (strip-annotation type))
+                           (t
+                            type)))
+                   (process-key (pair)
+                     (cond ((annotation-p (cadr pair))
+                            (destructuring-bind (key value) pair
+                              (setf (getf key-annotation key) (ensure-list value))
+                              (list key (strip-annotation value))))
+                           (t
+                            pair)))
+                   (process-rest (type)
+                     (cond ((annotation-p type)
+                            (setf rest-annotation (ensure-list type))
+                            (strip-annotation type))
+                           (t
+                            type)))
+                   (process-return (type)
+                     (cond ((annotation-p type)
+                            (setf return-annotation (ensure-list type))
+                            (strip-annotation type))
+                           (t
+                            type))))
+            (let ((required (mapcar #'process-positional required))
+                  (optional (mapcar #'process-positional optional))
+                  (rest (process-rest (car rest)))
+                  (key (mapcar #'process-key keys))
+                  (return (process-return result-type)))
+              (values
+               `(sfunction
+                 (,@required
+                  ,@(and optional `(&optional ,@optional))
+                  ,@(and (ll-kwds-restp llks) `(&rest ,rest))
+                  ,@(and (ll-kwds-keyp llks) `(&key ,@key))
+                  ,@(and (ll-kwds-allowp llks) '(&allow-other-keys)))
+                 ,return)
+               (when (or positional-annotation rest-annotation
+                         key-annotation return-annotation)
+                 `(make-fun-type-annotation :positional ',positional-annotation
+                                            :rest ',rest-annotation
+                                            :key ',key-annotation
+                                            :returns ',return-annotation)))))))))
 
 ;;; Return the FUN-INFO for NAME or die trying.
 (declaim (ftype (sfunction (t) fun-info) fun-info-or-lose))
@@ -249,46 +380,6 @@
                      (t
                       ctype))))))))))
 
-(defun remove-non-constants-and-nils (fun)
-  (lambda (list)
-    (remove-if-not #'lvar-value
-                   (remove-if-not #'constant-lvar-p (funcall fun list)))))
-
-;;; FIXME: bad name (first because it uses 1-based indexing; second
-;;; because it doesn't get the nth constant arguments)
-(defun nth-constant-args (&rest indices)
-  (lambda (list)
-    (let (result)
-      (do ((i 1 (1+ i))
-           (list list (cdr list))
-           (indices indices))
-          ((null indices) (nreverse result))
-        (when (= i (car indices))
-          (when (constant-lvar-p (car list))
-            (push (car list) result))
-          (setf indices (cdr indices)))))))
-
-;;; FIXME: a number of the sequence functions not only do not destroy
-;;; their argument if it is empty, but also leave it alone if :start
-;;; and :end bound a null sequence, or if :count is 0.  This test is a
-;;; bit complicated to implement, verging on the impossible, but for
-;;; extra points (fill #\1 "abc" :start 0 :end 0) should not cause a
-;;; warning.
-(defun nth-constant-nonempty-sequence-args (&rest indices)
-  (lambda (list)
-    (let (result)
-      (do ((i 1 (1+ i))
-           (list list (cdr list))
-           (indices indices))
-          ((null indices) (nreverse result))
-        (when (= i (car indices))
-          (when (constant-lvar-p (car list))
-            (let ((value (lvar-value (car list))))
-              (unless (or (typep value 'null)
-                          (typep value '(vector * 0)))
-                (push (car list) result))))
-          (setf indices (cdr indices)))))))
-
 (defun read-elt-type-deriver (skip-arg-p element-type-spec no-hang)
   (lambda (call)
     (let* ((element-type (specifier-type element-type-spec))
@@ -313,7 +404,11 @@
 
 ;;; Return MAX MIN
 (defun sequence-lvar-dimensions (lvar)
-  (if (not (constant-lvar-p lvar))
+  (if (constant-lvar-p lvar)
+      (let ((value (lvar-value lvar)))
+        (and (proper-sequence-p value)
+             (let ((length (length value)))
+               (values length length))))
       (let ((max 0) (min array-total-size-limit))
         (block nil
           (labels ((max-dim (type)
@@ -341,11 +436,7 @@
             ;; However that's probably not an important use, so the above
             ;; logic restricts itself to simple arrays.
             (max-dim (lvar-type lvar))
-            (values max min))))
-      (let ((value (lvar-value lvar)))
-        (and (typep value 'sequence)
-             (let ((length (length value)))
-               (values length length))))))
+            (values max min))))))
 
 (defun position-derive-type (call)
   (let ((dim (sequence-lvar-dimensions (second (combination-args call)))))
@@ -360,20 +451,53 @@
 ;;; This used to be done in DEFOPTIMIZER DERIVE-TYPE, but
 ;;; ASSERT-CALL-TYPE already asserts the ARRAY type, so it gets an extra
 ;;; assertion that may not get eliminated and requires extra work.
-(defun array-call-type-deriver (call trusted)
-  (let ((type (lvar-type (combination-fun call)))
-        (policy (lexenv-policy (node-lexenv call)))
-        (args (combination-args call)))
-    (flet ((assert-type (arg type)
-             (when (assert-lvar-type arg type policy)
-               (unless trusted (reoptimize-lvar arg)))))
-      (loop for (type . next) on (fun-type-required type)
-            while next
-            do (assert-type (pop args) type))
-      (assert-type (pop args)
-                   (specifier-type `(array * ,(make-list (length args)
-                                                         :initial-element '*))))
-      (loop for subscript in args
-            do (assert-type subscript (fun-type-rest type))))))
+(defun array-call-type-deriver (call trusted &optional set row-major-aref)
+  (let* ((fun (combination-fun call))
+         (type (lvar-fun-type fun))
+         (policy (lexenv-policy (node-lexenv call)))
+         (args (combination-args call)))
+    (when (fun-type-p type)
+      (flet ((assert-type (arg type &optional set index)
+               (when (cond (index
+                            (assert-array-index-lvar-type arg type policy))
+                           (t
+                            (when set
+                              (add-annotation arg
+                                              (make-lvar-modified-annotation :caller (lvar-fun-name fun))))
+                            (assert-lvar-type arg type policy)))
+                 (unless trusted (reoptimize-lvar arg)))))
+        (let ((required (fun-type-required type)))
+          (when set
+            (assert-type (pop args)
+                         (pop required)))
+          (assert-type (pop args)
+                       (if row-major-aref
+                           (pop required)
+                           (type-intersection
+                            (pop required)
+                            (specifier-type `(array * ,(length args)))))
+                       set)
+          (loop for type in required
+                do
+                (assert-type (pop args) type nil (or (not (and set row-major-aref))
+                                                     args)))
+          (loop for type in (fun-type-optional type)
+                do (assert-type (pop args) type nil t))
+          (loop for subscript in args
+                do (assert-type subscript (fun-type-rest type) nil t)))))))
 
-(/show0 "knownfun.lisp end of file")
+(defun append-call-type-deriver (call trusted)
+  (let* ((policy (lexenv-policy (node-lexenv call)))
+         (args (combination-args call))
+         (list-type (specifier-type 'list)))
+    ;; All but the last argument should be proper lists
+    (loop for (arg next) on args
+          while next
+          do
+          (add-annotation
+           arg
+           (make-lvar-proper-sequence-annotation
+            :kind 'proper-list))
+          (when (and (assert-lvar-type arg list-type policy)
+                     (not trusted))
+            (reoptimize-lvar arg)))))

@@ -16,6 +16,8 @@
 #ifndef PSEUDO_ATOMIC_H
 #define PSEUDO_ATOMIC_H
 
+#include "interr.h"
+
 #if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
 
 #define set_alloc_pointer(value) dynamic_space_free_pointer = (lispobj*)(value)
@@ -34,17 +36,17 @@
 #endif
 
 static inline int
-get_pseudo_atomic_atomic(struct thread *thread)
+get_pseudo_atomic_atomic(struct thread __attribute__((unused)) *thread)
 {
     return (THREAD_PA_BITS(thread) & (~1)) != 0;
 }
 
 static inline void
-set_pseudo_atomic_atomic(struct thread *thread)
+set_pseudo_atomic_atomic(struct thread __attribute__((unused)) *thread)
 {
     lispobj *p = &THREAD_PA_BITS(thread);
     if (*p)
-        lose("set_pseudo_atomic_atomic: pseudo atomic bits is %d.", *p);
+        lose("set_pseudo_atomic_atomic: pseudo atomic bits is %"OBJ_FMTX, *p);
     __asm__ __volatile__
         ("or" LISPOBJ_ASM_SUFFIX " %0,%1"
          :
@@ -53,7 +55,7 @@ set_pseudo_atomic_atomic(struct thread *thread)
 }
 
 static inline void
-clear_pseudo_atomic_atomic(struct thread *thread)
+clear_pseudo_atomic_atomic(struct thread __attribute__((unused)) *thread)
 {
     lispobj *p = &THREAD_PA_BITS(thread);
     __asm__ __volatile__
@@ -64,7 +66,7 @@ clear_pseudo_atomic_atomic(struct thread *thread)
 }
 
 static inline int
-get_pseudo_atomic_interrupted(struct thread *thread)
+get_pseudo_atomic_interrupted(struct thread __attribute__((unused)) *thread)
 {
     return THREAD_PA_BITS(thread) & 1;
 }

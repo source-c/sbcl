@@ -9,34 +9,32 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;; We compile some trivial character operations via inline expansion.
 #!-sb-fluid
 (declaim (inline standard-char-p graphic-char-p alpha-char-p
                  alphanumericp))
 (declaim (maybe-inline upper-case-p lower-case-p both-case-p
-                       digit-char-p two-arg-char-equal))
+                       digit-char-p))
 
 (deftype char-code ()
-  `(integer 0 (,sb!xc:char-code-limit)))
+  `(integer 0 (,sb-xc:char-code-limit)))
 
-(defglobal **unicode-character-name-huffman-tree** ())
+(define-load-time-global **unicode-character-name-huffman-tree** ())
 
 (declaim (inline pack-3-codepoints))
 (defun pack-3-codepoints (first &optional (second 0) (third 0))
   (declare (type (unsigned-byte 21) first second third))
-  (sb!c::mask-signed-field 63 (logior first (ash second 21) (ash third 42))))
+  (sb-c::mask-signed-field 63 (logior first (ash second 21) (ash third 42))))
 
 (macrolet ((frob ()
              (flet ((coerce-it (array)
                       (!coerce-to-specialized array '(unsigned-byte 8)))
                     (file (name type)
-                      ;; FIXME: this fails on a certain build system,
-                      ;; as does the more obvious :directory '(:relative "output").
-                      ;; Why???
-                      (make-pathname :directory (pathname-directory (merge-pathnames "output/"))
-                                     :name name :type type))
+                      (let ((dir (sb-cold:prepend-genfile-path "output/")))
+                        (make-pathname :directory (pathname-directory (merge-pathnames dir))
+                                       :name name :type type)))
                     (read-ub8-vector (pathname)
                       (with-open-file (stream pathname
                                               :element-type '(unsigned-byte 8))
@@ -47,7 +45,7 @@
                           array)))
                     (init-global (name type &optional length)
                       `(progn
-                         (defglobal ,name
+                         (define-load-time-global ,name
                              ,(if (eql type 'hash-table)
                                   `(make-hash-table)
                                   `(make-array ,length :element-type ',type)))
@@ -184,7 +182,7 @@
                                                    key-length
                                                    :element-type '(unsigned-byte 32)))
                                              (codepoints nil))
-                                        (assert (and (/= cp-length 0) (/= key-length 0)))
+                                        (aver (and (/= cp-length 0) (/= key-length 0)))
                                         (loop repeat cp-length do
                                               (push (dpb 0 (byte 10 22) (aref info index))
                                                     codepoints)
@@ -284,7 +282,7 @@
   (frob))
 #+sb-xc-host (!character-name-database-cold-init)
 
-(defglobal *base-char-name-alist*
+(define-load-time-global *base-char-name-alist*
   ;; Note: The *** markers here indicate character names which are
   ;; required by the ANSI specification of #'CHAR-NAME. For the others,
   ;; we prefer the ASCII standard name.
@@ -568,7 +566,7 @@ argument is an alphabetic character, A-Z or a-z; otherwise NIL."
         (page-var (gensym "PAGE")))
     `(block nil
        (locally
-           (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+           (declare (optimize (sb-c::insert-array-bounds-checks 0)))
          (let ((,code-var (char-code ,char)))
            (let* ((,shifted-var (ash ,code-var -6))
                   (,page-var (if (>= ,shifted-var (length **character-case-pages**))
@@ -611,7 +609,7 @@ lowercase eszet (U+DF)."
     (let ((code (aref cases (1+ index))))
       (if (zerop code)
           char
-          (code-char code)))))
+          (code-char (truly-the char-code code))))))
 
 (defun char-downcase (char)
   "Return CHAR converted to lower-case if that is possible."
@@ -620,7 +618,7 @@ lowercase eszet (U+DF)."
     (let ((code (aref cases index)))
       (if (zerop code)
           char
-          (code-char code)))))
+          (code-char (truly-the char-code code))))))
 
 (defun alphanumericp (char)
   "Given a character-object argument, ALPHANUMERICP returns T if the argument
@@ -664,7 +662,8 @@ is either numeric or alphabetic."
               code
               down-code)))))
 
-(defun two-arg-char-equal (c1 c2)
+(declaim (inline two-arg-char-equal-inline))
+(defun two-arg-char-equal-inline (c1 c2)
   (flet ((base-char-equal-p ()
            (let* ((code1 (char-code c1))
                   (code2 (char-code c2))
@@ -692,14 +691,12 @@ is either numeric or alphabetic."
              (or (= (aref cases index) (char-code c2)) ;; lower case
                  (= (aref cases (1+ index)) (char-code c2))))))))
 
-(defun char-equal-constant (x char reverse-case-char)
-  (declare (type character x) (explicit-check))
-  (or (eq char x)
-      (eq reverse-case-char x)))
+;;; There are transforms on two-arg-char-equal, don't make it inlinable itself.
+(defun two-arg-char-equal (c1 c2)
+  (two-arg-char-equal-inline c1 c2))
 
 (defun two-arg-char-not-equal (c1 c2)
-  (declare (inline two-arg-char-equal))
-  (not (two-arg-char-equal c1 c2)))
+  (not (two-arg-char-equal-inline c1 c2)))
 
 (macrolet ((def (name test doc)
              `(defun ,name (character &rest more-characters)

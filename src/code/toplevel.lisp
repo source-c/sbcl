@@ -11,7 +11,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; default initfiles
 
@@ -21,8 +21,8 @@
           (probe-file (merge-pathnames "sbclrc" sbcl-homedir))))
       #!+win32
       (merge-pathnames "sbcl\\sbclrc"
-                       (sb!win32::get-folder-pathname
-                        sb!win32::csidl_common_appdata))
+                       (sb-win32::get-folder-pathname
+                        sb-win32::csidl_common_appdata))
       #!-win32
       "/etc/sbclrc"))
 
@@ -58,7 +58,7 @@ been specified on the command-line.")
          (%exit)))))
 
 (define-load-time-global *exit-lock* nil)
-(defvar *exit-in-process* nil)
+(!define-thread-local *exit-in-process* nil)
 (declaim (type (or null real) *exit-timeout*))
 (defvar *exit-timeout* 60
   "Default amount of seconds, if any, EXIT should wait for other
@@ -89,7 +89,7 @@ means to wait indefinitely.")
           (unwind-protect
                (progn
                  (flush-standard-output-streams)
-                 (sb!thread::%exit-other-threads)
+                 (sb-thread::%exit-other-threads)
                  (setf ok t))
             (os-exit code :abort (not ok)))))))
 
@@ -98,18 +98,18 @@ means to wait indefinitely.")
 (declaim (inline split-ratio-for-sleep))
 (defun split-ratio-for-sleep (seconds)
   (declare (ratio seconds)
-           (muffle-conditions t))
+           (muffle-conditions compiler-note))
   (multiple-value-bind (quot rem) (truncate (numerator seconds)
                                             (denominator seconds))
     (values quot
             (* rem
-               #.(if (sb!xc:typep 1000000000 'fixnum)
+               #.(if (sb-xc:typep 1000000000 'fixnum)
                      '(truncate 1000000000 (denominator seconds))
                      ;; Can't truncate a bignum by a fixnum without consing
                      '(* 10 (truncate 100000000 (denominator seconds))))))))
 
 (defun split-seconds-for-sleep (seconds)
-  (declare (muffle-conditions t))
+  (declare (muffle-conditions compiler-note))
   ;; KLUDGE: This whole thing to avoid consing floats
   (flet ((split-float ()
            (let ((whole-seconds (truly-the fixnum (%unary-truncate seconds))))
@@ -119,9 +119,9 @@ means to wait indefinitely.")
                                                     (load-time-value 1f9 t))))))))
     (declare (inline split-float))
     (typecase seconds
-      ((single-float 0f0 #.(float sb!xc:most-positive-fixnum 1f0))
+      ((single-float 0f0 #.(float sb-xc:most-positive-fixnum 1f0))
        (split-float))
-      ((double-float 0d0 #.(float sb!xc:most-positive-fixnum 1d0))
+      ((double-float 0d0 #.(float sb-xc:most-positive-fixnum 1d0))
        (split-float))
       (ratio
        (split-ratio-for-sleep seconds))
@@ -129,6 +129,39 @@ means to wait indefinitely.")
        (multiple-value-bind (sec frac)
            (truncate seconds)
          (values sec (truncate frac (load-time-value 1f-9 t))))))))
+
+(declaim (inline %nanosleep))
+(defun %nanosleep (sec nsec)
+  ;; nanosleep() accepts time_t as the first argument, but on some
+  ;; platforms it is restricted to 100 million seconds. Maybe someone
+  ;; can actually have a reason to sleep for over 3 years?
+  (loop while (> sec (expt 10 8))
+     do (decf sec (expt 10 8))
+       (sb-unix:nanosleep (expt 10 8) 0))
+  (sb-unix:nanosleep sec nsec))
+
+(declaim (inline %sleep))
+#!-win32
+(defun %sleep (seconds)
+  (typecase seconds
+    (double-float
+     (sb-unix::nanosleep-double seconds))
+    (single-float
+     (sb-unix::nanosleep-float seconds))
+    (integer
+     (%nanosleep seconds 0))
+    (t
+     (multiple-value-call #'%nanosleep (split-ratio-for-sleep seconds)))))
+
+#!+(and win32 sb-thread)
+(defun %sleep (seconds)
+  (if (integerp seconds)
+      (%nanosleep seconds 0)
+      (multiple-value-call #'%nanosleep (split-seconds-for-sleep seconds))))
+
+#!+(and win32 (not sb-thread))
+(defun %sleep (seconds)
+  (sb-win32:millisleep (truncate (* seconds 1000))))
 
 (defun sleep (seconds)
   "This function causes execution to be suspended for SECONDS. SECONDS may be
@@ -142,31 +175,34 @@ any non-negative real number."
            :format-arguments (list seconds)
            :datum seconds
            :expected-type '(real 0)))
-  #!-(and win32 (not sb-thread))
-  (typecase seconds
-    #!-win32
-    (double-float
-     (sb!unix::nanosleep-double seconds))
-    #!-win32
-    (single-float
-     (sb!unix::nanosleep-float seconds))
-    (t
-     (multiple-value-bind (sec nsec)
-         (if (integerp seconds)
-             (values seconds 0)
-             #!-win32
-             (split-ratio-for-sleep seconds)
-             #!+win32
-             (split-seconds-for-sleep seconds))
-       ;; nanosleep() accepts time_t as the first argument, but on some platforms
-       ;; it is restricted to 100 million seconds. Maybe someone can actually
-       ;; have a reason to sleep for over 3 years?
-       (loop while (> sec (expt 10 8))
-             do (decf sec (expt 10 8))
-                (sb!unix:nanosleep (expt 10 8) 0))
-       (sb!unix:nanosleep sec nsec))))
-  #!+(and win32 (not sb-thread))
-  (sb!win32:millisleep (truncate (* seconds 1000)))
+  (if *deadline*
+      (let ((start (get-internal-real-time))
+            ;; SECONDS can be too large to present as INTERNAL-TIME,
+            ;; use the largest representable value in that case.
+            (timeout (or (seconds-to-maybe-internal-time seconds)
+                         (* safe-internal-seconds-limit
+                            internal-time-units-per-second))))
+        (labels ((sleep-for-a-bit (remaining)
+                   (multiple-value-bind
+                         (timeout-sec timeout-usec stop-sec stop-usec deadlinep)
+                       (decode-timeout (/ remaining internal-time-units-per-second))
+                     (declare (ignore stop-sec stop-usec))
+                     ;; Sleep until either the timeout or the deadline
+                     ;; expires.
+                     (when (or (plusp timeout-sec) (plusp timeout-usec))
+                       (%nanosleep timeout-sec (* 1000 timeout-usec)))
+                     ;; If the deadline expired first, signal the
+                     ;; DEADLINE-TIMEOUT. If the deadline is deferred
+                     ;; or canceled, go back to sleep for the
+                     ;; remaining time (if any).
+                     (when deadlinep
+                       (signal-deadline)
+                       (let ((remaining (- timeout
+                                           (- (get-internal-real-time) start))))
+                         (when (plusp remaining)
+                           (sleep-for-a-bit remaining)))))))
+          (sleep-for-a-bit timeout)))
+      (%sleep seconds))
   nil)
 
 ;;;; the default toplevel function
@@ -266,11 +302,12 @@ any non-negative real number."
            ;; Scripts don't need to be stylish or fast, but silence is usually a
            ;; desirable quality...
            (handler-bind (((or style-warning compiler-note) #'muffle-warning)
-                          (stream-error (lambda (e)
-                                          ;; Shell-style.
-                                          (when (member (stream-error-stream e)
-                                                        (list *stdout* *stdin* *stderr*))
-                                            (exit)))))
+                          ((or broken-pipe end-of-file)
+                            (lambda (e)
+                              ;; Shell-style.
+                              (when (member (stream-error-stream e)
+                                            (list *stdout* *stdin* *stderr*))
+                                (exit)))))
              ;; Let's not use the *TTY* for scripts, ok? Also, normally we use
              ;; synonym streams, but in order to have the broken pipe/eof error
              ;; handling right we want to bind them for scripts.
@@ -284,7 +321,7 @@ any non-negative real number."
       (if (eq t script)
           (load-script *stdin*)
           (with-open-file (f (native-pathname script) :element-type :default)
-            (sb!fasl::maybe-skip-shebang-line f)
+            (sb-fasl::maybe-skip-shebang-line f)
             (load-script f))))))
 
 ;; Errors while processing the command line cause the system to EXIT,
@@ -448,7 +485,7 @@ any non-negative real number."
                        (cond (stream
                               (dx-flet ((thunk ()
                                           (load-as-source stream :context kind)))
-                                (sb!fasl::call-with-load-bindings #'thunk stream)))
+                                (sb-fasl::call-with-load-bindings #'thunk stream)))
                              (specified-pathname
                               (cerror "Ignore missing init file"
                                       "The specified ~A file ~A was not found."
@@ -505,6 +542,35 @@ the user for input.")
 that provides the REPL for the system. Assumes that *STANDARD-INPUT* and
 *STANDARD-OUTPUT* are set up.")
 
+;;; toplevel helper
+(defmacro with-rebound-io-syntax (&body body)
+  `(%with-rebound-io-syntax (lambda () ,@body)))
+
+(defun %with-rebound-io-syntax (function)
+  (declare (type function function))
+  (declare (dynamic-extent function))
+  (let ((*package* *package*)
+        (*print-array* *print-array*)
+        (*print-base* *print-base*)
+        (*print-case* *print-case*)
+        (*print-circle* *print-circle*)
+        (*print-escape* *print-escape*)
+        (*print-gensym* *print-gensym*)
+        (*print-length* *print-length*)
+        (*print-level* *print-level*)
+        (*print-lines* *print-lines*)
+        (*print-miser-width* *print-miser-width*)
+        (*print-pretty* *print-pretty*)
+        (*print-radix* *print-radix*)
+        (*print-readably* *print-readably*)
+        (*print-right-margin* *print-right-margin*)
+        (*read-base* *read-base*)
+        (*read-default-float-format* *read-default-float-format*)
+        (*read-eval* *read-eval*)
+        (*read-suppress* *read-suppress*)
+        (*readtable* *readtable*))
+    (funcall function)))
+
 ;;; read-eval-print loop for the default system toplevel
 (defun toplevel-repl (noprint)
   (/show0 "entering TOPLEVEL-REPL")
@@ -530,7 +596,7 @@ that provides the REPL for the system. Assumes that *STANDARD-INPUT* and
                    ;; should have unwound enough stack by the time we get
                    ;; here that this is now possible.
                    #!-win32
-                   (sb!kernel::reset-control-stack-guard-page)
+                   (sb-kernel::reset-control-stack-guard-page)
                    (funcall repl-fun noprint)
                    (critically-unreachable "after REPL")))))))))
 
@@ -559,9 +625,8 @@ that provides the REPL for the system. Assumes that *STANDARD-INPUT* and
   (loop
    (unwind-protect
         (progn
-          ;; (See comment preceding the definition of SCRUB-CONTROL-STACK.)
           (scrub-control-stack)
-          (sb!thread::get-foreground)
+          (sb-thread::get-foreground)
           (unless noprint
             (flush-standard-output-streams)
             (funcall *repl-prompt-fun* *standard-output*)
@@ -571,7 +636,14 @@ that provides the REPL for the system. Assumes that *STANDARD-INPUT* and
             ;; odd. But maybe there *is* a valid reason in some
             ;; circumstances? perhaps some deadlock issue when being driven
             ;; by another process or something...)
-            (force-output *standard-output*))
+            (force-output *standard-output*)
+            (let ((real (maybe-resolve-synonym-stream *standard-output*)))
+              ;; Because by default *standard-output* is not
+              ;; *terminal-io* but STDOUT the column is not reset
+              ;; after pressing enter. Reduce confusion by resetting
+              ;; the column to 0
+              (when (fd-stream-p real)
+                (setf (fd-stream-output-column real) 0))))
           (let* ((form (funcall *repl-read-form-fun*
                                 *standard-input*
                                 *standard-output*))
@@ -585,4 +657,4 @@ that provides the REPL for the system. Assumes that *STANDARD-INPUT* and
 
 ;;; a convenient way to get into the assembly-level debugger
 (defun %halt ()
-  (%primitive sb!c:halt))
+  (%primitive sb-c:halt))

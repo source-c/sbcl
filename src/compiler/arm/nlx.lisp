@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; Make a TN for the argument count passing location for a
 ;;; non-local entry.
@@ -59,6 +59,16 @@
   (:results (res :scs (any-reg descriptor-reg)))
   (:generator 1
     (load-symbol-value res *binding-stack-pointer*)))
+
+(define-vop (current-nsp)
+  (:results (res :scs (any-reg descriptor-reg)))
+  (:generator 1
+    (move res nsp-tn)))
+
+(define-vop (set-nsp)
+  (:args (nsp :scs (any-reg descriptor-reg)))
+  (:generator 1
+    (move nsp-tn nsp)))
 
 ;;;; Unwind block hackery:
 
@@ -108,15 +118,12 @@
 
     (move block result)))
 
-;;; Just set the current unwind-protect to TN's address.  This
+;;; Just set the current unwind-protect to UWP.  This
 ;;; instantiates an unwind block as an unwind-protect.
 (define-vop (set-unwind-protect)
-  (:args (tn))
-  (:temporary (:scs (descriptor-reg)) new-uwp)
+  (:args (uwp :scs (any-reg)))
   (:generator 7
-    (composite-immediate-instruction
-     add new-uwp cfp-tn (* (tn-offset tn) n-word-bytes))
-    (store-symbol-value new-uwp *current-unwind-protect-block*)))
+    (store-symbol-value uwp *current-unwind-protect-block*)))
 
 (define-vop (unlink-catch-block)
   (:temporary (:scs (any-reg)) block)
@@ -263,7 +270,7 @@
       (storew temp block catch-block-entry-pc-slot)
 
       ;; Run any required UWPs.
-      (assemble (*elsewhere* vop)
+      (assemble (:elsewhere vop)
         (emit-label uwp-label)
         (inst word (make-fixup 'unwind :assembly-routine)))
       (inst load-from-label pc-tn lr-tn uwp-label)

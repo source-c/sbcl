@@ -30,11 +30,12 @@
 
 (defun try-call-into-lisp (c-prog) ; er, assembly program, but whatever
   (flet ((assemble-it (n)
-           (let ((segment (sb-assem:make-segment :type :regular)))
+           (let ((segment (sb-assem:make-segment)))
              (sb-assem:assemble (segment)
                (dolist (instruction (subst n :ARGC c-prog)
                                     (sb-assem::segment-buffer segment))
-                 (apply (sb-assem::op-encoder-name (car instruction))
+                 (apply #'sb-assem::%inst
+                        (sb-assem::op-encoder-name (car instruction))
                         (cdr instruction)))))))
     (dotimes (n-args 4)
       (let ((the-code (assemble-it n-args)))

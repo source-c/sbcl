@@ -73,17 +73,18 @@
 #include "gc.h"
 
 #define DEFTYPE(lispname,cname) { cname foo; \
-    printf("(define-alien-type " lispname " (%s %d))\n", (((foo=-1)<0) ? "signed" : "unsigned"), (8 * (sizeof foo))); }
+    printf("(define-alien-type " lispname " (%s %lu))\n", \
+           (((foo=-1)<0) ? "signed" : "unsigned"), (8LU * (sizeof foo))); }
 
 #define DEFSTRUCT(lispname,cname,body) { cname bar; \
     printf("(define-alien-type nil\n  (struct %s", #lispname); \
     body; \
     printf("))\n"); }
 #define DEFSLOT(lispname,cname) \
-    printf("\n          (%s (%s %d))", \
+    printf("\n          (%s (%s %lu))", \
            #lispname, \
            (((bar.cname=-1)<0) ? "signed" : "unsigned"), \
-           (8 * (sizeof bar.cname)))
+           (8LU * (sizeof bar.cname)))
 
 void
 defconstant(char* lisp_name, unsigned long unix_number)
@@ -103,7 +104,7 @@ void defsignal(char* lisp_name, unsigned long unix_number)
 }
 
 int
-main(int argc, char *argv[])
+main(int argc, char __attribute__((unused)) *argv[])
 {
     /* don't need no steenking command line arguments */
     if (1 != argc) {
@@ -120,7 +121,7 @@ main(int argc, char *argv[])
 #ifdef _WIN32
     #include "grovel-headers-win32.h"
 #else
-    printf("(in-package \"SB!ALIEN\")\n\n");
+    printf("(in-package \"SB-ALIEN\")\n\n");
 
     printf (";;;flags for dlopen()\n");
 
@@ -128,7 +129,7 @@ main(int argc, char *argv[])
     defconstant ("rtld-now", RTLD_NOW);
     defconstant ("rtld-global", RTLD_GLOBAL);
 
-    printf("(in-package \"SB!UNIX\")\n\n");
+    printf("(in-package \"SB-UNIX\")\n\n");
 
     printf(";;; select()\n");
     defconstant("fd-setsize", FD_SETSIZE);
@@ -217,9 +218,12 @@ main(int argc, char *argv[])
     deferrno("eio", EIO);
     deferrno("eexist", EEXIST);
     deferrno("eloop", ELOOP);
+    deferrno("epipe", EPIPE);
     deferrno("espipe", ESPIPE);
     deferrno("ewouldblock", EWOULDBLOCK);
     printf("\n");
+
+    deferrno("sc-nprocessors-onln", _SC_NPROCESSORS_ONLN);
 
     printf(";;; for wait3(2) in run-program.lisp\n");
 #ifdef WCONTINUED
@@ -356,7 +360,7 @@ main(int argc, char *argv[])
 
 #ifdef LISP_FEATURE_BSD
     printf(";;; sysctl(3) names\n");
-    printf("(in-package \"SB!IMPL\")\n");
+    printf("(in-package \"SB-IMPL\")\n");
     defconstant("ctl-kern", CTL_KERN);
     defconstant("ctl-hw", CTL_HW);
     defconstant("ctl-maxname", CTL_MAXNAME);
@@ -369,7 +373,7 @@ main(int argc, char *argv[])
     printf("\n");
 #endif
 
-    printf("(in-package \"SB!KERNEL\")\n\n");
+    printf("(in-package \"SB-KERNEL\")\n\n");
 #ifdef LISP_FEATURE_GENCGC
     printf(";;; GENCGC related\n");
     DEFTYPE("page-index-t", page_index_t);

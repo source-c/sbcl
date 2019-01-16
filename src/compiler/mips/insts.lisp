@@ -9,28 +9,25 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!MIPS-ASM")
+(in-package "SB-MIPS-ASM")
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   ;; Imports from this package into SB-VM
-  (import '(reg-tn-encoding) "SB!VM")
+  (import '(reg-tn-encoding) "SB-VM")
   ;; Imports from SB-VM into this package
   (import '(;; SBs, SCs, and TNs
-            sb!vm::immediate-constant
-            sb!vm::registers sb!vm::float-registers
-            sb!vm::zero
-            sb!vm::lip-tn sb!vm::zero-tn)))
-
-(setf *assem-scheduler-p* t)
-(setf *assem-max-locations* 68)
+            sb-vm::immediate-constant
+            sb-vm::registers sb-vm::float-registers
+            sb-vm::zero
+            sb-vm::lip-tn sb-vm::zero-tn)))
 
 ;;;; Constants, types, conversion functions, some disassembler stuff.
 
 (defun reg-tn-encoding (tn)
   (declare (type tn tn))
   (sc-case tn
-    (zero sb!vm::zero-offset)
-    (null sb!vm::null-offset)
+    (zero sb-vm::zero-offset)
+    (null sb-vm::null-offset)
     (t
      (if (eq (sb-name (sc-sb (tn-sc tn))) 'registers)
          (tn-offset tn)
@@ -41,8 +38,6 @@
   (unless (eq (sb-name (sc-sb (tn-sc tn))) 'float-registers)
     (error "~S isn't a floating-point register." tn))
   (tn-offset tn))
-
-;;;(sb!disassem:set-disassem-params :instruction-alignment 32)
 
 (defvar *disassem-use-lisp-reg-names* t)
 
@@ -75,7 +70,7 @@
        (lambda (name)
          (and name
               (make-symbol (concatenate 'string "$" name))))
-       sb!vm::*register-names*))
+       sb-vm::*register-names*))
 
 (define-arg-type reg
   :printer #'(lambda (value stream dstate)
@@ -89,7 +84,7 @@
   :printer (lambda (value stream dstate)
              (declare (ignore stream))
              (destructuring-bind (reg offset) value
-               (when (= reg sb!vm::code-offset)
+               (when (= reg sb-vm::code-offset)
                  (note-code-constant offset dstate)))))
 
 (defparameter *float-reg-symbols*
@@ -306,9 +301,6 @@
 
 (define-bitfield-emitter emit-word 32
   (byte 32 0))
-
-(define-bitfield-emitter emit-short 16
-  (byte 16 0))
 
 (define-bitfield-emitter emit-immediate-inst 32
   (byte 6 26) (byte 5 21) (byte 5 16) (byte 16 0))
@@ -621,8 +613,8 @@
 (defun emit-relative-branch (segment opcode r1 r2 target)
   (emit-chooser
    segment 20 2
-      #'(lambda (segment posn magic-value)
-          (declare (ignore magic-value))
+      #'(lambda (segment chooser posn magic-value)
+          (declare (ignore chooser magic-value))
           (let ((delta (ash (- (label-position target) (+ posn 4)) -2)))
             (when (typep delta '(signed-byte 16))
               (emit-back-patch segment 4
@@ -1054,18 +1046,12 @@
 (defun break-control (chunk inst stream dstate)
   (declare (ignore inst))
   (flet ((nt (x) (if stream (note x dstate))))
-    (when (= (break-code chunk dstate) 0)
-      (case (break-subcode chunk dstate)
+    (let ((trap (break-subcode chunk dstate)))
+      (case trap
         (#.halt-trap
          (nt "Halt trap"))
         (#.pending-interrupt-trap
          (nt "Pending interrupt trap"))
-        (#.error-trap
-         (nt "Error trap")
-         (handle-break-args #'snarf-error-junk stream dstate))
-        (#.cerror-trap
-         (nt "Cerror trap")
-         (handle-break-args #'snarf-error-junk stream dstate))
         (#.breakpoint-trap
          (nt "Breakpoint trap"))
         (#.fun-end-breakpoint-trap
@@ -1075,7 +1061,12 @@
         (#.single-step-around-trap
          (nt "Single step around trap"))
         (#.single-step-before-trap
-         (nt "Single step before trap"))))))
+         (nt "Single step before trap"))
+        (#.cerror-trap
+         (nt "Cerror trap")
+         (handle-break-args #'snarf-error-junk trap stream dstate))
+        (t
+         (handle-break-args #'snarf-error-junk trap stream dstate))))))
 
 (define-instruction break (segment code &optional (subcode 0))
   (:declare (type (unsigned-byte 10) code subcode))
@@ -1118,14 +1109,6 @@
      (integer
       (emit-word segment word)))))
 
-(define-instruction short (segment short)
-  (:declare (type (or (unsigned-byte 16) (signed-byte 16)) short))
-  :pinned
-  (:cost 0)
-  (:delay 0)
-  (:emitter
-   (emit-short segment short)))
-
 (define-instruction byte (segment byte)
   (:declare (type (or (unsigned-byte 8) (signed-byte 8)) byte))
   :pinned
@@ -1163,7 +1146,8 @@
   (emit-chooser
    ;; We emit either 12 or 4 bytes, so we maintain 8 byte alignments.
    segment 12 3
-   #'(lambda (segment posn delta-if-after)
+   #'(lambda (segment chooser posn delta-if-after)
+       (declare (ignore chooser))
        (let ((delta (funcall calc label posn delta-if-after)))
           (when (typep delta '(signed-byte 16))
             (emit-back-patch segment 4

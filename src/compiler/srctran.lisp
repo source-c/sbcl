@@ -11,7 +11,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; We turn IDENTITY into PROG1 so that it is obvious that it just
 ;;; returns the first value of its argument. Ditto for VALUES with one
@@ -19,10 +19,28 @@
 (define-source-transform identity (x) `(prog1 ,x))
 (define-source-transform values (x) `(prog1 ,x))
 
+(deftransform constantly ((value) * * :node node)
+  (let ((lvar (node-lvar node)))
+    (map-all-lvar-dests
+     lvar
+     (lambda (lvar node)
+       (unless (lvar-called-by-node-p lvar node)
+         (give-up-ir1-transform))))
+    `#'(lambda (&rest rest)
+         (declare (ignore rest))
+         value)))
+
 ;;; CONSTANTLY is pretty much never worth transforming, but it's good to get the type.
 (defoptimizer (constantly derive-type) ((value))
   (specifier-type
    `(function (&rest t) (values ,(type-specifier (lvar-type value)) &optional))))
+
+(defoptimizer (complement derive-type) ((fun))
+  (let ((type (lvar-fun-type fun)))
+    (when (fun-type-p type)
+      (specifier-type
+       (append (butlast (type-specifier type))
+               '(boolean))))))
 
 ;;; If the function has a known number of arguments, then return a
 ;;; lambda with the appropriate fixed number of args. If the
@@ -72,7 +90,6 @@
 ;;; Don't transform CAD*R, they are treated specially for &more args
 ;;; optimizations
 
-(/show0 "about to set CxR source transforms")
 (loop for i of-type index from 2 upto 4 do
       ;; Iterate over BUF = all names CxR where x = an I-element
       ;; string of #\A or #\D characters.
@@ -89,7 +106,6 @@
                           :test #'equal)
             (setf (info :function :source-transform (intern buf))
                   #'source-transform-cxr)))))
-(/show0 "done setting CxR source transforms")
 
 ;;; Turn FIRST..FOURTH and REST into the obvious synonym, assuming
 ;;; whatever is right for them is right for us. FIFTH..TENTH turn into
@@ -139,17 +155,24 @@
       ;; Something fishy here- If THE is removed, OPERAND-RESTRICTION-OK
       ;; returns NIL because type inference on MAKE-LIST never happens.
       ;; But the fndb entry for %MAKE-LIST is right, so I'm slightly bewildered.
-      `(%make-list (the (integer 0 (,(1- sb!xc:array-dimension-limit))) ,length)
+      `(%make-list (the (integer 0 (,(1- sb-xc:array-dimension-limit))) ,length)
                    ,(second rest))
       (values nil t))) ; give up
 
 (deftransform %make-list ((length item) ((constant-arg (eql 0)) t)) nil)
 
+(define-source-transform copy-list (list &environment env)
+  ;; If speed is more important than space, or cons profiling is wanted,
+  ;; then inline the whole copy loop.
+  (if (policy env (or (> speed space) (> instrument-consing 1)))
+      (once-only ((list `(the list ,list))) `(copy-list-macro ,list))
+      (values nil t))) ; give up
+
 (define-source-transform append (&rest lists)
   (case (length lists)
     (0 nil)
     (1 (car lists))
-    (2 `(sb!impl::append2 ,@lists))
+    (2 `(sb-impl::append2 ,@lists))
     (t (values nil t))))
 
 (define-source-transform nconc (&rest lists)
@@ -168,28 +191,22 @@
     (return-from derive-append-type (specifier-type 'null)))
   (let* ((cons-type (specifier-type 'cons))
          (null-type (specifier-type 'null))
-         (list-type (specifier-type 'list))
          (last (lvar-type (car (last args)))))
     ;; Derive the actual return type, assuming that all but the last
     ;; arguments are LISTs (otherwise, APPEND/NCONC doesn't return).
     (loop with all-nil = t       ; all but the last args are NIL?
           with some-cons = nil   ; some args are conses?
           for (arg next) on args
-          for lvar-type = (type-approx-intersection2 (lvar-type arg)
-                                                     list-type)
+          for lvar-type = (lvar-type arg)
           while next
-          do (multiple-value-bind (typep definitely)
-                 (ctypep nil lvar-type)
-               (cond ((type= lvar-type *empty-type*)
-                      ;; type mismatch! insert an inline check that'll cause
-                      ;; compile-time warnings.
-                      (assert-lvar-type arg list-type
-                                        (lexenv-policy *lexenv*)))
-                     (some-cons) ; we know result's a cons -- nothing to do
-                     ((and (not typep) definitely) ; can't be NIL
-                      (setf some-cons t))          ; must be a CONS
-                     (all-nil
-                      (setf all-nil (csubtypep lvar-type null-type)))))
+          do
+          (multiple-value-bind (typep definitely)
+              (ctypep nil lvar-type)
+            (cond (some-cons) ; we know result's a cons -- nothing to do
+                  ((and (not typep) definitely) ; can't be NIL
+                   (setf some-cons t))          ; must be a CONS
+                  (all-nil
+                   (setf all-nil (csubtypep lvar-type null-type)))))
           finally
              ;; if some of the previous arguments are CONSes so is the result;
              ;; if all the previous values are NIL, we're a fancy identity;
@@ -201,7 +218,7 @@
 (defoptimizer (append derive-type) ((&rest args))
   (derive-append-type args))
 
-(defoptimizer (sb!impl::append2 derive-type) ((&rest args))
+(defoptimizer (sb-impl::append2 derive-type) ((&rest args))
   (derive-append-type args))
 
 (defoptimizer (nconc derive-type) ((&rest args))
@@ -237,13 +254,13 @@
 
 (define-source-transform gethash (&rest args)
   (case (length args)
-   (2 `(sb!impl::gethash3 ,@args nil))
-   (3 `(sb!impl::gethash3 ,@args))
+   (2 `(sb-impl::gethash3 ,@args nil))
+   (3 `(sb-impl::gethash3 ,@args))
    (t (values nil t))))
 (define-source-transform get (&rest args)
   (case (length args)
-   (2 `(sb!impl::get3 ,@args nil))
-   (3 `(sb!impl::get3 ,@args))
+   (2 `(sb-impl::get3 ,@args nil))
+   (3 `(sb-impl::get3 ,@args))
    (t (values nil t))))
 
 (defvar *default-nthcdr-open-code-limit* 6)
@@ -326,13 +343,13 @@
           ((eql integer-value -1)
            t)
           ((csubtypep integer-type (specifier-type '(or word
-                                                     sb!vm:signed-word)))
-           `(if (>= index #.sb!vm:n-word-bits)
+                                                     sb-vm:signed-word)))
+           `(if (>= index #.sb-vm:n-word-bits)
                 (minusp integer)
                 (not (zerop (logand integer (ash 1 index))))))
           ((csubtypep integer-type (specifier-type 'bignum))
            (if (csubtypep (lvar-type index)
-                          (specifier-type '(mod #.sb!vm:n-word-bits))) ; word-index
+                          (specifier-type '(mod #.sb-vm:n-word-bits))) ; word-index
                `(logbitp index (%bignum-ref integer 0))
                `(bignum-logbitp index integer)))
           (t
@@ -432,10 +449,10 @@
                       (float-infinity-p y))
                  nil
                  (set-bound y (and strict (consp x))))))
-         ;; Some numerical operations will signal SIMPLE-TYPE-ERROR, e.g.
-         ;; in the course of converting a bignum to a float.  Default to
+         ;; Some numerical operations will signal an ERROR, e.g. in
+         ;; the course of converting a bignum to a float. Default to
          ;; NIL in that case.
-         (simple-type-error ()))))
+         (arithmetic-error ()))))
 
 (defun safe-double-coercion-p (x)
   (or (typep x 'double-float)
@@ -544,20 +561,23 @@
     (t (bug "Unexpected arguments to bounds coercion: ~S ~S" val type))))
 
 (defun coerce-for-bound (val type)
-  (if (consp val)
-      (let ((xbound (coerce-for-bound (car val) type)))
-        (if (coercion-loses-precision-p (car val) type)
-            xbound
-            (list xbound)))
-      (cond
-        ((subtypep type 'double-float)
-         (if (<= most-negative-double-float val most-positive-double-float)
-             (coerce val type)))
-        ((or (subtypep type 'single-float) (subtypep type 'float))
-         ;; coerce to float returns a single-float
-         (if (<= most-negative-single-float val most-positive-single-float)
-             (coerce val type)))
-        (t (coerce val type)))))
+  (cond
+    ((or (null val)
+         (null type))
+     val)
+    ((consp val)
+     (let ((xbound (coerce-for-bound (car val) type)))
+       (if (coercion-loses-precision-p (car val) type)
+           xbound
+           (list xbound))))
+    ((subtypep type 'double-float)
+     (if (<= most-negative-double-float val most-positive-double-float)
+         (coerce val type)))
+    ((or (subtypep type 'single-float) (subtypep type 'float))
+     ;; coerce to float returns a single-float
+     (if (<= most-negative-single-float val most-positive-single-float)
+         (coerce val type)))
+    (t (coerce val type))))
 
 (defun coerce-and-truncate-floats (val type)
   (when val
@@ -591,9 +611,14 @@
   (let ((types (prepare-arg-for-derive-type type))
         (result nil))
     (dolist (type types)
-      (let ((type (if (member-type-p type)
-                      (convert-member-type type)
-                      type)))
+      (let ((type (typecase type
+                    (member-type type
+                     (convert-member-type type))
+                    (intersection-type
+                     (find-if #'numeric-type-p
+                              (intersection-type-types type)))
+                    (t
+                     type))))
         (unless (numeric-type-p type)
           (return-from type-approximate-interval nil))
         (let ((interval (numeric-type->interval type)))
@@ -945,6 +970,9 @@
                  ((zerop (type-bound-number y))
                   ;; Divide by zero means result is infinity
                   nil)
+                 ((and (numberp x) (zerop x))
+                  ;; Zero divided by anything is zero, but don't lose the sign
+                  (/ x (signum (type-bound-number y))))
                  (t
                   (bound-binop / x y)))))
     (let ((top-range (interval-range-info top))
@@ -1107,22 +1135,28 @@
              (union-type
               (union-type-types arg))
              (t
-              (list arg)))))
+              (list arg))))
+         (ignore-hairy-type (type)
+           (if (and (intersection-type-p type)
+                    (find-if #'hairy-type-p (intersection-type-types type)))
+               (find-if-not #'hairy-type-p (intersection-type-types type))
+               type)))
     (unless (eq arg *empty-type*)
       ;; Make sure all args are some type of numeric-type. For member
       ;; types, convert the list of members into a union of equivalent
       ;; single-element member-type's.
       (let ((new-args nil))
         (dolist (arg (listify arg))
-          (if (member-type-p arg)
-              ;; Run down the list of members and convert to a list of
-              ;; member types.
-              (mapc-member-type-members
-               (lambda (member)
-                 (push (if (numberp member) (make-eql-type member) *empty-type*)
-                       new-args))
-               arg)
-              (push arg new-args)))
+          (let ((arg (ignore-hairy-type arg)))
+            (if (member-type-p arg)
+                ;; Run down the list of members and convert to a list of
+                ;; member types.
+                (mapc-member-type-members
+                 (lambda (member)
+                   (push (if (numberp member) (make-eql-type member) *empty-type*)
+                         new-args))
+                 arg)
+                (push arg new-args))))
         (unless (member *empty-type* new-args)
           new-args)))))
 
@@ -1235,54 +1269,56 @@
 ;;; we didn't do this, we wouldn't be able to tell.
 (defun two-arg-derive-type (arg1 arg2 derive-fun fun)
   (declare (type function derive-fun fun))
-  (flet ((deriver (x y same-arg)
-           (cond ((and (member-type-p x) (member-type-p y))
-                  (let* ((x (first (member-type-members x)))
-                         (y (first (member-type-members y)))
-                         (result (ignore-errors
-                                   (with-float-traps-masked
-                                       (:underflow :overflow :divide-by-zero
-                                                   :invalid)
-                                     (funcall fun x y)))))
-                    (cond ((null result) *empty-type*)
-                          ((and (floatp result) (float-nan-p result))
-                           (make-numeric-type :class 'float
-                                              :format (type-of result)
-                                              :complexp :real))
-                          (t
-                           (specifier-type `(eql ,result))))))
-                 ((and (member-type-p x) (numeric-type-p y))
-                  (funcall derive-fun (convert-member-type x) y same-arg))
-                 ((and (numeric-type-p x) (member-type-p y))
-                  (funcall derive-fun x (convert-member-type y) same-arg))
-                 ((and (numeric-type-p x) (numeric-type-p y))
-                  (funcall derive-fun x y same-arg))
-                 (t
-                  *universal-type*))))
-    (let ((same-arg (same-leaf-ref-p arg1 arg2))
-          (a1 (prepare-arg-for-derive-type (lvar-type arg1)))
-          (a2 (prepare-arg-for-derive-type (lvar-type arg2))))
-      (when (and a1 a2)
-        (let ((results nil))
-          (if same-arg
-              ;; Since the args are the same LVARs, just run down the
-              ;; lists.
-              (dolist (x a1)
-                (let ((result (deriver x x same-arg)))
-                  (if (listp result)
-                      (setf results (append results result))
-                      (push result results))))
-              ;; Try all pairwise combinations.
-              (dolist (x a1)
-                (dolist (y a2)
-                  (let ((result (or (deriver x y same-arg)
-                                    (numeric-contagion x y))))
-                    (if (listp result)
-                        (setf results (append results result))
-                        (push result results))))))
-          (if (rest results)
-              (make-derived-union-type results)
-              (first results)))))))
+  (labels ((deriver (x y same-arg)
+             (cond ((and (member-type-p x) (member-type-p y))
+                    (let* ((x (first (member-type-members x)))
+                           (y (first (member-type-members y)))
+                           (result (ignore-errors
+                                    (with-float-traps-masked
+                                        (:underflow :overflow :divide-by-zero
+                                                    :invalid)
+                                      (funcall fun x y)))))
+                      (cond ((null result) *empty-type*)
+                            ((and (floatp result) (float-nan-p result))
+                             (make-numeric-type :class 'float
+                                                :format (type-of result)
+                                                :complexp :real))
+                            (t
+                             (specifier-type `(eql ,result))))))
+                   ((and (member-type-p x) (numeric-type-p y))
+                    (funcall derive-fun (convert-member-type x) y same-arg))
+                   ((and (numeric-type-p x) (member-type-p y))
+                    (funcall derive-fun x (convert-member-type y) same-arg))
+                   ((and (numeric-type-p x) (numeric-type-p y))
+                    (funcall derive-fun x y same-arg))
+                   (t
+                    *universal-type*)))
+           (derive (type1 type2 same-arg)
+             (let ((a1 (prepare-arg-for-derive-type type1))
+                   (a2 (prepare-arg-for-derive-type type2)))
+              (when (and a1 a2)
+                (let ((results nil))
+                  (if same-arg
+                      ;; Since the args are the same LVARs, just run down the
+                      ;; lists.
+                      (dolist (x a1)
+                        (let ((result (deriver x x same-arg)))
+                          (if (listp result)
+                              (setf results (append results result))
+                              (push result results))))
+                      ;; Try all pairwise combinations.
+                      (dolist (x a1)
+                        (dolist (y a2)
+                          (let ((result (or (deriver x y same-arg)
+                                            (numeric-contagion x y))))
+                            (if (listp result)
+                                (setf results (append results result))
+                                (push result results))))))
+                  (if (rest results)
+                      (make-derived-union-type results)
+                      (first results)))))))
+    (derive (lvar-type arg1) (lvar-type arg2)
+            (same-leaf-ref-p arg1 arg2))))
 
 #+sb-xc-host ; (See CROSS-FLOAT-INFINITY-KLUDGE.)
 (progn
@@ -1484,14 +1520,14 @@
   (flet ((ash-outer (n s)
            (when (and (fixnump s)
                       (<= s 64)
-                      (> s sb!xc:most-negative-fixnum))
+                      (> s sb-xc:most-negative-fixnum))
              (ash n s)))
          ;; KLUDGE: The bare 64's here should be related to
          ;; symbolic machine word size values somehow.
 
          (ash-inner (n s)
            (if (and (fixnump s)
-                    (> s sb!xc:most-negative-fixnum))
+                    (> s sb-xc:most-negative-fixnum))
              (ash n (min s 64))
              (if (minusp n) -1 0))))
     (or (and (csubtypep n-type (specifier-type 'integer))
@@ -1729,10 +1765,15 @@
 
 (defun truncate-derive-type-rem-aux (num div same-arg)
   (declare (ignore same-arg))
-  (if (and (numeric-type-real-p num)
-           (numeric-type-real-p div))
-      (truncate-derive-type-rem num div)
-      *empty-type*))
+  (cond ((not (and (numeric-type-real-p num)
+                   (numeric-type-real-p div)))
+         *empty-type*)
+        ;; Floats introduce rounding errors
+        ((and (memq (numeric-type-class num) '(integer rational))
+              (memq (numeric-type-class div) '(integer rational)))
+         (truncate-derive-type-rem num div))
+        (t
+         (numeric-contagion num div))))
 
 (defoptimizer (truncate derive-type) ((number divisor))
   (let ((quot (two-arg-derive-type number divisor
@@ -1747,11 +1788,12 @@
   ;; result is a float of some type. We need to determine what that
   ;; type is. Basically it's the more contagious of the two types.
   (let ((q-type (truncate-derive-type-quot number-type divisor-type))
-        (res-type (numeric-contagion number-type divisor-type)))
+        (format (numeric-type-format
+                 (numeric-contagion number-type divisor-type))))
     (make-numeric-type :class 'float
-                       :format (numeric-type-format res-type)
-                       :low (numeric-type-low q-type)
-                       :high (numeric-type-high q-type))))
+                       :format format
+                       :low (coerce-for-bound (numeric-type-low q-type) format)
+                       :high (coerce-for-bound (numeric-type-high q-type) format))))
 
 (defun ftruncate-derive-type-quot-aux (n d same-arg)
   (declare (ignore same-arg))
@@ -1869,12 +1911,17 @@
                                (numeric-type-real-p d))
                           (,q-aux n d)
                           *empty-type*))
-                    (derive-r (n d same-arg)
+                    (derive-r (num div same-arg)
                       (declare (ignore same-arg))
-                      (if (and (numeric-type-real-p n)
-                               (numeric-type-real-p d))
-                          (,r-aux n d)
-                          *empty-type*)))
+                      (cond ((not (and (numeric-type-real-p num)
+                                       (numeric-type-real-p div)))
+                             *empty-type*)
+                            ;; Floats introduce rounding errors
+                            ((and (memq (numeric-type-class num) '(integer rational))
+                                  (memq (numeric-type-class div) '(integer rational)))
+                             (,r-aux num div))
+                            (t
+                             (numeric-contagion num div)))))
                (let ((quot (two-arg-derive-type
                             number divisor #'derive-q #',name))
                      (rem (two-arg-derive-type
@@ -1893,18 +1940,19 @@
                   ;; Compute type of quotient (first) result.
                   (defun ,q-aux (number-type divisor-type)
                     (let* ((number-interval
-                            (numeric-type->interval number-type))
+                             (numeric-type->interval number-type))
                            (divisor-interval
-                            (numeric-type->interval divisor-type))
+                             (numeric-type->interval divisor-type))
                            (quot (,q-name (interval-div number-interval
                                                         divisor-interval)))
                            (res-type (numeric-contagion number-type
-                                                        divisor-type)))
+                                                        divisor-type))
+                           (format (numeric-type-format res-type)))
                       (make-numeric-type
                        :class (numeric-type-class res-type)
-                       :format (numeric-type-format res-type)
-                       :low  (interval-low quot)
-                       :high (interval-high quot))))
+                       :format format
+                       :low  (coerce-for-bound (interval-low quot) format)
+                       :high (coerce-for-bound (interval-high quot) format))))
 
                   (defoptimizer (,name derive-type) ((number divisor))
                     (flet ((derive-q (n d same-arg)
@@ -1913,12 +1961,17 @@
                                       (numeric-type-real-p d))
                                  (,q-aux n d)
                                  *empty-type*))
-                           (derive-r (n d same-arg)
+                           (derive-r (num div same-arg)
                              (declare (ignore same-arg))
-                             (if (and (numeric-type-real-p n)
-                                      (numeric-type-real-p d))
-                                 (,r-aux n d)
-                                 *empty-type*)))
+                             (cond ((not (and (numeric-type-real-p num)
+                                              (numeric-type-real-p div)))
+                                    *empty-type*)
+                                   ;; Floats introduce rounding errors
+                                   ((and (memq (numeric-type-class num) '(integer rational))
+                                         (memq (numeric-type-class div) '(integer rational)))
+                                    (,r-aux num div))
+                                   (t
+                                    (numeric-contagion num div)))))
                       (let ((quot (two-arg-derive-type
                                    number divisor #'derive-q #',name))
                             (rem (two-arg-derive-type
@@ -1936,27 +1989,34 @@
   ;; need.
   (let ((lo (interval-low quot))
         (hi (interval-high quot)))
-    ;; Take the floor of the lower bound. The result is always a
-    ;; closed lower bound.
-    (setf lo (if lo
-                 (floor (type-bound-number lo))
-                 nil))
-    ;; For the upper bound, we need to be careful.
-    (setf hi
-          (cond ((consp hi)
+    (make-interval
+     ;; Take the floor of the lower bound. The result is always a
+     ;; closed lower bound.
+     :low
+     (and lo
+          (- (floor (type-bound-number lo))
+             ;; FLOOR on floats depends on the divisor,
+             ;; make it conservative
+             (if (floatp (type-bound-number lo))
+                 1
+                 0)))
+     :high
+     (and hi
+          (+ (if (consp hi)
                  ;; An open bound. We need to be careful here because
                  ;; the floor of '(10.0) is 9, but the floor of
                  ;; 10.0 is 10.
                  (multiple-value-bind (q r) (floor (first hi))
                    (if (zerop r)
                        (1- q)
-                       q)))
-                (hi
+                       q))
                  ;; A closed bound, so the answer is obvious.
                  (floor hi))
-                (t
-                 hi)))
-    (make-interval :low lo :high hi)))
+             ;; Be conservative
+             (if (floatp (type-bound-number hi))
+                 1
+                 0))))))
+
 (defun floor-rem-bound (div)
   ;; The remainder depends only on the divisor. Try to get the
   ;; correct sign for the remainder if we can.
@@ -2028,27 +2088,33 @@
   ;; need.
   (let ((lo (interval-low quot))
         (hi (interval-high quot)))
-    ;; Take the ceiling of the upper bound. The result is always a
-    ;; closed upper bound.
-    (setf hi (if hi
-                 (ceiling (type-bound-number hi))
-                 nil))
-    ;; For the lower bound, we need to be careful.
-    (setf lo
-          (cond ((consp lo)
+    (make-interval
+     :low
+     (and lo
+          (- (if (consp lo)
                  ;; An open bound. We need to be careful here because
                  ;; the ceiling of '(10.0) is 11, but the ceiling of
                  ;; 10.0 is 10.
                  (multiple-value-bind (q r) (ceiling (first lo))
                    (if (zerop r)
                        (1+ q)
-                       q)))
-                (lo
+                       q))
                  ;; A closed bound, so the answer is obvious.
                  (ceiling lo))
-                (t
-                 lo)))
-    (make-interval :low lo :high hi)))
+             ;; CEILING on floats depends on the divisor,
+             ;; make it conservative
+             (if (floatp (type-bound-number lo))
+                 1
+                 0)))
+     :high
+     ;; Take the ceiling of the upper bound. The result is always a
+     ;; closed upper bound.
+     (and hi
+          (+ (ceiling (type-bound-number hi))
+             ;; Be conservative
+             (if (floatp (type-bound-number hi))
+                 1
+                 0))))))
 (defun ceiling-rem-bound (div)
   ;; The remainder depends only on the divisor. Try to get the
   ;; correct sign for the remainder if we can.
@@ -2365,7 +2431,7 @@
               ,@(loop for member in (member-type-members type)
                       when (characterp member)
                       collect (char-code member)))))
-          ((sb!kernel::character-set-type-p type)
+          ((sb-kernel::character-set-type-p type)
            (specifier-type
             `(or
               ,@(loop for (low . high)
@@ -2376,7 +2442,7 @@
             `(mod ,base-char-code-limit)))
           (t
            (specifier-type
-            `(mod ,sb!xc:char-code-limit))))))
+            `(mod ,sb-xc:char-code-limit))))))
 
 (defoptimizer (code-char derive-type) ((code))
   (let ((type (lvar-type code)))
@@ -2460,7 +2526,9 @@
 ;;;; A transform approximates that, but fails when BYTE is produced by an
 ;;;; inline function and not a macro.
 (flet ((xform (bytespec-form env int fun &optional (new nil setter-p))
-         (let ((spec (%macroexpand bytespec-form env)))
+         (let ((spec (handler-case (%macroexpand bytespec-form env)
+                       (error ()
+                         (return-from xform (values nil t))))))
            (if (and (consp spec) (eq (car spec) 'byte))
                (if (proper-list-of-length-p (cdr spec) 2)
                    (values `(,fun ,@(if setter-p (list new))
@@ -2495,7 +2563,7 @@
     (if (and (numeric-type-p size)
              (csubtypep size (specifier-type 'integer)))
         (let ((size-high (numeric-type-high size)))
-          (if (and size-high (<= size-high sb!vm:n-word-bits))
+          (if (and size-high (<= size-high sb-vm:n-word-bits))
               (specifier-type `(unsigned-byte* ,size-high))
               (specifier-type 'unsigned-byte)))
         *universal-type*)))
@@ -2511,7 +2579,7 @@
         (let ((size-high (numeric-type-high size))
               (posn-high (numeric-type-high posn)))
           (if (and size-high posn-high
-                   (<= (+ size-high posn-high) sb!vm:n-word-bits))
+                   (<= (+ size-high posn-high) sb-vm:n-word-bits))
               (specifier-type `(unsigned-byte* ,(+ size-high posn-high)))
               (specifier-type 'unsigned-byte)))
         *universal-type*)))
@@ -2533,12 +2601,12 @@
                    ;; (UNSIGNED-BYTE 1073741822), and then attempt to
                    ;; canonicalize this type to (INTEGER 0 (1- (ASH 1
                    ;; 1073741822))), with hilarious consequences.  We
-                   ;; cutoff at 4*SB!VM:N-WORD-BITS to allow inference
+                   ;; cutoff at 4*SB-VM:N-WORD-BITS to allow inference
                    ;; over a reasonable amount of shifting, even on
                    ;; the alpha/32 port, where N-WORD-BITS is 32 but
                    ;; machine integers are 64-bits.  -- CSR,
                    ;; 2003-09-12
-                   (<= (+ size-high posn-high) (* 4 sb!vm:n-word-bits)))
+                   (<= (+ size-high posn-high) (* 4 sb-vm:n-word-bits)))
           (let ((raw-bit-count (max (integer-length high)
                                     (integer-length low)
                                     (+ size-high posn-high))))
@@ -2557,27 +2625,27 @@
 
 (deftransform %ldb ((size posn int)
                     (fixnum fixnum integer)
-                    (unsigned-byte #.sb!vm:n-word-bits))
+                    (unsigned-byte #.sb-vm:n-word-bits))
   "convert to inline logical operations"
   (if (and (constant-lvar-p size)
            (constant-lvar-p posn)
-           (<= (+ (lvar-value size) (lvar-value posn)) sb!vm:n-fixnum-bits))
+           (<= (+ (lvar-value size) (lvar-value posn)) sb-vm:n-fixnum-bits))
       (let ((size (lvar-value size))
             (posn (lvar-value posn)))
-        `(logand (ash (mask-signed-field sb!vm:n-fixnum-bits int) ,(- posn))
-                 ,(ash (1- (ash 1 sb!vm:n-word-bits))
-                       (- size sb!vm:n-word-bits))))
+        `(logand (ash (mask-signed-field sb-vm:n-fixnum-bits int) ,(- posn))
+                 ,(ash (1- (ash 1 sb-vm:n-word-bits))
+                       (- size sb-vm:n-word-bits))))
       `(logand (ash int (- posn))
-               (ash ,(1- (ash 1 sb!vm:n-word-bits))
-                    (- size ,sb!vm:n-word-bits)))))
+               (ash ,(1- (ash 1 sb-vm:n-word-bits))
+                    (- size ,sb-vm:n-word-bits)))))
 
 (deftransform %mask-field ((size posn int)
                            (fixnum fixnum integer)
-                           (unsigned-byte #.sb!vm:n-word-bits))
+                           (unsigned-byte #.sb-vm:n-word-bits))
   "convert to inline logical operations"
   `(logand int
-           (ash (ash ,(1- (ash 1 sb!vm:n-word-bits))
-                     (- size ,sb!vm:n-word-bits))
+           (ash (ash ,(1- (ash 1 sb-vm:n-word-bits))
+                     (- size ,sb-vm:n-word-bits))
                 posn)))
 
 ;;; Note: for %DPB and %DEPOSIT-FIELD, we can't use
@@ -2588,7 +2656,7 @@
 
 (deftransform %dpb ((new size posn int)
                     *
-                    (unsigned-byte #.sb!vm:n-word-bits))
+                    (unsigned-byte #.sb-vm:n-word-bits))
   "convert to inline logical operations"
   `(let ((mask (ldb (byte size 0) -1)))
      (logior (ash (logand new mask) posn)
@@ -2596,7 +2664,7 @@
 
 (deftransform %dpb ((new size posn int)
                     *
-                    (signed-byte #.sb!vm:n-word-bits))
+                    (signed-byte #.sb-vm:n-word-bits))
   "convert to inline logical operations"
   `(let ((mask (ldb (byte size 0) -1)))
      (logior (ash (logand new mask) posn)
@@ -2604,7 +2672,7 @@
 
 (deftransform %deposit-field ((new size posn int)
                               *
-                              (unsigned-byte #.sb!vm:n-word-bits))
+                              (unsigned-byte #.sb-vm:n-word-bits))
   "convert to inline logical operations"
   `(let ((mask (ash (ldb (byte size 0) -1) posn)))
      (logior (logand new mask)
@@ -2612,7 +2680,7 @@
 
 (deftransform %deposit-field ((new size posn int)
                               *
-                              (signed-byte #.sb!vm:n-word-bits))
+                              (signed-byte #.sb-vm:n-word-bits))
   "convert to inline logical operations"
   `(let ((mask (ash (ldb (byte size 0) -1) posn)))
      (logior (logand new mask)
@@ -2623,24 +2691,25 @@
   (let ((size (lvar-type size)))
     (if (numeric-type-p size)
         (let ((size-high (numeric-type-high size)))
-          (if (and size-high (<= 1 size-high sb!vm:n-word-bits))
+          (if (and size-high (<= 1 size-high sb-vm:n-word-bits))
               (specifier-type `(signed-byte ,size-high))
               *universal-type*))
         *universal-type*)))
 
 ;;; Rightward ASH
-#!+ash-right-vops
+
+;;; Assert correctness of build order. (Need not be exhaustive)
+#!-(vop-translates sb-kernel:%ash/right)
+(eval-when (:compile-toplevel) #!+x86-64 (error "Expected %ASH/RIGHT vop"))
+
+#!+(vop-translates sb-kernel:%ash/right)
 (progn
   (defun %ash/right (integer amount)
     (ash integer (- amount)))
 
-  (deftransform ash ((integer amount))
+  (deftransform ash ((integer amount) (sb-vm:signed-word (integer * 0)) *
+                     :important nil)
     "Convert ASH of signed word to %ASH/RIGHT"
-    (unless (and (csubtypep (lvar-type integer) ; do that ourselves to avoid
-                            (specifier-type 'sb!vm:signed-word)) ; optimization
-                 (csubtypep (lvar-type amount)  ; notes.
-                            (specifier-type '(integer * 0))))
-      (give-up-ir1-transform))
     (when (constant-lvar-p amount)
       (give-up-ir1-transform))
     (let ((use (lvar-uses amount)))
@@ -2649,21 +2718,17 @@
              (splice-fun-args amount '%negate 1)
              `(lambda (integer amount)
                 (declare (type unsigned-byte amount))
-                (%ash/right integer (if (>= amount ,sb!vm:n-word-bits)
-                                        ,(1- sb!vm:n-word-bits)
+                (%ash/right integer (if (>= amount ,sb-vm:n-word-bits)
+                                        ,(1- sb-vm:n-word-bits)
                                         amount))))
             (t
-             `(%ash/right integer (if (<= amount ,(- sb!vm:n-word-bits))
-                                      ,(1- sb!vm:n-word-bits)
+             `(%ash/right integer (if (<= amount ,(- sb-vm:n-word-bits))
+                                      ,(1- sb-vm:n-word-bits)
                                       (- amount)))))))
 
-  (deftransform ash ((integer amount))
+  (deftransform ash ((integer amount) (word (integer * 0)) *
+                     :important nil)
     "Convert ASH of word to %ASH/RIGHT"
-    (unless (and (csubtypep (lvar-type integer)
-                            (specifier-type 'sb!vm:word))
-                 (csubtypep (lvar-type amount)
-                            (specifier-type '(integer * 0))))
-      (give-up-ir1-transform))
     (when (constant-lvar-p amount)
       (give-up-ir1-transform))
     (let ((use (lvar-uses amount)))
@@ -2672,11 +2737,11 @@
              (splice-fun-args amount '%negate 1)
              `(lambda (integer amount)
                 (declare (type unsigned-byte amount))
-                (if (>= amount ,sb!vm:n-word-bits)
+                (if (>= amount ,sb-vm:n-word-bits)
                     0
                     (%ash/right integer amount))))
             (t
-             `(if (<= amount ,(- sb!vm:n-word-bits))
+             `(if (<= amount ,(- sb-vm:n-word-bits))
                   0
                   (%ash/right integer (- amount)))))))
 
@@ -2692,15 +2757,15 @@
             ((type= return-type (specifier-type '(eql -1)))
              -1)
             ((csubtypep return-type (specifier-type '(member -1 0)))
-             `(ash integer ,(- sb!vm:n-word-bits)))
+             `(ash integer ,(- sb-vm:n-word-bits)))
             (t
              (give-up-ir1-transform)))))
 
   (defun %ash/right-derive-type-aux (n-type shift same-arg)
     (declare (ignore same-arg))
-    (or (and (or (csubtypep n-type (specifier-type 'sb!vm:signed-word))
+    (or (and (or (csubtypep n-type (specifier-type 'sb-vm:signed-word))
                  (csubtypep n-type (specifier-type 'word)))
-             (csubtypep shift (specifier-type `(mod ,sb!vm:n-word-bits)))
+             (csubtypep shift (specifier-type `(mod ,sb-vm:n-word-bits)))
              (let ((n-low (numeric-type-low n-type))
                    (n-high (numeric-type-high n-type))
                    (s-low (numeric-type-low shift))
@@ -2757,34 +2822,6 @@
 ;;; (ldb (byte s 0) (foo (ldb (byte s 0) x) y ...))
 ;;;
 ;;; and similar for other arguments.
-
-(defun make-modular-fun-type-deriver (prototype kind width signedp)
-  (declare (ignore kind))
-  #!-sb-fluid
-  (binding* ((info (info :function :info prototype) :exit-if-null)
-             (fun (fun-info-derive-type info) :exit-if-null)
-             (mask-type (specifier-type
-                         (ecase signedp
-                             ((nil) (let ((mask (1- (ash 1 width))))
-                                      `(integer ,mask ,mask)))
-                             ((t) `(signed-byte ,width))))))
-    (lambda (call)
-      (let ((res (funcall fun call)))
-        (when res
-          (if (eq signedp nil)
-              (logand-derive-type-aux res mask-type))))))
-  #!+sb-fluid
-  (lambda (call)
-    (binding* ((info (info :function :info prototype) :exit-if-null)
-               (fun (fun-info-derive-type info) :exit-if-null)
-               (res (funcall fun call) :exit-if-null)
-               (mask-type (specifier-type
-                           (ecase signedp
-                             ((nil) (let ((mask (1- (ash 1 width))))
-                                      `(integer ,mask ,mask)))
-                             ((t) `(signed-byte ,width))))))
-      (if (eq signedp nil)
-          (logand-derive-type-aux res mask-type)))))
 
 ;;; Try to recursively cut all uses of LVAR to WIDTH bits.
 ;;;
@@ -3083,22 +3120,22 @@
     (give-up-ir1-transform "BOOLE code is not a constant."))
   (let ((control (lvar-value op)))
     (case control
-      (#.sb!xc:boole-clr 0)
-      (#.sb!xc:boole-set -1)
-      (#.sb!xc:boole-1 'x)
-      (#.sb!xc:boole-2 'y)
-      (#.sb!xc:boole-c1 '(lognot x))
-      (#.sb!xc:boole-c2 '(lognot y))
-      (#.sb!xc:boole-and '(logand x y))
-      (#.sb!xc:boole-ior '(logior x y))
-      (#.sb!xc:boole-xor '(logxor x y))
-      (#.sb!xc:boole-eqv '(logeqv x y))
-      (#.sb!xc:boole-nand '(lognand x y))
-      (#.sb!xc:boole-nor '(lognor x y))
-      (#.sb!xc:boole-andc1 '(logandc1 x y))
-      (#.sb!xc:boole-andc2 '(logandc2 x y))
-      (#.sb!xc:boole-orc1 '(logorc1 x y))
-      (#.sb!xc:boole-orc2 '(logorc2 x y))
+      (#.sb-xc:boole-clr 0)
+      (#.sb-xc:boole-set -1)
+      (#.sb-xc:boole-1 'x)
+      (#.sb-xc:boole-2 'y)
+      (#.sb-xc:boole-c1 '(lognot x))
+      (#.sb-xc:boole-c2 '(lognot y))
+      (#.sb-xc:boole-and '(logand x y))
+      (#.sb-xc:boole-ior '(logior x y))
+      (#.sb-xc:boole-xor '(logxor x y))
+      (#.sb-xc:boole-eqv '(logeqv x y))
+      (#.sb-xc:boole-nand '(lognand x y))
+      (#.sb-xc:boole-nor '(lognor x y))
+      (#.sb-xc:boole-andc1 '(logandc1 x y))
+      (#.sb-xc:boole-andc2 '(logandc2 x y))
+      (#.sb-xc:boole-orc1 '(logorc1 x y))
+      (#.sb-xc:boole-orc2 '(logorc2 x y))
       (t
        (abort-ir1-transform "~S is an illegal control arg to BOOLE."
                             control)))))
@@ -3267,7 +3304,7 @@
            (choose-multiplier (y precision)
              (do* ((l (ld y))
                    (shift l (1- shift))
-                   (expt-2-n+l (expt 2 (+ sb!vm:n-word-bits l)))
+                   (expt-2-n+l (expt 2 (+ sb-vm:n-word-bits l)))
                    (m-low (truncate expt-2-n+l y) (ash m-low -1))
                    (m-high (truncate (+ expt-2-n+l
                                         (ash expt-2-n+l (- precision)))
@@ -3276,7 +3313,7 @@
                   ((not (and (< (ash m-low -1) (ash m-high -1))
                              (> shift 0)))
                    (values m-high shift)))))
-    (let ((n (expt 2 sb!vm:n-word-bits))
+    (let ((n (expt 2 sb-vm:n-word-bits))
           (precision (integer-length max-x))
           (shift1 0))
       (multiple-value-bind (m shift2)
@@ -3304,9 +3341,13 @@
                `(ash (%multiply-high (logandc2 x ,(1- (ash 1 shift1))) ,m)
                      ,(- (+ shift1 shift2)))))))))
 
-#!-multiply-high-vops
+#!-(vop-translates sb-kernel:%multiply-high)
+(progn
+;;; Assert correctness of build order. (Need not be exhaustive)
+(eval-when (:compile-toplevel) #!+x86-64 (error "Expected %MULTIPLY-HIGH vop"))
 (define-source-transform %multiply-high (x y)
-  `(values (sb!bignum:%multiply ,x ,y)))
+  `(values (sb-bignum:%multiply ,x ,y)))
+)
 
 ;;; If the divisor is constant and both args are positive and fit in a
 ;;; machine word, replace the division by a multiplication and possibly
@@ -3331,7 +3372,7 @@
     (when (zerop (logand y (1- y)))
       (give-up-ir1-transform))
     `(let* ((quot ,(gen-unsigned-div-by-constant-expr y max-x))
-            (rem (ldb (byte #.sb!vm:n-word-bits 0)
+            (rem (ldb (byte #.sb-vm:n-word-bits 0)
                       (- x (* quot ,y)))))
        (values quot rem))))
 
@@ -3368,10 +3409,11 @@
 (deftransform mask-signed-field ((size x) ((constant-arg t) *) *)
   "fold identity operation"
   (let ((size (lvar-value size)))
-    (when (= size 0) (give-up-ir1-transform))
-    (unless (csubtypep (lvar-type x) (specifier-type `(signed-byte ,size)))
-      (give-up-ir1-transform))
-    'x))
+    (cond ((= size 0) 0)
+          ((csubtypep (lvar-type x) (specifier-type `(signed-byte ,size)))
+           'x)
+          (t
+           (give-up-ir1-transform)))))
 
 (deftransform logior ((x y) (* (constant-arg integer)) *)
   "fold identity operation"
@@ -3387,38 +3429,36 @@
 ;;; More complicated stuff that also depends on commutativity
 ;;; (e.g. (f (f x k1) (f y k2)) => (f (f x y) (f k1 k2))) should
 ;;; probably be handled with a more general tree-rewriting pass.
-(macrolet ((def (operator &key (type 'integer) (folded operator))
+(macrolet ((def (operator &key (type 'integer) (folded (list operator)))
              `(deftransform ,operator ((x z) (,type (constant-arg ,type)))
                 ,(format nil "associate ~A/~A of constants"
                          operator folded)
                 (binding* ((node  (if (lvar-has-single-use-p x)
                                       (lvar-use x)
                                       (give-up-ir1-transform)))
-                           (nil (or (and (combination-p node)
-                                         (eq (lvar-fun-name
-                                              (combination-fun node))
-                                             ',folded))
-                                    (give-up-ir1-transform)))
+                           (folded (or (and (combination-p node)
+                                            (car (memq (lvar-fun-name
+                                                        (combination-fun node))
+                                                       ',folded)))
+                                       (give-up-ir1-transform)))
                            (y   (second (combination-args node)))
                            (nil (or (constant-lvar-p y)
                                     (give-up-ir1-transform)))
                            (y   (lvar-value y)))
                   (unless (typep y ',type)
                     (give-up-ir1-transform))
-                  (splice-fun-args x ',folded 2)
+                  (splice-fun-args x folded 2)
                   `(lambda (x y z)
                      (declare (ignore y z))
                      ;; (operator (folded x y) z)
                      ;; == (operator x (folded z y))
-                     (,',operator x ',(,folded (lvar-value z) y)))))))
+                     (,',operator x (,folded ,(lvar-value z) ,y)))))))
   (def logand)
   (def logior)
   (def logxor)
-  (def logtest :folded logand)
-  (def + :type rational)
-  (def + :type rational :folded -)
-  (def * :type rational)
-  (def * :type rational :folded /))
+  (def logtest :folded (logand))
+  (def + :type rational :folded (+ -))
+  (def * :type rational :folded (* /)))
 
 (deftransform mask-signed-field ((width x) ((constant-arg unsigned-byte) *))
   "Fold mask-signed-field/mask-signed-field of constant width"
@@ -3482,7 +3522,7 @@
       ((csubtypep x (specifier-type 'double-float))
        (csubtypep y (specifier-type 'double-float))))))
 
-(def!type exact-number ()
+(sb-xc:deftype exact-number ()
   '(or rational (complex rational)))
 
 ;;; Fold (+ x 0).
@@ -3608,18 +3648,19 @@
                  (and (> sum 415) (< sum 461))
                  (and (> sum 463) (< sum 477))))))))
 
-(deftransform two-arg-char-equal ((a b) (* (constant-arg character)) *
-                                  :node node)
+(defun transform-constant-char-equal (a b &optional (op 'char=))
   (let ((char (lvar-value b)))
     (if (both-case-p char)
         (let ((reverse (if (upper-case-p char)
                            (char-downcase char)
                            (char-upcase char))))
-          (if (policy node (> speed space))
-              `(or (char= a ,char)
-                   (char= a ,reverse))
-              `(char-equal-constant a ,char ,reverse)))
-        '(char= a b))))
+          `(or (,op ,a ,char)
+               (,op ,a ,reverse)))
+        `(,op ,a ,char))))
+
+(deftransform two-arg-char-equal ((a b) (* (constant-arg character)) *
+                                  :node node)
+  (transform-constant-char-equal 'a b))
 
 (deftransform char-upcase ((x) (base-char))
   "open code"
@@ -3647,28 +3688,31 @@
 
 ;;;; equality predicate transforms
 
-;;; Return true if X and Y are lvars whose only use is a
-;;; reference to the same leaf, and the value of the leaf cannot
-;;; change.
-(defun same-leaf-ref-p (x y)
-  (declare (type lvar x y))
-  (let ((x-use (principal-lvar-use x))
-        (y-use (principal-lvar-use y)))
-    (and (ref-p x-use)
-         (ref-p y-use)
-         (eq (ref-leaf x-use) (ref-leaf y-use))
-         (constant-reference-p x-use))))
-
 ;;; If X and Y are the same leaf, then the result is true. Otherwise,
 ;;; if there is no intersection between the types of the arguments,
 ;;; then the result is definitely false.
 (deftransforms (eq char=) ((x y) * *)
   "Simple equality transform"
-  (cond
-    ((same-leaf-ref-p x y) t)
-    ((not (types-equal-or-intersect (lvar-type x) (lvar-type y)))
-     nil)
-    (t (give-up-ir1-transform))))
+  (let ((use (lvar-uses x)) arg)
+    (declare (ignorable use arg))
+    (cond
+      ((same-leaf-ref-p x y) t)
+      ((not (types-equal-or-intersect (lvar-type x) (lvar-type y)))
+       nil)
+      #!+(vop-translates sb-kernel:%instance-ref-eq)
+      ;; Reduce (eq (%instance-ref x i) Y) to 1 instruction
+      ;; if possible, but do not defer the memory load unless doing
+      ;; so can have no effect, i.e. Y is a constant or provably not
+      ;; effectful. For now, just handle constant Y.
+      ((and (constant-lvar-p y)
+            (combination-p use)
+            (almost-immediately-used-p x use)
+            (eql '%instance-ref (lvar-fun-name (combination-fun use)))
+            (constant-lvar-p (setf arg (second (combination-args use))))
+            (typep (lvar-value arg) '(unsigned-byte 16)))
+       (splice-fun-args x '%instance-ref 2)
+       `(lambda (obj i val) (%instance-ref-eq obj i val)))
+      (t (give-up-ir1-transform)))))
 
 ;;; Can't use the above thing, since TYPES-EQUAL-OR-INTERSECT is case sensitive.
 (deftransform two-arg-char-equal ((x y) * *)
@@ -3734,6 +3778,15 @@
                                             (integerp y-dim)
                                             (not (= x-dim y-dim)))))))))))
 
+;;; Only a simple array will always remain non-empty
+(defun array-type-non-empty-p (type)
+  (and (csubtypep type (specifier-type 'simple-array))
+       (let ((dimensions (ctype-array-dimensions type)))
+         (and (consp dimensions)
+              (every (lambda (dim)
+                       (typep dim '(integer 1)))
+                     dimensions)))))
+
 ;;; similarly to the EQL transform above, we attempt to constant-fold
 ;;; or convert to a simpler predicate: mostly we have to be careful
 ;;; with strings and bit-vectors.
@@ -3758,12 +3811,6 @@
                         (csubtypep y-type ctype2))
                    (and (csubtypep y-type ctype1)
                         (csubtypep x-type ctype2)))))
-           (mismatching-types-p (type)
-             (let* ((ctype (specifier-type type))
-                    (x-equal (types-equal-or-intersect x-type ctype))
-                    (y-equal (types-equal-or-intersect y-type ctype)))
-               (or (and x-equal (not y-equal))
-                   (and (not x-equal) y-equal))))
            (non-equal-array-p (type)
              (and (csubtypep type (specifier-type 'array))
                   (let ((equal-types (specifier-type '(or bit character)))
@@ -3784,6 +3831,9 @@
               (equal (lvar-value y) ""))
          `(and (stringp x)
                (zerop (length x))))
+        ((or (some-csubtypep 'symbol)
+             (some-csubtypep 'character))
+         `(eq x y))
         ((both-csubtypep 'string)
          '(string= x y))
         ((both-csubtypep 'bit-vector)
@@ -3814,10 +3864,6 @@
                 (give-up-ir1-transform))
                (t
                 '(eql x y))))
-        ((or (mismatching-types-p 'cons)
-             (mismatching-types-p 'bit-vector)
-             (mismatching-types-p 'string))
-         nil)
         ((some-csubtypep2 '(and array (not vector))
                           'vector)
          nil)
@@ -3835,24 +3881,30 @@
              (let ((ctype (specifier-type type)))
                (and (csubtypep x-type ctype)
                     (csubtypep y-type ctype))))
-           (mismatching-types-p (type)
-             (let* ((ctype (specifier-type type))
-                    (x-equal (types-equal-or-intersect x-type ctype))
-                    (y-equal (types-equal-or-intersect y-type ctype)))
-               (or (and x-equal (not y-equal))
-                   (and (not x-equal) y-equal)))))
+           (some-csubtypep (type)
+             (let ((ctype (specifier-type type)))
+               (or (csubtypep x-type ctype)
+                   (csubtypep y-type ctype))))
+           (transform-char-equal (x y)
+             (and (constant-lvar-p y)
+                  (characterp (lvar-value y))
+                  (transform-constant-char-equal x y 'eq))))
       (cond
         ((same-leaf-ref-p x y) t)
         ((array-type-dimensions-mismatch x-type y-type)
          nil)
         ((and (constant-lvar-p x)
-              (equal (lvar-value x) ""))
-         `(and (stringp y)
+              (typep (lvar-value x) '(simple-array * (0))))
+         `(and (vectorp y)
                (zerop (length y))))
         ((and (constant-lvar-p y)
-              (equal (lvar-value y) ""))
-         `(and (stringp x)
+              (typep (lvar-value y) '(simple-array * (0))))
+         `(and (vectorp x)
                (zerop (length x))))
+        ((some-csubtypep 'symbol)
+         `(eq x y))
+        ((transform-char-equal 'x y))
+        ((transform-char-equal 'y x))
         ((both-csubtypep 'string)
          '(string-equal x y))
         ((both-csubtypep 'bit-vector)
@@ -3860,12 +3912,16 @@
         ((both-csubtypep 'pathname)
          '(pathname= x y))
         ((both-csubtypep 'character)
-         '(char-equal x y))
+         '(two-arg-char-equal x y))
         ((both-csubtypep 'number)
          '(= x y))
         ((both-csubtypep 'hash-table)
          '(hash-table-equalp x y))
         ((and (both-csubtypep 'array)
+              ;; At least one array has to be longer than 0
+              ;; and not adjustable, because #() and "" are equal.
+              (or (array-type-non-empty-p x-type)
+                  (array-type-non-empty-p y-type))
               (flet ((upgraded-et (type)
                        (multiple-value-bind (specialized supetype)
                            (array-type-upgraded-element-type type)
@@ -3887,10 +3943,6 @@
                  (types-equal-or-intersect y-type combination-type))
              (give-up-ir1-transform)
              '(eq x y)))
-        ((or (mismatching-types-p 'cons)
-             (mismatching-types-p 'array)
-             (mismatching-types-p 'number))
-         nil)
         (t (give-up-ir1-transform))))))
 
 ;;; Convert to EQL if both args are rational and complexp is specified
@@ -3903,10 +3955,10 @@
                     (csubtypep y-type (specifier-type 'float)))
                (and (csubtypep x-type (specifier-type '(complex float)))
                     (csubtypep y-type (specifier-type '(complex float))))
-               #!+complex-float-vops
+               #!+(vop-named sb-vm::=/complex-single-float)
                (and (csubtypep x-type (specifier-type '(or single-float (complex single-float))))
                     (csubtypep y-type (specifier-type '(or single-float (complex single-float)))))
-               #!+complex-float-vops
+               #!+(vop-named sb-vm::=/complex-double-float)
                (and (csubtypep x-type (specifier-type '(or double-float (complex double-float))))
                     (csubtypep y-type (specifier-type '(or double-float (complex double-float))))))
            ;; They are both floats. Leave as = so that -0.0 is
@@ -3921,6 +3973,14 @@
            ;; They are both rationals and complexp is the same.
            ;; Convert to EQL.
            '(eql x y))
+          ((or (and (csubtypep x-type (specifier-type 'real))
+                    (csubtypep y-type
+                               (specifier-type '(complex rational))))
+               (and (csubtypep y-type (specifier-type 'real))
+                    (csubtypep x-type
+                               (specifier-type '(complex rational)))))
+           ;; Can't be EQL since imagpart can't be 0.
+           nil)
           (t
            (give-up-ir1-transform
             "The operands might not be the same type.")))))
@@ -3930,8 +3990,12 @@
                                        (lvar-type lvar))))
 
 (flet ((maybe-invert (node op inverted x y)
-         ;; Don't invert if either argument can be a float (NaNs)
          (cond
+           #!+(or x86-64 arm64) ;; have >=/<= VOPs
+           ((and (csubtypep (lvar-type x) (specifier-type 'float))
+                 (csubtypep (lvar-type y) (specifier-type 'float)))
+            (give-up-ir1-transform))
+           ;; Don't invert if either argument can be a float (NaNs)
            ((or (maybe-float-lvar-p x) (maybe-float-lvar-p y))
             (delay-ir1-transform node :constraint)
             `(or (,op x y) (= x y)))
@@ -4080,21 +4144,25 @@
           ((= nargs 1) `(progn (the ,type ,@args) t))
           ((= nargs 2)
            `(if (,predicate ,(first args) ,(second args)) nil t))
-          ((not (policy *lexenv*
+          ((or (> (length args) 50)
+               (not (policy *lexenv*
                         (and (>= speed space)
-                             (>= speed compilation-speed))))
+                             (>= speed compilation-speed)))))
            (values nil t))
           (t
            (let ((vars (make-gensym-list nargs)))
-             (do ((var vars next)
-                  (next (cdr vars) (cdr next))
-                  (result t))
-                 ((null next)
-                  `((lambda ,vars (declare (type ,type ,@vars)) ,result)
-                    ,@args))
-               (let ((v1 (first var)))
-                 (dolist (v2 next)
-                   (setq result `(if (,predicate ,v1 ,v2) nil ,result))))))))))
+             `((lambda ,vars
+                 (declare (type ,type ,@vars))
+                 (block nil
+                   (tagbody
+                      ,@(loop for (var . rest) on vars
+                              nconc (loop for var2 in rest
+                                          collect `(if (,predicate ,var ,var2)
+                                                       (go return-nil))))
+                      (return-from nil t)
+                    return-nil
+                      (return-from nil nil))))
+               ,@args))))))
 
 (define-source-transform /= (&rest args)
   (multi-not-equal '= args 'number))
@@ -4151,7 +4219,7 @@
     (setf y (rational y))
     (if (and (csubtypep (lvar-type x)
                         (specifier-type 'integer))
-             (ratiop y))
+             (sb-xc:typep y 'ratio))
         nil
         `(= x ,y))))
 
@@ -4252,6 +4320,7 @@
   (source-transform-transitive 'logxor args 0 'integer))
 (define-source-transform logand (&rest args)
   (source-transform-transitive 'logand args -1 'integer))
+#!-(or arm arm64 hppa mips x86 x86-64) ; defined in compiler/target/arith.lisp
 (define-source-transform logeqv (&rest args)
   (source-transform-transitive 'logeqv args -1 'integer))
 (define-source-transform gcd (&rest args)
@@ -4435,15 +4504,13 @@
       `(values-list list)))
 
 (deftransform %rest-ref ((n list context count &optional length-checked-p))
-  (cond ((rest-var-more-context-ok list)
-         (if (and (constant-lvar-p length-checked-p)
-                  (lvar-value length-checked-p))
-             `(%more-arg context n)
-             `(and (< (the index n) count) (%more-arg context n))))
-        ((and (constant-lvar-p n) (zerop (lvar-value n)))
-         `(car list))
+  (cond ((not (rest-var-more-context-ok list))
+         `(nth n list))
+        ((and (constant-lvar-p length-checked-p)
+              (lvar-value length-checked-p))
+         `(%more-arg context n))
         (t
-         `(nth n list))))
+         `(and (< (the index n) count) (%more-arg context n)))))
 
 (deftransform %rest-length ((list context count))
   (if (rest-var-more-context-ok list)
@@ -4475,35 +4542,110 @@
 ;;; instance, ~{ ... ~} requires a list argument, so if the lvar-type
 ;;; of a corresponding argument is known and does not intersect the
 ;;; list type, a warning could be signalled.
-(defun check-format-args (string args fun)
-  (declare (type string string))
-  (unless (typep string 'simple-string)
-    (setq string (coerce string 'simple-string)))
-  (multiple-value-bind (min max)
-      (handler-case (sb!format:%compiler-walk-format-string string args)
-        (sb!format:format-error (c)
-          (compiler-warn "~A" c)))
-    (when min
-      (let ((nargs (length args)))
-        (cond
-          ((< nargs min)
-           (warn 'format-too-few-args-warning
-                 :format-control
-                 "Too few arguments (~D) to ~S ~S: requires at least ~D."
-                 :format-arguments (list nargs fun string min)))
-          ((> nargs max)
-           (warn 'format-too-many-args-warning
-                 :format-control
-                 "Too many arguments (~D) to ~S ~S: uses at most ~D."
-                 :format-arguments (list nargs fun string max))))))))
+(defglobal *optimize-format-strings* t)
+(defun check-format-args (node fun arg-n verify-arg-count
+                          &aux (combination-args (basic-combination-args node)))
+  ;; ARG-N is the index into COMBINATION-ARGS of a format control string,
+  ;; usually 0 or 1.
+  (flet ((maybe-replace (control)
+           (binding* ((string (lvar-value control))
+                      ((symbols new-string)
+                       (sb-format::extract-user-fun-directives string)))
+             (when (or symbols (and new-string (string/= string new-string)))
+               (change-ref-leaf
+                (lvar-use control)
+                (find-constant
+                 (cond ((not symbols) new-string)
+                       ((fasl-output-p *compile-object*)
+                        (sb-format::make-fmt-control-proxy new-string symbols))
+                       #-sb-xc-host ; no such object as a FMT-CONTROL
+                       (t
+                        (sb-format::make-fmt-control new-string symbols)))))))))
+    (when (list-of-length-at-least-p combination-args (1+ arg-n))
+      (let* ((args (nthcdr arg-n combination-args))
+             (control (pop args)))
+        (when (and (constant-lvar-p control) (stringp (lvar-value control)))
+          (when verify-arg-count
+            (binding* ((string (lvar-value control))
+                       (*compiler-error-context* node)
+                       ((min max)
+                        (handler-case (sb-format:%compiler-walk-format-string
+                                       string args)
+                          (sb-format:format-error (c)
+                            (compiler-warn "~A" c)))
+                        :exit-if-null)
+                       (nargs (length args)))
+             (cond
+              ((< nargs min)
+               (warn 'format-too-few-args-warning
+                     :format-control
+                     "Too few arguments (~D) to ~S ~S: requires at least ~D."
+                     :format-arguments (list nargs fun string min)))
+              ((> nargs max)
+               (warn 'format-too-many-args-warning
+                     :format-control
+                     "Too many arguments (~D) to ~S ~S: uses at most ~D."
+                     :format-arguments (list nargs fun string max))))))
+          ;; Now possibly replace the control string
+          (when *optimize-format-strings*
+            (maybe-replace control))
+          (return-from check-format-args)))
+      ;; Look for a :FORMAT-CONTROL and possibly replace that. Always do that
+      ;; when cross-compiling, but in the target, cautiously skip this step
+      ;; if the first argument is not known to be a symbol. Why?
+      ;; Well if the first argument is a string (or function), then that object
+      ;; is *arbitrary* format-control, and the arguments that follow it do not
+      ;; necessarily comprise a keyword/value pair list as they would for
+      ;; constructing a condition instance. Moreover, in that case you could
+      ;; randomly have a symbol named :FORMAT-CONTROL as an argument, randomly
+      ;; followed by a string that is not actually a format-control!
+      ;; But when the first argument is a symbol, then the following arguments
+      ;; must be a plist passed to MAKE-CONDITION. [See COERCE-TO-CONDITION]
+      ;;
+      ;; In this cross-compiler, this processing is not only always right, but
+      ;; in fact mandatory, to make our format strings agnostic of package names.
+      (when (and *optimize-format-strings*
+                 (member fun '(error warn style-warn
+                               compiler-warn compiler-style-warn))
+                 ;; Hmm, should we additionally require that this symbol be
+                 ;; known to designate a subtype of SIMPLE-CONDITION? Perhaps.
+                 #-sb-xc-host
+                 (csubtypep (lvar-type (car combination-args))
+                            (specifier-type 'symbol)))
+        (let ((keywords (cdr combination-args)))
+          (loop
+            (unless (and keywords (constant-lvar-p (car keywords))) (return))
+            (when (eq (lvar-value (car keywords)) :format-control)
+              (let ((control (cadr keywords)))
+                (when (and (constant-lvar-p control) (stringp (lvar-value control)))
+                  (maybe-replace control)))
+              (return))
+            (setq keywords (cddr keywords))))))))
 
-(defoptimizer (format optimizer) ((dest control &rest args) node)
-  (declare (ignore dest))
-  (when (constant-lvar-p control)
-    (let ((x (lvar-value control)))
-      (when (stringp x)
-        (let ((*compiler-error-context* node))
-         (check-format-args x args 'format))))))
+;;; FORMAT control string best-effort sanity checker and compactor
+(dolist (fun (append '(format error warn style-warn %program-error)
+                     #+sb-xc-host ; No need for these after self-build
+                     '(bug compiler-mumble compiler-notify
+                       compiler-style-warn compiler-warn compiler-error
+                       maybe-compiler-notify
+                       note-lossage note-unwinnage)))
+  (setf (fun-info-optimizer (fun-info-or-lose fun))
+        (let ((arg-n (if (eq fun 'format) 1 0))
+              ;; in some Lisps, DOLIST uses SETQ instead of LET on the iteration
+              ;; variable, so the closures would all share one binding of FUN,
+              ;; which is not as intended. An extra LET solves that.
+              (fun fun))
+          (lambda (node) (check-format-args node fun arg-n t)))))
+
+;; Can these appear in the expansion of FORMATTER?
+#+sb-xc-host
+(dolist (fun '(sb-format::format-error
+               sb-format::format-error-at
+               sb-format::format-error-at*))
+  (setf (fun-info-optimizer (fun-info-or-lose fun))
+        (let ((arg-n (if (eq fun 'sb-format::format-error) 0 2))
+              (fun fun))
+          (lambda (node) (check-format-args node fun arg-n nil)))))
 
 (defoptimizer (format derive-type) ((dest control &rest args))
   (declare (ignore control args))
@@ -4528,10 +4670,10 @@
          ;; FIXME: instead of checking the condition report, define a
          ;; dedicated condition class
          (expr (handler-case ; in case %formatter wants to signal an error
-                   (sb!format::%formatter control argc nil)
+                   (sb-format::%formatter control argc nil)
                  ;; otherwise, let the macro complain
-                 (sb!format:format-error (c)
-                   (if (string= (sb!format::format-error-complaint c)
+                 (sb-format:format-error (c)
+                   (if (string= (sb-format::format-error-complaint c)
                                 "No package named ~S")
                        ;; "~/apackage:afun/" might become legal later.
                        ;; To put it in perspective, "~/f" (no closing slash)
@@ -4569,29 +4711,19 @@
    (loop for directive in control
          always
          (or (stringp directive)
-             (and (sb!format::format-directive-p directive)
-                  (let ((char (sb!format::format-directive-character directive))
-                        (params (sb!format::format-directive-params directive)))
-                    (or
-                     (and
-                      (char-equal char #\a)
-                      (null params)
-                      (pop args))
-                     (and
-                      (or (eql char #\~)
-                          (eql char #\%))
-                      (null (sb!format::format-directive-colonp directive))
-                      (null (sb!format::format-directive-atsignp directive))
-                      (or (null params)
-                          (typep params
-                                 '(cons (cons (eql 1) unsigned-byte) null)))))))))
+             (and (sb-format::format-directive-p directive)
+                  (let ((char (sb-format::directive-character directive))
+                        (params (sb-format::directive-params directive)))
+                     (and (char= char #\A)
+                          (null params)
+                          (pop args))))))
    (null args)))
 
 (deftransform format ((stream control &rest args) (null (constant-arg string) &rest string))
   (let ((tokenized
           (handler-case
-              (sb!format::tokenize-control-string (lvar-value control))
-            (sb!format:format-error ()
+              (sb-format::tokenize-control-string (coerce (lvar-value control) 'simple-string))
+            (sb-format:format-error ()
               (give-up-ir1-transform)))))
     (unless (concatenate-format-p tokenized args)
       (give-up-ir1-transform))
@@ -4601,69 +4733,21 @@
                   (ignorable ,@arg-names))
          (concatenate
           'string
-          ,@(let ((strings
-                    (loop for directive in tokenized
-                          for char = (and (not (stringp directive))
-                                          (sb!format::format-directive-character directive))
-                          when
-                          (cond ((not char)
-                                 directive)
-                                ((char-equal char #\a)
-                                 (let ((arg (pop args))
-                                       (arg-name (pop arg-names)))
-                                   (if
-                                    (constant-lvar-p arg)
-                                    (lvar-value arg)
-                                    arg-name)))
-                                (t
-                                 (let ((n (or (cdar (sb!format::format-directive-params directive))
-                                              1)))
-                                   (and (plusp n)
-                                        (make-string n
-                                                     :initial-element
-                                                     (if (eql char #\%)
-                                                         #\Newline
-                                                         char))))))
-                          collect it)))
-              ;; Join adjacent constant strings
-              (loop with concat
-                    for (string . rest) on strings
-                    when (stringp string)
-                    do (setf concat
-                             (if concat
-                                 (concatenate 'string concat string)
-                                 string))
-                    else
-                    when concat collect (shiftf concat nil) end
-                    and collect string
-                    when (and concat (not rest))
-                    collect concat)))))))
+          ,@(mapcar (lambda (directive)
+                      (if (stringp directive)
+                          directive
+                          (let ((arg (pop args))
+                                (arg-name (pop arg-names)))
+                            (if (constant-lvar-p arg)
+                                (lvar-value arg)
+                                arg-name))))
+                    tokenized))))))
 
 (deftransform pathname ((pathspec) (pathname) *)
   'pathspec)
 
 (deftransform pathname ((pathspec) (string) *)
   '(values (parse-namestring pathspec)))
-
-(macrolet
-    ((def (name)
-         `(defoptimizer (,name optimizer) ((control &rest args) node)
-            (when (constant-lvar-p control)
-              (let ((x (lvar-value control)))
-                (when (stringp x)
-                  (let ((*compiler-error-context* node))
-                    (check-format-args x args ',name))))))))
-  (def error)
-  (def warn)
-  #+sb-xc-host ; Only we should be using these
-  (progn
-    (def style-warn)
-    (def compiler-error)
-    (def compiler-warn)
-    (def compiler-style-warn)
-    (def compiler-notify)
-    (def maybe-compiler-notify)
-    (def bug)))
 
 (defoptimizer (cerror optimizer) ((report control &rest args))
   (when (and (constant-lvar-p control)
@@ -4673,14 +4757,14 @@
       (when (and (stringp x) (stringp y))
         (multiple-value-bind (min1 max1)
             (handler-case
-                (sb!format:%compiler-walk-format-string x args)
-              (sb!format:format-error (c)
+                (sb-format:%compiler-walk-format-string x args)
+              (sb-format:format-error (c)
                 (compiler-warn "~A" c)))
           (when min1
             (multiple-value-bind (min2 max2)
                 (handler-case
-                    (sb!format:%compiler-walk-format-string y args)
-                  (sb!format:format-error (c)
+                    (sb-format:%compiler-walk-format-string y args)
+                  (sb-format:format-error (c)
                     (compiler-warn "~A" c)))
               (when min2
                 (let ((nargs (length args)))
@@ -4806,7 +4890,7 @@
                          *universal-type*))))
         (recurse array-type)))))
 
-(define-source-transform sb!impl::sort-vector (vector start end predicate key)
+(define-source-transform sb-impl::sort-vector (vector start end predicate key)
   ;; Like CMU CL, we use HEAPSORT. However, other than that, this code
   ;; isn't really related to the CMU CL code, since instead of trying
   ;; to generalize the CMU CL code to allow START and END values, this
@@ -4816,48 +4900,43 @@
               (%parent (i) `(ash ,i -1))
               (%left (i) `(%index (ash ,i 1)))
               (%right (i) `(%index (1+ (ash ,i 1))))
+              (%elt (i)
+                `(aref ,',vector
+                       (%index (+ (%index ,i) start-1))))
               (%heapify (i)
-               `(do* ((i ,i)
-                      (left (%left i) (%left i)))
-                 ((> left current-heap-size))
-                 (declare (type index i left))
-                 (let* ((i-elt (%elt i))
-                        (i-key (funcall keyfun i-elt))
-                        (left-elt (%elt left))
-                        (left-key (funcall keyfun left-elt)))
-                   (multiple-value-bind (large large-elt large-key)
-                       (if (funcall ,',predicate i-key left-key)
-                           (values left left-elt left-key)
-                           (values i i-elt i-key))
-                     (let ((right (%right i)))
-                       (multiple-value-bind (largest largest-elt)
-                           (if (> right current-heap-size)
-                               (values large large-elt)
-                               (let* ((right-elt (%elt right))
-                                      (right-key (funcall keyfun right-elt)))
-                                 (if (funcall ,',predicate large-key right-key)
-                                     (values right right-elt)
-                                     (values large large-elt))))
-                         (cond ((= largest i)
-                                (return))
-                               (t
-                                (setf (%elt i) largest-elt
-                                      (%elt largest) i-elt
-                                      i largest)))))))))
-              (%sort-vector (keyfun &optional (vtype 'vector))
-               `(macrolet (;; KLUDGE: In SBCL ca. 0.6.10, I had
-                           ;; trouble getting type inference to
-                           ;; propagate all the way through this
-                           ;; tangled mess of inlining. The TRULY-THE
-                           ;; here works around that. -- WHN
-                           (%elt (i)
-                            `(aref (truly-the ,',vtype ,',',vector)
-                              (%index (+ (%index ,i) start-1)))))
-                 (let (;; Heaps prefer 1-based addressing.
+                `(do* ((i ,i)
+                       (left (%left i) (%left i)))
+                      ((> left current-heap-size))
+                   (declare (type index i left))
+                   (let* ((i-elt (%elt i))
+                          (i-key (funcall keyfun i-elt))
+                          (left-elt (%elt left))
+                          (left-key (funcall keyfun left-elt)))
+                     (multiple-value-bind (large large-elt large-key)
+                         (if (funcall ,',predicate i-key left-key)
+                             (values left left-elt left-key)
+                             (values i i-elt i-key))
+                       (let ((right (%right i)))
+                         (multiple-value-bind (largest largest-elt)
+                             (if (> right current-heap-size)
+                                 (values large large-elt)
+                                 (let* ((right-elt (%elt right))
+                                        (right-key (funcall keyfun right-elt)))
+                                   (if (funcall ,',predicate large-key right-key)
+                                       (values right right-elt)
+                                       (values large large-elt))))
+                           (cond ((= largest i)
+                                  (return))
+                                 (t
+                                  (setf (%elt i) largest-elt
+                                        (%elt largest) i-elt
+                                        i largest)))))))))
+              (%sort-vector (keyfun)
+                `(let ( ;; Heaps prefer 1-based addressing.
                        (start-1 (1- ,',start))
                        (current-heap-size (- ,',end ,',start))
                        (keyfun ,keyfun))
-                   (declare (type (integer -1 #.(1- sb!xc:most-positive-fixnum))
+                   (declare (type (integer -1 #.(1- sb-xc:most-positive-fixnum))
                                   start-1))
                    (declare (type index current-heap-size))
                    (declare (type function keyfun))
@@ -4869,25 +4948,26 @@
                       (return))
                     (rotatef (%elt 1) (%elt current-heap-size))
                     (decf current-heap-size)
-                    (%heapify 1))))))
-    (if (typep ,vector 'simple-vector)
-        ;; (VECTOR T) is worth optimizing for, and SIMPLE-VECTOR is
-        ;; what we get from (VECTOR T) inside WITH-ARRAY-DATA.
-        (if (null ,key)
-            ;; Special-casing the KEY=NIL case lets us avoid some
-            ;; function calls.
-            (%sort-vector #'identity simple-vector)
-            (%sort-vector ,key simple-vector))
-        ;; It's hard to anticipate many speed-critical applications for
-        ;; sorting vector types other than (VECTOR T), so we just lump
-        ;; them all together in one slow dynamically typed mess.
-        (locally
-          (declare (optimize (speed 2) (space 2) (inhibit-warnings 3)))
-          (%sort-vector (or ,key #'identity))))))
+                    (%heapify 1)))))
+     (declare (optimize (insert-array-bounds-checks 0) speed))
+     (if (typep ,vector 'simple-vector)
+         ;; (VECTOR T) is worth optimizing for, and SIMPLE-VECTOR is
+         ;; what we get from (VECTOR T) inside WITH-ARRAY-DATA.
+         (if (null ,key)
+             ;; Special-casing the KEY=NIL case lets us avoid some
+             ;; function calls.
+             (%sort-vector #'identity)
+             (%sort-vector ,key))
+         ;; It's hard to anticipate many speed-critical applications for
+         ;; sorting vector types other than (VECTOR T), so we just lump
+         ;; them all together in one slow dynamically typed mess.
+         (locally
+             (declare (optimize (inhibit-warnings 3)))
+           (%sort-vector (or ,key #'identity))))))
 
 (deftransform sort ((list predicate &key key)
                     (list * &rest t) *)
-  `(sb!impl::stable-sort-list list
+  `(sb-impl::stable-sort-list list
                               (%coerce-callable-to-fun predicate)
                               (if key (%coerce-callable-to-fun key) #'identity)))
 
@@ -4895,15 +4975,15 @@
                            ((or vector list) *))
   (let ((sequence-type (lvar-type sequence)))
     (cond ((csubtypep sequence-type (specifier-type 'list))
-           `(sb!impl::stable-sort-list sequence
+           `(sb-impl::stable-sort-list sequence
                                        (%coerce-callable-to-fun predicate)
                                        (if key (%coerce-callable-to-fun key) #'identity)))
           ((csubtypep sequence-type (specifier-type 'simple-vector))
-           `(sb!impl::stable-sort-simple-vector sequence
+           `(sb-impl::stable-sort-simple-vector sequence
                                                 (%coerce-callable-to-fun predicate)
                                                 (and key (%coerce-callable-to-fun key))))
           (t
-           `(sb!impl::stable-sort-vector sequence
+           `(sb-impl::stable-sort-vector sequence
                                          (%coerce-callable-to-fun predicate)
                                          (and key (%coerce-callable-to-fun key)))))))
 
@@ -4937,37 +5017,32 @@
   (defun /report-lvar (x message)
     (declare (ignore x message))))
 
-(deftransform encode-universal-time
-    ((second minute hour date month year &optional time-zone)
-     ((constant-arg (mod 60)) (constant-arg (mod 60))
-      (constant-arg (mod 24))
-      (constant-arg (integer 1 31))
-      (constant-arg (integer 1 12))
-      (constant-arg (integer 1899))
-      (constant-arg (rational -24 24))))
-  (let ((second (lvar-value second))
-        (minute (lvar-value minute))
-        (hour (lvar-value hour))
-        (date (lvar-value date))
-        (month (lvar-value month))
-        (year (lvar-value year))
-        (time-zone (lvar-value time-zone)))
-    (if (zerop (rem time-zone 1/3600))
-        (encode-universal-time second minute hour date month year time-zone)
-        (give-up-ir1-transform))))
+;;; Can fold only when time-zone is supplied.
+(defoptimizer (encode-universal-time optimizer)
+    (#1=(second minute hour date month year time-zone) node)
+  (declare (ignore . #1#))
+  (when (every #'constant-lvar-p (basic-combination-args node))
+    (constant-fold-call node)
+    t))
 
 #!-(and win32 (not sb-thread))
 (deftransform sleep ((seconds) ((integer 0 #.(expt 10 8))))
-  `(sb!unix:nanosleep seconds 0))
+  `(if sb-impl::*deadline*
+       (locally (declare (notinline sleep)) (sleep seconds))
+       (sb-unix:nanosleep seconds 0)))
 
 #!-(and win32 (not sb-thread))
-(deftransform sleep ((seconds) ((constant-arg (real 0))))
+(deftransform sleep ((seconds)
+                     ((constant-arg (and (real 0)
+                                         (not (satisfies float-infinity-p))))))
   (let ((seconds-value (lvar-value seconds)))
     (multiple-value-bind (seconds nano)
-        (sb!impl::split-seconds-for-sleep seconds-value)
+        (sb-impl::split-seconds-for-sleep seconds-value)
       (if (> seconds (expt 10 8))
           (give-up-ir1-transform)
-          `(sb!unix:nanosleep ,seconds ,nano)))))
+          `(if sb-impl::*deadline*
+               (locally (declare (notinline sleep)) (sleep seconds))
+               (sb-unix:nanosleep ,seconds ,nano))))))
 
 ;; On 64-bit architectures the TLS index is in the symbol header,
 ;; !DEFINE-PRIMITIVE-OBJECT doesn't define an accessor for it.
@@ -4981,22 +5056,23 @@
 #!+(and 64-bit sb-thread)
 (define-source-transform symbol-tls-index (sym)
   `(ash (sap-ref-32 (int-sap (get-lisp-obj-address (the symbol ,sym)))
-                    (- 4 sb!vm:other-pointer-lowtag))
-        (- sb!vm:n-fixnum-tag-bits)))
+                    (- 4 sb-vm:other-pointer-lowtag))
+        (- sb-vm:n-fixnum-tag-bits)))
 
 (deftransform make-string-output-stream ((&key element-type))
   (let ((element-type (cond ((not element-type)
                              'character)
                             ((constant-lvar-p element-type)
-                             (let ((specifier (careful-specifier-type (lvar-value element-type))))
+                             (let ((specifier (ir1-transform-specifier-type
+                                               (lvar-value element-type))))
                                (and (csubtypep specifier (specifier-type 'character))
                                     (type-specifier specifier)))))))
    (if element-type
-       `(sb!impl::%make-string-output-stream
+       `(sb-impl::%make-string-output-stream
          ',element-type
          (function ,(case element-type
-                      (base-char 'sb!impl::string-ouch/base-char)
-                      (t 'sb!impl::string-ouch))))
+                      (base-char 'sb-impl::string-ouch/base-char)
+                      (t 'sb-impl::string-ouch))))
        (give-up-ir1-transform))))
 
 (flet ((xform (symbol match-kind fallback)
@@ -5031,6 +5107,20 @@
     (xform symbol :global `(sym-global-val symbol)))
   (deftransform symbol-value ((symbol))
     (xform symbol :special `(symeval symbol))))
+
+(deftransform symeval ((symbol) ((constant-arg symbol)))
+  (let* ((symbol (lvar-value symbol))
+         (kind (info :variable :kind symbol)))
+    (if (and (eq kind :constant)
+             (boundp symbol)
+             (typep (symbol-value symbol) '(or number character symbol)))
+        symbol
+        (give-up-ir1-transform))))
+
+(deftransform boundp ((symbol) ((constant-arg symbol)))
+  (if (always-boundp (lvar-value symbol))
+      t
+      (give-up-ir1-transform)))
 
 (flet ((xform (symbol match-kind)
          (let* ((symbol (lvar-value symbol))

@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; Signed and unsigned bignums from word-sized integers. Argument
 ;;;; and return in the same register. No VOPs, as these are only used
@@ -24,8 +24,8 @@
              (let ((tn (symbolicate reg "-TN")))
                `(define-assembly-routine (,(symbolicate "ALLOC-SIGNED-BIGNUM-IN-" reg)) ()
                   (inst push ,tn)
-                  (with-fixed-allocation (,tn bignum-widetag (+ bignum-digits-offset 1))
-                    (popw ,tn bignum-digits-offset other-pointer-lowtag))))))
+                  (fixed-alloc ,tn bignum-widetag (+ bignum-digits-offset 1) nil)
+                  (popw ,tn bignum-digits-offset other-pointer-lowtag)))))
   (def eax)
   (def ebx)
   (def ecx)
@@ -43,12 +43,12 @@
                   ;; here we minimize garbage.
                   (inst jmp :ns one-word-bignum)
                   ;; Two word bignum
-                  (with-fixed-allocation (,tn bignum-widetag (+ bignum-digits-offset 2))
-                    (popw ,tn bignum-digits-offset other-pointer-lowtag))
+                  (fixed-alloc ,tn bignum-widetag (+ bignum-digits-offset 2) nil)
+                  (popw ,tn bignum-digits-offset other-pointer-lowtag)
                   (inst ret)
                   ONE-WORD-BIGNUM
-                  (with-fixed-allocation (,tn bignum-widetag (+ bignum-digits-offset 1))
-                    (popw ,tn bignum-digits-offset other-pointer-lowtag))))))
+                  (fixed-alloc ,tn bignum-widetag (+ bignum-digits-offset 1) nil)
+                  (popw ,tn bignum-digits-offset other-pointer-lowtag)))))
   (def eax)
   (def ebx)
   (def ecx)
@@ -56,13 +56,12 @@
   (def edi)
   (def esi))
 
-;;; FIXME: This is dead, right? Can it go?
 #+sb-assembling
 (defun frob-allocation-assembly-routine (obj lowtag arg-tn)
   `(define-assembly-routine (,(intern (format nil "ALLOCATE-~A-TO-~A" obj arg-tn)))
      ((:temp ,arg-tn descriptor-reg ,(intern (format nil "~A-OFFSET" arg-tn))))
-     (pseudo-atomic
-      (allocation ,arg-tn (pad-data-block ,(intern (format nil "~A-SIZE" obj))))
+     (pseudo-atomic ()
+      (allocation ,arg-tn (pad-data-block ,(intern (format nil "~A-SIZE" obj))) nil)
       (inst lea ,arg-tn (make-ea :byte :base ,arg-tn :disp ,lowtag)))))
 
 #+sb-assembling
@@ -96,7 +95,7 @@
     ;; to receive an interrupt causing it to do a slow operation between
     ;; acquisition and release of the spinlock. Preventing GC is irrelevant,
     ;; but would not be if we recycled tls indices of garbage symbols.
-    (pseudo-atomic
+    (pseudo-atomic ()
      (assemble () ; for conversion of tagbody-like labels to assembler labels
      RETRY
        (inst bts free-tls-index-ea lock-bit :lock)

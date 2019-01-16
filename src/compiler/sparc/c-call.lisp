@@ -9,12 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
-
-(defun my-make-wired-tn (prim-type-name sc-name offset)
-  (make-wired-tn (primitive-type-or-lose prim-type-name)
-                 (sc-number-or-lose sc-name)
-                 offset))
+(in-package "SB-VM")
 
 (defstruct arg-state
   (register-args 0)
@@ -27,20 +22,20 @@
   (let ((reg-args (arg-state-register-args state)))
     (cond ((< reg-args 6)
            (setf (arg-state-register-args state) (1+ reg-args))
-           (my-make-wired-tn prim-type reg-sc (+ reg-args nl0-offset)))
+           (make-wired-tn* prim-type reg-sc (+ reg-args nl0-offset)))
           (t
            (let ((frame-size (arg-state-stack-frame-size state)))
              (setf (arg-state-stack-frame-size state) (1+ frame-size))
-             (my-make-wired-tn prim-type stack-sc (+ frame-size 16)))))))
+             (make-wired-tn* prim-type stack-sc (+ frame-size 16)))))))
 
 (define-alien-type-method (integer :arg-tn) (type state)
   (if (alien-integer-type-signed type)
-      (int-arg state 'signed-byte-32 'signed-reg 'signed-stack)
-      (int-arg state 'unsigned-byte-32 'unsigned-reg 'unsigned-stack)))
+      (int-arg state 'signed-byte-32 signed-reg-sc-number signed-stack-sc-number)
+      (int-arg state 'unsigned-byte-32 unsigned-reg-sc-number unsigned-stack-sc-number)))
 
 (define-alien-type-method (system-area-pointer :arg-tn) (type state)
   (declare (ignore type))
-  (int-arg state 'system-area-pointer 'sap-reg 'sap-stack))
+  (int-arg state 'system-area-pointer sap-reg-sc-number sap-stack-sc-number))
 
 (defstruct result-state
   (num-results 0))
@@ -55,29 +50,29 @@
     (setf (result-state-num-results state) (1+ num-results))
     (multiple-value-bind (ptype reg-sc)
         (if (alien-integer-type-signed type)
-            (values 'signed-byte-32 'signed-reg)
-            (values 'unsigned-byte-32 'unsigned-reg))
-      (my-make-wired-tn ptype reg-sc (result-reg-offset num-results)))))
+            (values 'signed-byte-32 signed-reg-sc-number)
+            (values 'unsigned-byte-32 unsigned-reg-sc-number))
+      (make-wired-tn* ptype reg-sc (result-reg-offset num-results)))))
 
 (define-alien-type-method (system-area-pointer :result-tn) (type state)
   (declare (ignore type))
   (let ((num-results (result-state-num-results state)))
     (setf (result-state-num-results state) (1+ num-results))
-    (my-make-wired-tn 'system-area-pointer 'sap-reg
+    (make-wired-tn* 'system-area-pointer sap-reg-sc-number
                       (result-reg-offset num-results))))
 
 (define-alien-type-method (double-float :result-tn) (type state)
   (declare (ignore type state))
-  (my-make-wired-tn 'double-float 'double-reg 0))
+  (make-wired-tn* 'double-float double-reg-sc-number 0))
 
 (define-alien-type-method (single-float :result-tn) (type state)
   (declare (ignore type state))
-  (my-make-wired-tn 'single-float 'single-reg 0))
+  (make-wired-tn* 'single-float single-reg-sc-number 0))
 
 #!+long-float
 (define-alien-type-method (long-float :result-tn) (type)
   (declare (ignore type))
-  (my-make-wired-tn 'long-float 'long-reg 0))
+  (make-wired-tn* 'long-float long-reg-sc-number 0))
 
 (define-alien-type-method (values :result-tn) (type state)
   (let ((values (alien-values-type-values type)))
@@ -93,7 +88,7 @@
     (collect ((arg-tns))
       (dolist (arg-type (alien-fun-type-arg-types type))
         (arg-tns (invoke-alien-type-method :arg-tn arg-type arg-state)))
-      (values (my-make-wired-tn 'positive-fixnum 'any-reg nsp-offset)
+      (values (make-wired-tn* 'positive-fixnum any-reg-sc-number nsp-offset)
               (* (arg-state-stack-frame-size arg-state) n-word-bytes)
               (arg-tns)
               (invoke-alien-type-method
@@ -102,8 +97,8 @@
                (make-result-state))))))
 
 (deftransform %alien-funcall ((function type &rest args))
-  (aver (sb!c::constant-lvar-p type))
-  (let* ((type (sb!c::lvar-value type))
+  (aver (sb-c::constant-lvar-p type))
+  (let* ((type (sb-c::lvar-value type))
          (arg-types (alien-fun-type-arg-types type))
          (result-type (alien-fun-type-result-type type)))
     (aver (= (length arg-types) (length args)))
@@ -114,17 +109,17 @@
             (some #'alien-double-float-type-p arg-types)
             (some #'(lambda (type)
                       (and (alien-integer-type-p type)
-                           (> (sb!alien::alien-integer-type-bits type) 32)))
+                           (> (sb-alien::alien-integer-type-bits type) 32)))
                   arg-types)
             #!+long-float (some #'alien-long-float-type-p arg-types)
             (and (alien-integer-type-p result-type)
-                 (> (sb!alien::alien-integer-type-bits result-type) 32)))
+                 (> (sb-alien::alien-integer-type-bits result-type) 32)))
         (collect ((new-args) (lambda-vars) (new-arg-types))
                  (dolist (type arg-types)
                    (let ((arg (gensym)))
                      (lambda-vars arg)
                      (cond ((and (alien-integer-type-p type)
-                                 (> (sb!alien::alien-integer-type-bits type) 32))
+                                 (> (sb-alien::alien-integer-type-bits type) 32))
                             ;; 64-bit long long types are stored in
                             ;; consecutive locations, most significant word
                             ;; first (big-endian).
@@ -156,9 +151,9 @@
                             (new-args arg)
                             (new-arg-types type)))))
                  (cond ((and (alien-integer-type-p result-type)
-                             (> (sb!alien::alien-integer-type-bits result-type) 32))
+                             (> (sb-alien::alien-integer-type-bits result-type) 32))
                         (let ((new-result-type
-                               (let ((sb!alien::*values-type-okay* t))
+                               (let ((sb-alien::*values-type-okay* t))
                                  (parse-alien-type
                                   (if (alien-integer-type-signed result-type)
                                       '(values (signed 32) (unsigned 32))
@@ -181,7 +176,7 @@
                               :arg-types (new-arg-types)
                               :result-type result-type)
                            ,@(new-args))))))
-        (sb!c::give-up-ir1-transform))))
+        (sb-c::give-up-ir1-transform))))
 
 (define-vop (foreign-symbol-sap)
   (:translate foreign-symbol-sap)

@@ -11,7 +11,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!SPARC-ASM")
+(in-package "SB-SPARC-ASM")
 
 (defun sethi-arg-printer (value stream dstate)
     (format stream "%hi(#x~8,'0x)" (ash value 10))
@@ -137,7 +137,7 @@
      ;; A reference to a static symbol or static function (reg =
      ;; %NULL)
      (or (maybe-note-nil-indexed-symbol-slot-ref immed-val dstate)
-         #+nil (sb!disassem::maybe-note-static-function immed-val dstate)))
+         #+nil (sb-disassem::maybe-note-static-function immed-val dstate)))
     (t
      (let ((sethi (assoc rs1 *note-sethi-inst*)))
        (when sethi
@@ -153,18 +153,18 @@
 (defun unimp-control (chunk inst stream dstate)
   (declare (ignore inst))
   (flet ((nt (x) (if stream (note x dstate))))
-    (case (format-2-unimp-data chunk dstate)
-      (#.error-trap
-       (nt "Error trap")
-       (handle-break-args #'snarf-error-junk stream dstate))
-      (#.cerror-trap
-       (nt "Cerror trap")
-       (handle-break-args #'snarf-error-junk stream dstate))
-      (#.breakpoint-trap
-       (nt "Breakpoint trap"))
-      (#.pending-interrupt-trap
-       (nt "Pending interrupt trap"))
-      (#.halt-trap
-       (nt "Halt trap"))
-      (#.fun-end-breakpoint-trap
-       (nt "Function end breakpoint trap")))))
+    (let ((trap (format-2-unimp-data chunk dstate)))
+     (case trap
+       (#.cerror-trap
+        (nt "Cerror trap")
+        (handle-break-args #'snarf-error-junk trap stream dstate))
+       (#.breakpoint-trap
+        (nt "Breakpoint trap"))
+       (#.pending-interrupt-trap
+        (nt "Pending interrupt trap"))
+       (#.halt-trap
+        (nt "Halt trap"))
+       (#.fun-end-breakpoint-trap
+        (nt "Function end breakpoint trap"))
+       (t
+        (handle-break-args #'snarf-error-junk trap stream dstate))))))

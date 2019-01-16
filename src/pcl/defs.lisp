@@ -61,27 +61,6 @@
       class))
 
 ;;; interface
-(defun specializer-from-type (type &aux args)
-  ;; Avoid style-warning about compiler-macro being unavailable.
-  (declare (notinline make-instance))
-  (when (symbolp type)
-    (return-from specializer-from-type (find-class type)))
-  (when (consp type)
-    (setq args (cdr type) type (car type)))
-  (cond ((symbolp type)
-         (or (ecase type
-               (class    (coerce-to-class (car args)))
-               (prototype (make-instance 'class-prototype-specializer
-                                         :object (coerce-to-class (car args))))
-               (class-eq (class-eq-specializer (coerce-to-class (car args))))
-               (eql      (intern-eql-specializer (car args))))))
-        ;; FIXME: do we still need this?
-        ((and (null args) (typep type 'classoid))
-         (or (classoid-pcl-class type)
-             (ensure-non-standard-class (classoid-name type) type)))
-        ((specializerp type) type)))
-
-;;; interface
 (defun type-from-specializer (specl)
   (cond ((eq specl t)
          t)
@@ -178,15 +157,11 @@
               (t
                (subtypep (convert-to-system-type type1)
                          (convert-to-system-type type2))))))))
-
-(define-load-time-global *built-in-class-symbols* ())
 
-(defun get-built-in-class-symbol (class-name)
-  (or (cadr (assq class-name *built-in-class-symbols*))
-      (let ((symbol (make-class-symbol class-name)))
-        (push (list class-name symbol) *built-in-class-symbols*)
-        symbol)))
-
+(defun make-class-symbol (class-name)
+  (format-symbol #.(find-package "SB-PCL")
+                 "*THE-CLASS-~A*" (symbol-name class-name)))
+
 (defvar *standard-method-combination*)
 (defvar *or-method-combination*)
 
@@ -202,7 +177,7 @@
 
 ;;;; built-in classes
 
-;;; Grovel over SB-KERNEL::*!BUILT-IN-CLASSES* in order to set
+;;; Grovel over SB-KERNEL::+!BUILT-IN-CLASSES+ in order to set
 ;;; SB-PCL:*BUILT-IN-CLASSES*.
 (/show "about to set up SB-PCL::*BUILT-IN-CLASSES*")
 (define-load-time-global *built-in-classes*
@@ -257,7 +232,7 @@
                                  ;; BUILT-IN-CLASS list
                                  '(t function stream sequence
                                      file-stream string-stream)))
-                       sb-kernel::*!built-in-classes*))))
+                       sb-kernel::+!built-in-classes+))))
 (/noshow "done setting up SB-PCL::*BUILT-IN-CLASSES*")
 
 ;;;; the classes that define the kernel of the metabraid
@@ -399,30 +374,23 @@
 
 (defclass standard-method-combination (definition-source-mixin
                                        method-combination)
-  ((type-name
-    :reader method-combination-type-name
-    :initarg :type-name)
-   (options
-    :reader method-combination-options
-    :initarg :options)))
+  ((type-name :reader method-combination-type-name :initarg :type-name)
+   (options :reader method-combination-options :initarg :options)
+   (%generic-functions :initform (make-hash-table :weakness :key
+                                                   :synchronized t)
+                       :reader method-combination-%generic-functions)))
 
 (defclass long-method-combination (standard-method-combination)
-  ((function
-    :initarg :function
-    :reader long-method-combination-function)
-   (args-lambda-list
-    :initarg :args-lambda-list
-    :reader long-method-combination-args-lambda-list)))
+  ((function :initarg :function :reader long-method-combination-function)
+   (args-lambda-list :initarg :args-lambda-list
+                     :reader long-method-combination-args-lambda-list)))
 
 (defclass short-method-combination (standard-method-combination)
-  ((operator
-    :reader short-combination-operator
-    :initarg :operator)
-   (identity-with-one-argument
-    :reader short-combination-identity-with-one-argument
+  ((operator :reader short-combination-operator :initarg :operator)
+   (identity-with-one-argument :reader short-combination-identity-with-one-argument
     :initarg :identity-with-one-argument)))
 
-(defclass slot-definition (metaobject)
+(defclass slot-definition (metaobject definition-source-mixin)
   ((name
     :initform nil
     :initarg :name
@@ -445,8 +413,7 @@
     ;; KLUDGE: we need a reader for bootstrapping purposes, in
     ;; COMPUTE-EFFECTIVE-SLOT-DEFINITION-INITARGS.
     :reader %slot-definition-documentation)
-   (%class :initform nil :initarg :class :accessor slot-definition-class)
-   (source :initform nil :initarg source :accessor definition-source)))
+   (%class :initform nil :initarg :class :accessor slot-definition-class)))
 
 (defclass standard-slot-definition (slot-definition)
   ((allocation
@@ -707,7 +674,7 @@
   ((source
     :initform nil
     :reader definition-source
-    :initarg :definition-source)))
+    :initarg source)))
 
 (defclass plist-mixin (standard-object)
   ((plist :initform () :accessor object-plist :initarg plist)))

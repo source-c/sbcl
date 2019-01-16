@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; the branch VOP
 
@@ -35,7 +35,7 @@
 ;;; false. Otherwise, the code must branch to dest if the test was true.
 
 (define-vop (branch-if)
-  (:info dest flags not-p)
+  (:info dest not-p flags)
   (:generator 0
      (flet ((negate-condition (name)
               (let ((code (logxor 1 (conditional-opcode name))))
@@ -47,7 +47,7 @@
                  (first flags))
              dest))))
 
-(defvar *cmov-ptype-representation-vop*
+(define-load-time-global *cmov-ptype-representation-vop*
   (mapcan (lambda (entry)
             (destructuring-bind (ptypes &optional sc vop)
                 entry
@@ -82,8 +82,8 @@
 
 (defun convert-conditional-move-p (node dst-tn x-tn y-tn)
   (declare (ignore node))
-  (let* ((ptype (sb!c::tn-primitive-type dst-tn))
-         (name  (sb!c::primitive-type-name ptype))
+  (let* ((ptype (sb-c::tn-primitive-type dst-tn))
+         (name  (sb-c::primitive-type-name ptype))
          (param (and (memq :cmov *backend-subfeatures*)
                      (cdr (or (assoc name *cmov-ptype-representation-vop*)
                               '(t descriptor-reg move-if/t))))))
@@ -93,7 +93,7 @@
           (labels ((make-tn ()
                      (make-representation-tn ptype scn))
                    (frob-tn (tn)
-                     (if (immediate-tn-p tn)
+                     (if (constant-tn-p tn)
                          tn
                          (make-tn))))
             (values vop

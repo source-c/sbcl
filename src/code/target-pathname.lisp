@@ -9,12 +9,228 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
+(defstruct (logical-host
+             (:copier nil)
+             (:print-object
+              (lambda (logical-host stream)
+                (print-unreadable-object (logical-host stream :type t)
+                  (prin1 (logical-host-name logical-host) stream))))
+             (:include host
+                       (parse #'parse-logical-namestring)
+                       (parse-native
+                        (lambda (&rest x)
+                          (error "called PARSE-NATIVE-NAMESTRING using a ~
+                                  logical host: ~S" (first x))))
+                       (unparse #'unparse-logical-namestring)
+                       (unparse-native
+                        (lambda (&rest x)
+                          (error "called NATIVE-NAMESTRING using a ~
+                                  logical host: ~S" (first x))))
+                       (unparse-host
+                        (lambda (x)
+                          (logical-host-name (%pathname-host x))))
+                       (unparse-directory #'unparse-logical-directory)
+                       (unparse-file #'unparse-logical-file)
+                       (unparse-enough #'unparse-enough-namestring)
+                       (unparse-directory-separator ";")
+                       (simplify-namestring #'identity)
+                       (customary-case :upper)))
+  (name "" :type simple-string :read-only t)
+  (translations nil :type list)
+  (canon-transls nil :type list))
+
+;;; Logical pathnames have the following format:
+;;;
+;;; logical-namestring ::=
+;;;      [host ":"] [";"] {directory ";"}* [name] ["." type ["." version]]
+;;;
+;;; host ::= word
+;;; directory ::= word | wildcard-word | **
+;;; name ::= word | wildcard-word
+;;; type ::= word | wildcard-word
+;;; version ::= pos-int | newest | NEWEST | *
+;;; word ::= {uppercase-letter | digit | -}+
+;;; wildcard-word ::= [word] '* {word '*}* [word]
+;;; pos-int ::= integer > 0
+;;;
+;;; Physical pathnames include all these slots and a device slot.
+
+;;; Logical pathnames are a subclass of PATHNAME. Their class
+;;; relations are mimicked using structures for efficiency.
+(defstruct (logical-pathname (:conc-name %logical-pathname-)
+                                   (:include pathname)
+                                   (:copier nil)
+                                   (:constructor %make-logical-pathname
+                                    (host device directory name type version
+                                     &aux (dir-hash (pathname-dir-hash directory))
+                                          (stem-hash (mix (sxhash name) (sxhash type)))))))
+
+;;; FIXME: this, and many other FREEZE-TYPEs don't actually do anything.
+;;; Unobvious order of execution of TLFs in cold-init is one potential problem,
+;;; but there could be other issues as well, like maybe we're unsealing classes
+;;; because the FREEZE-TYPE was wrong to begin with. (So why no warnings then?)
 #!-sb-fluid (declaim (freeze-type logical-pathname logical-host))
+
+(defmethod make-load-form ((logical-host logical-host) &optional env)
+  (declare (ignore env))
+  (values `(find-logical-host ',(logical-host-name logical-host))
+          nil))
+
+;;; Utility functions
+
+(deftype absent-pathname-component ()
+  '(member nil :unspecific))
+
+(declaim (inline pathname-component-present-p))
+(defun pathname-component-present-p (component)
+  (not (typep component 'absent-pathname-component)))
+
+;;; The following functions are used both for Unix and Windows: while
+;;; we accept both \ and / as directory separators on Windows, we
+;;; print our own always with /, which is much less confusing what
+;;; with being \ needing to be escaped.
+(defun unparse-physical-directory (pathname escape-char)
+  (declare (pathname pathname))
+  (unparse-physical-directory-list (%pathname-directory pathname) escape-char))
+
+(defun unparse-physical-directory-list (directory escape-char)
+  (declare (list directory))
+  (collect ((pieces))
+    (when directory
+      (ecase (pop directory)
+       (:absolute
+        (let ((next (pop directory)))
+          (cond ((eq :home next)
+                 (pieces "~"))
+                ((and (consp next) (eq :home (car next)))
+                 (pieces "~")
+                 (pieces (second next)))
+                ((and (stringp next)
+                      (plusp (length next))
+                      (char= #\~ (char next 0)))
+                 ;; The only place we need to escape the tilde.
+                 (pieces "\\")
+                 (pieces next))
+                (next
+                 (push next directory)))
+          (pieces "/")))
+        (:relative))
+      (dolist (dir directory)
+        (typecase dir
+         ((member :up)
+          (pieces "../"))
+         ((member :back)
+          (error ":BACK cannot be represented in namestrings."))
+         ((member :wild-inferiors)
+          (pieces "**/"))
+         ((or simple-string pattern (member :wild))
+          (pieces (unparse-physical-piece dir escape-char))
+          (pieces "/"))
+         (t
+          (error "invalid directory component: ~S" dir)))))
+    (apply #'concatenate 'simple-string (pieces))))
+
+(defun unparse-physical-file (pathname escape-char)
+  (declare (type pathname pathname))
+  (let ((name (%pathname-name pathname))
+        (type (%pathname-type pathname)))
+    (collect ((fragments))
+      ;; Note: by ANSI 19.3.1.1.5, we ignore the version slot when
+      ;; translating logical pathnames to a filesystem without
+      ;; versions (like Unix and Win32).
+      (when name
+        (when (and (typep name 'string)
+                   (string= name ""))
+          (no-namestring-error
+           pathname "the ~S component ~S is of length 0" :name name))
+        (fragments (unparse-physical-piece
+                    name escape-char
+                    :escape-dot (when (null type) :unless-at-start))))
+      (when (pathname-component-present-p type)
+        (unless name
+          (no-namestring-error
+           pathname
+           "there is a ~S component but no ~S component" :type :name))
+        (fragments ".")
+        (fragments (unparse-physical-piece
+                    type escape-char :escape-dot t)))
+      (apply #'concatenate 'simple-string (fragments)))))
+
+(defun unparse-native-physical-file (pathname)
+  (let ((name (pathname-name pathname))
+        (type (pathname-type pathname)))
+    (collect ((fragments))
+      (cond
+        ((pathname-component-present-p name)
+         (unless (stringp name)         ; some kind of wild field
+           (no-native-namestring-error
+            pathname "of the ~S component ~S." :name name))
+         (fragments name)
+         (when (pathname-component-present-p type)
+           (unless (stringp type)       ; some kind of wild field
+             (no-native-namestring-error
+              pathname "of the ~S component ~S" :type type))
+           (fragments ".")
+           (fragments type)))
+        ((pathname-component-present-p type) ; type without a name
+         (no-native-namestring-error
+          pathname
+          "there is a ~S component but no ~S component" :type :name)))
+      (apply #'concatenate 'simple-string (fragments)))))
+
+(defun unparse-physical-enough (pathname defaults escape-char)
+  (declare (type pathname pathname defaults))
+  (flet ((lose ()
+           (error "~S cannot be represented relative to ~S."
+                  pathname defaults)))
+    (collect ((strings))
+      (let* ((pathname-directory (%pathname-directory pathname))
+             (defaults-directory (%pathname-directory defaults))
+             (prefix-len (length defaults-directory))
+             (result-directory
+               (cond ((null pathname-directory) '(:relative))
+                     ((eq (car pathname-directory) :relative)
+                      pathname-directory)
+                     ((and (> prefix-len 0)
+                           (>= (length pathname-directory) prefix-len)
+                           (compare-component (subseq pathname-directory
+                                                      0 prefix-len)
+                                              defaults-directory))
+                      ;; Pathname starts with a prefix of default. So
+                      ;; just use a relative directory from then on out.
+                      (cons :relative (nthcdr prefix-len pathname-directory)))
+                     ((eq (car pathname-directory) :absolute)
+                      ;; We are an absolute pathname, so we can just use it.
+                      pathname-directory)
+                     (t
+                      (bug "Bad fallthrough in ~S" 'unparse-physical-enough)))))
+        (strings (unparse-physical-directory-list result-directory escape-char)))
+      (let* ((pathname-type (%pathname-type pathname))
+             (type-needed (pathname-component-present-p pathname-type))
+             (pathname-name (%pathname-name pathname))
+             (name-needed (or type-needed
+                              (and pathname-name
+                                   (not (compare-component pathname-name
+                                                           (%pathname-name
+                                                            defaults)))))))
+        (when name-needed
+          (unless pathname-name (lose))
+          (strings (unparse-physical-piece
+                    pathname-name escape-char
+                    :escape-dot (when (not pathname-type) :unless-at-start))))
+        (when type-needed
+          (unless (pathname-component-present-p pathname-type)
+            (lose))
+          (strings ".")
+          (strings (unparse-physical-piece pathname-type
+                                           escape-char :escape-dot t))))
+      (apply #'concatenate 'simple-string (strings)))))
+
 
 ;;; To be initialized in unix/win32-pathname.lisp
-(defvar *physical-host*)
+(define-load-time-global *physical-host* nil)
 
 ;;; Return a value suitable, e.g., for preinitializing
 ;;; *DEFAULT-PATHNAME-DEFAULTS* before *DEFAULT-PATHNAME-DEFAULTS* is
@@ -29,6 +245,8 @@
 ;;; filesystem root- every directory in your work space might hash to the same
 ;;; value under SXHASH. Mixing in all pieces of the directory path solves that.
 (defun pathname-dir-hash (directory)
+  ;; FIXME: all instances of PATTERN hash to the same thing.
+  ;; We should probably hash the pattern pieces. (Same for stem-hash)
   (let ((hash (sxhash (car directory))))
     (dolist (piece (cdr directory) hash)
       (mixf hash (sxhash piece)))))
@@ -259,7 +477,7 @@
 ;;; A two-level lookup is used- it works better than mixing all
 ;;; pathname components into a hash key.
 (define-load-time-global *pathnames* (make-array 211 :initial-element nil))
-(defglobal *pathnames-lock* (sb!thread:make-mutex :name "Pathnames"))
+(define-load-time-global *pathnames-lock* (sb-thread:make-mutex :name "Pathnames"))
 
 (defun %make-pathname (host device directory name type version)
   (if (or device (neq host *physical-host*))
@@ -313,7 +531,7 @@
             ;; on the double-check, allocate it now
             (let ((pathname (%%make-pathname *physical-host* nil (car dir-holder)
                                              name type version)))
-              (sb!thread::with-system-mutex (*pathnames-lock*)
+              (sb-thread::with-system-mutex (*pathnames-lock*)
                 (when (>= n-candidates 10)
                   ;; Rehash into a larger vector
                   (let* ((old-len (length vector))
@@ -334,32 +552,27 @@
               pathname))))))
 
 ;;; Convert PATHNAME-DESIGNATOR (a pathname, or string, or
-;;; stream), into a pathname in pathname.
-;;;
-;;; FIXME: was rewritten, should be tested (or rewritten again, this
-;;; time using ONCE-ONLY, *then* tested)
-(eval-when (:compile-toplevel :execute)
-(sb!xc:defmacro with-pathname ((pathname pathname-designator) &body body)
-  (let ((pd0 (gensym)))
-    `(let* ((,pd0 ,pathname-designator)
-            (,pathname (etypecase ,pd0
-                         (pathname ,pd0)
-                         (string (parse-namestring ,pd0))
-                         (file-stream (file-name ,pd0)))))
+;;; stream), into a pathname in PATHNAME.
+(defmacro with-pathname ((pathname pathname-designator) &body body)
+  (once-only ((pathname-designator pathname-designator))
+    `(let ((,pathname (etypecase ,pathname-designator
+                        (pathname ,pathname-designator)
+                        (string (parse-namestring ,pathname-designator))
+                        ((or file-stream synonym-stream)
+                         (stream-file-name-or-lose ,pathname-designator)))))
        ,@body)))
 
-(sb!xc:defmacro with-native-pathname ((pathname pathname-designator) &body body)
-  (let ((pd0 (gensym)))
-    `(let* ((,pd0 ,pathname-designator)
-            (,pathname (etypecase ,pd0
-                         (pathname ,pd0)
-                         (string (parse-native-namestring ,pd0))
-                         ;; FIXME
-                         #+nil
-                         (file-stream (file-name ,pd0)))))
+(defmacro with-native-pathname ((pathname pathname-designator) &body body)
+  (once-only ((pathname-designator pathname-designator))
+    `(let ((,pathname (etypecase ,pathname-designator
+                        (pathname ,pathname-designator)
+                        (string (parse-native-namestring ,pathname-designator))
+                        ;; FIXME
+                        #+nil
+                        (file-stream (file-name ,pathname-designator)))))
        ,@body)))
 
-(sb!xc:defmacro with-host ((host host-designator) &body body)
+(defmacro with-host ((host host-designator) &body body)
   ;; Generally, redundant specification of information in software,
   ;; whether in code or in comments, is bad. However, the ANSI spec
   ;; for this is messy enough that it's hard to hold in short-term
@@ -384,38 +597,36 @@
   ;;
   ;; A logical host is an object of implementation-dependent nature. In
   ;; SBCL, it's a member of the HOST class (a subclass of STRUCTURE-OBJECT).
-  (let ((hd0 (gensym)))
-    `(let* ((,hd0 ,host-designator)
-            (,host (etypecase ,hd0
-                     ((string 0)
-                      ;; This is a special host. It's not valid as a
-                      ;; logical host, so it is a sensible thing to
-                      ;; designate the physical host object. So we do
-                      ;; that.
-                      *physical-host*)
-                     (string
-                      ;; In general ANSI-compliant Common Lisps, a
-                      ;; string might also be a physical pathname
-                      ;; host, but ANSI leaves this up to the
-                      ;; implementor, and in SBCL we don't do it, so
-                      ;; it must be a logical host.
-                      (find-logical-host ,hd0))
-                     ((or null (member :unspecific))
-                      ;; CLHS says that HOST=:UNSPECIFIC has
-                      ;; implementation-defined behavior. We
-                      ;; just turn it into NIL.
-                      nil)
-                     (list
-                      ;; ANSI also allows LISTs to designate hosts,
-                      ;; but leaves its interpretation
-                      ;; implementation-defined. Our interpretation
-                      ;; is that it's unsupported.:-|
-                      (error "A LIST representing a pathname host is not ~
+  (once-only ((host-designator host-designator))
+    `(let ((,host (etypecase ,host-designator
+                    ((string 0)
+                     ;; This is a special host. It's not valid as a
+                     ;; logical host, so it is a sensible thing to
+                     ;; designate the physical host object. So we do
+                     ;; that.
+                     *physical-host*)
+                    (string
+                     ;; In general ANSI-compliant Common Lisps, a
+                     ;; string might also be a physical pathname
+                     ;; host, but ANSI leaves this up to the
+                     ;; implementor, and in SBCL we don't do it, so
+                     ;; it must be a logical host.
+                     (find-logical-host ,host-designator))
+                    (absent-pathname-component
+                     ;; CLHS says that HOST=:UNSPECIFIC has
+                     ;; implementation-defined behavior. We
+                     ;; just turn it into NIL.
+                     nil)
+                    (list
+                     ;; ANSI also allows LISTs to designate hosts,
+                     ;; but leaves its interpretation
+                     ;; implementation-defined. Our interpretation
+                     ;; is that it's unsupported.:-|
+                     (error "A LIST representing a pathname host is not ~
                               supported in this implementation:~%  ~S"
-                             ,hd0))
-                     (host ,hd0))))
-      ,@body)))
-) ; EVAL-WHEN
+                            ,host-designator))
+                    (host ,host-designator))))
+       ,@body)))
 
 (defun find-host (host-designator &optional (errorp t))
   (with-host (host host-designator)
@@ -435,72 +646,62 @@ the operating system native pathname conventions."
   (with-native-pathname (pathname pathspec)
     pathname))
 
-;;; Change the case of thing if DIDDLE-P.
+;;; Recursively (e.g. for the directory component) change the case of
+;;; the pathname component THING.
+(declaim (type (sfunction ((or symbol integer string pattern list))
+                          (or symbol integer string pattern list))
+               diddle-case))
+(defun diddle-case (thing)
+  (labels ((check-for (pred in)
+             (typecase in
+               (pattern
+                (some (lambda (piece)
+                        (typecase piece
+                          (simple-string
+                           (check-for pred piece))
+                          ((cons (eql :character-set))
+                           (check-for pred (cdr piece)))))
+                      (pattern-pieces in)))
+               (simple-string
+                (some pred in))))
+           (diddle-with (fun thing)
+             (typecase thing
+               (pattern
+                (make-pattern
+                 (mapcar (lambda (piece)
+                           (typecase piece
+                             (simple-string
+                              (funcall fun piece))
+                             ((cons (eql :character-set))
+                              (funcall fun (cdr piece)))
+                             (t
+                              piece)))
+                         (pattern-pieces thing))))
+               (simple-string
+                (funcall fun thing))
+               (t
+                thing)))
+           (maybe-diddle-part (thing)
+             (if (listp thing)
+                 (mapcar #'maybe-diddle-part thing)
+                 (let ((any-uppers (check-for #'upper-case-p thing))
+                       (any-lowers (check-for #'lower-case-p thing)))
+                   (cond ((and any-uppers any-lowers) ; mixed case, stays the same
+                          thing)
+                         (any-uppers ; all uppercase, becomes all lower case
+                          (diddle-with 'string-downcase thing))
+                         (any-lowers ; all lowercase, becomes all upper case
+                          (diddle-with 'string-upcase thing))
+                         (t ; no letters?  I guess just leave it.
+                          thing))))))
+    (if (not (or (symbolp thing) (integerp thing)))
+        (maybe-diddle-part thing)
+        thing)))
+
+(declaim (inline maybe-diddle-case))
 (defun maybe-diddle-case (thing diddle-p)
-  (if (and diddle-p (not (or (symbolp thing) (integerp thing))))
-      (labels ((check-for (pred in)
-                 (typecase in
-                   (pattern
-                    (dolist (piece (pattern-pieces in))
-                      (when (typecase piece
-                              (simple-string
-                               (check-for pred piece))
-                              (cons
-                               (case (car piece)
-                                 (:character-set
-                                  (check-for pred (cdr piece))))))
-                        (return t))))
-                   (list
-                    (dolist (x in)
-                      (when (check-for pred x)
-                        (return t))))
-                   (simple-string
-                    (dotimes (i (length in))
-                      (when (funcall pred (schar in i))
-                        (return t))))
-                   (t nil)))
-               (diddle-with (fun thing)
-                 (typecase thing
-                   (pattern
-                    (make-pattern
-                     (mapcar (lambda (piece)
-                               (typecase piece
-                                 (simple-string
-                                  (funcall fun piece))
-                                 (cons
-                                  (case (car piece)
-                                    (:character-set
-                                     (cons :character-set
-                                           (funcall fun (cdr piece))))
-                                    (t
-                                     piece)))
-                                 (t
-                                  piece)))
-                             (pattern-pieces thing))))
-                   (list
-                    (mapcar fun thing))
-                   (simple-string
-                    (funcall fun thing))
-                   (t
-                    thing))))
-        (let ((any-uppers (check-for #'upper-case-p thing))
-              (any-lowers (check-for #'lower-case-p thing)))
-          (cond ((and any-uppers any-lowers)
-                 ;; mixed case, stays the same
-                 thing)
-                (any-uppers
-                 ;; all uppercase, becomes all lower case
-                 (diddle-with (lambda (x) (if (stringp x)
-                                              (string-downcase x)
-                                              x)) thing))
-                (any-lowers
-                 ;; all lowercase, becomes all upper case
-                 (diddle-with (lambda (x) (if (stringp x)
-                                              (string-upcase x)
-                                              x)) thing))
-                (t
-                 ;; no letters?  I guess just leave it.
-                 thing))))
+  (if diddle-p
+      (diddle-case thing)
       thing))
 
 (defun merge-directories (dir1 dir2 diddle-case)
@@ -531,34 +732,32 @@ the operating system native pathname conventions."
            (type pathname-designator defaults)
            (values pathname))
   (with-pathname (defaults defaults)
-    (let ((pathname (let ((*default-pathname-defaults* defaults))
-                      (pathname pathname))))
-      (let* ((default-host (%pathname-host defaults))
-             (pathname-host (%pathname-host pathname))
-             (diddle-case
-              (and default-host pathname-host
-                   (not (eq (host-customary-case default-host)
-                            (host-customary-case pathname-host)))))
-             (directory (merge-directories (%pathname-directory pathname)
-                                           (%pathname-directory defaults)
-                                           diddle-case)))
+    (let* ((pathname (let ((*default-pathname-defaults* defaults))
+                       (pathname pathname)))
+           (default-host (%pathname-host defaults))
+           (pathname-host (%pathname-host pathname))
+           (diddle-case
+             (and default-host pathname-host
+                  (not (eq (host-customary-case default-host)
+                           (host-customary-case pathname-host)))))
+           (directory (merge-directories (%pathname-directory pathname)
+                                         (%pathname-directory defaults)
+                                         diddle-case)))
+      (macrolet ((merged-component (component)
+                   `(or (,component pathname)
+                        (let ((default (,component defaults)))
+                          (if diddle-case
+                              (diddle-case default)
+                              default)))))
         (%make-maybe-logical-pathname
          (or pathname-host default-host)
-         (and ;; The device of ~/ shouldn't be merged,
-              ;; because the expansion may have a different device
-              (not (and (>= (length directory) 2)
-                        (eql (car directory) :absolute)
-                        (eql (cadr directory) :home)))
-              (or (%pathname-device pathname)
-                  (maybe-diddle-case (%pathname-device defaults)
-                                     diddle-case)))
+         ;; The device of ~/ shouldn't be merged, because the
+         ;; expansion may have a different device
+         (unless (typep directory '(cons (eql :absolute) (cons (eql :home))))
+           (merged-component %pathname-device))
          directory
-         (or (%pathname-name pathname)
-             (maybe-diddle-case (%pathname-name defaults)
-                                diddle-case))
-         (or (%pathname-type pathname)
-             (maybe-diddle-case (%pathname-type defaults)
-                                diddle-case))
+         (merged-component %pathname-name)
+         (merged-component %pathname-type)
          (or (%pathname-version pathname)
              (and (not (%pathname-name pathname)) (%pathname-version defaults))
              default-version))))))
@@ -630,7 +829,7 @@ a host-structure or string."
            (type (or integer pathname-component-tokens (member :newest))
                  version)
            (type (or pathname-designator null) defaults)
-           (type (member :common :local) case))
+           (type pathname-component-case case))
   (let* ((defaults (when defaults
                      (with-pathname (defaults defaults) defaults)))
          (default-host (if defaults
@@ -660,7 +859,6 @@ a host-structure or string."
          (diddle-defaults
           (not (eq (host-customary-case host)
                    (host-customary-case default-host))))
-         (dev (if devp device (if defaults (%pathname-device defaults))))
          (dir (import-directory directory diddle-args))
          (ver (cond
                (versionp version)
@@ -686,68 +884,37 @@ a host-structure or string."
                                             diddle-defaults))
                         (t
                          nil))))
-      (%make-maybe-logical-pathname host
-                                    dev ; forced to :UNSPECIFIC when logical
-                                    dir
-                                    (pick name namep %pathname-name)
-                                    (pick type typep %pathname-type)
-                                    ver))))
+      (%make-maybe-logical-pathname
+       host
+       (pick device devp %pathname-device) ; forced to :UNSPECIFIC when logical
+       dir
+       (pick name namep %pathname-name)
+       (pick type typep %pathname-type)
+       ver))))
 
 (defun pathname-host (pathname &key (case :local))
   "Return PATHNAME's host."
-  (declare (type pathname-designator pathname)
-           (type (member :local :common) case)
-           (values host)
-           (ignore case))
+  (declare (ignore case))
   (with-pathname (pathname pathname)
     (%pathname-host pathname)))
 
-(defun pathname-device (pathname &key (case :local))
-  "Return PATHNAME's device."
-  (declare (type pathname-designator pathname)
-           (type (member :local :common) case))
-  (with-pathname (pathname pathname)
-    (maybe-diddle-case (%pathname-device pathname)
-                       (and (eq case :common)
-                            (eq (host-customary-case
-                                 (%pathname-host pathname))
-                                :lower)))))
+(macrolet ((frob (name component docstring)
+             `(defun ,name (pathname &key (case :local))
+                ,docstring
+                (with-pathname (pathname pathname)
+                  (let ((effective-case (and (eq case :common)
+                                             (eq (host-customary-case
+                                                  (%pathname-host pathname))
+                                                 :lower))))
+                    (maybe-diddle-case (,component pathname) effective-case))))))
 
-(defun pathname-directory (pathname &key (case :local))
-  "Return PATHNAME's directory."
-  (declare (type pathname-designator pathname)
-           (type (member :local :common) case))
-  (with-pathname (pathname pathname)
-    (maybe-diddle-case (%pathname-directory pathname)
-                       (and (eq case :common)
-                            (eq (host-customary-case
-                                 (%pathname-host pathname))
-                                :lower)))))
-(defun pathname-name (pathname &key (case :local))
-  "Return PATHNAME's name."
-  (declare (type pathname-designator pathname)
-           (type (member :local :common) case))
-  (with-pathname (pathname pathname)
-    (maybe-diddle-case (%pathname-name pathname)
-                       (and (eq case :common)
-                            (eq (host-customary-case
-                                 (%pathname-host pathname))
-                                :lower)))))
-
-(defun pathname-type (pathname &key (case :local))
-  "Return PATHNAME's type."
-  (declare (type pathname-designator pathname)
-           (type (member :local :common) case))
-  (with-pathname (pathname pathname)
-    (maybe-diddle-case (%pathname-type pathname)
-                       (and (eq case :common)
-                            (eq (host-customary-case
-                                 (%pathname-host pathname))
-                                :lower)))))
+  (frob pathname-device    %pathname-device    "Return PATHNAME's device.")
+  (frob pathname-directory %pathname-directory "Return PATHNAME's directory.")
+  (frob pathname-name      %pathname-name      "Return PATHNAME's name.")
+  (frob pathname-type      %pathname-type      "Return PATHNAME's type."))
 
 (defun pathname-version (pathname)
   "Return PATHNAME's version."
-  (declare (type pathname-designator pathname))
   (with-pathname (pathname pathname)
     (%pathname-version pathname)))
 
@@ -803,7 +970,7 @@ a host-structure or string."
        (namestring-parse-error (condition)
          (values nil (namestring-parse-error-offset condition)))))
     (t
-     (let* ((end (%check-vector-sequence-bounds namestr start end)))
+     (let ((end (%check-vector-sequence-bounds namestr start end)))
        (multiple-value-bind (new-host device directory file type version)
            ;; Comments below are quotes from the HyperSpec
            ;; PARSE-NAMESTRING entry, reproduced here to demonstrate
@@ -907,12 +1074,8 @@ a host-structure or string."
                     ~S and ~S."
                     defaulted-host (%pathname-host thing))))
          (values thing start))
-        (stream
-         (let ((name (file-name thing)))
-           (unless name
-             (error "can't figure out the file associated with stream:~%  ~S"
-                    thing))
-           (values name nil)))))))
+        ((or file-stream synonym-stream)
+         (values (stream-file-name-or-lose thing) nil))))))
 
 (defun %parse-native-namestring (namestr host defaults start end junk-allowed
                                  as-directory)
@@ -1006,29 +1169,8 @@ directory."
                      ~S and ~S."
                     defaulted-host (%pathname-host thing))))
          (values thing start))
-        (stream
-         ;; FIXME
-         (let ((name (file-name thing)))
-           (unless name
-             (error "can't figure out the file associated with stream:~%  ~S"
-                    thing))
-           (values name nil)))))))
-
-(defun namestring (pathname)
-  "Construct the full (name)string form of the pathname."
-  (declare (type pathname-designator pathname))
-  (with-pathname (pathname pathname)
-    (when pathname
-      (or (%pathname-namestring pathname)
-          (let ((host (%pathname-host pathname)))
-            (if (not host)
-                (error
-                 "can't determine the namestring for pathnames with no host:~%  ~S"
-                 pathname)
-                (setf (%pathname-namestring pathname)
-                      (logically-readonlyize
-                       (possibly-base-stringize
-                        (funcall (host-unparse host) pathname))))))))))
+        ((or file-stream synonym-stream)
+         (values (stream-file-name-or-lose thing) nil))))))
 
 (defun native-namestring (pathname &key as-file)
   "Construct the full native (name)string form of PATHNAME.  For
@@ -1040,59 +1182,54 @@ system's syntax for files."
   (declare (type pathname-designator pathname))
   (with-native-pathname (pathname pathname)
     (when pathname
-      (let ((host (%pathname-host pathname)))
-        (unless host
-          (error "can't determine the native namestring for pathnames with no ~
-                  host:~%  ~S" pathname))
+      (let ((host (or (%pathname-host pathname)
+                      (no-native-namestring-error
+                       pathname "there is no ~S component." :host))))
         (funcall (host-unparse-native host) pathname as-file)))))
 
-(defun host-namestring (pathname)
-  "Return a string representation of the name of the host in the pathname."
-  (declare (type pathname-designator pathname))
-  (with-pathname (pathname pathname)
-    (let ((host (%pathname-host pathname)))
-      (if host
-          (funcall (host-unparse-host host) pathname)
-          (error
-           "can't determine the namestring for pathnames with no host:~%  ~S"
-           pathname)))))
+(flet ((pathname-host-or-no-namestring (pathname)
+         (or (%pathname-host pathname)
+             (no-namestring-error
+              pathname "there is no ~S component." :host))))
 
-(defun directory-namestring (pathname)
-  "Return a string representation of the directories used in the pathname."
-  (declare (type pathname-designator pathname))
-  (with-pathname (pathname pathname)
-    (let ((host (%pathname-host pathname)))
-      (if host
-          (funcall (host-unparse-directory host) pathname)
-          (error
-           "can't determine the namestring for pathnames with no host:~%  ~S"
-           pathname)))))
+  (defun namestring (pathname)
+    "Construct the full (name)string form PATHNAME."
+    (with-pathname (pathname pathname)
+      (when pathname
+        (or (%pathname-namestring pathname)
+            (let ((host (pathname-host-or-no-namestring pathname)))
+              (setf (%pathname-namestring pathname)
+                    (logically-readonlyize
+                     (possibly-base-stringize
+                      (funcall (host-unparse host) pathname)))))))))
 
-(defun file-namestring (pathname)
-  "Return a string representation of the name used in the pathname."
-  (declare (type pathname-designator pathname))
-  (with-pathname (pathname pathname)
-    (let ((host (%pathname-host pathname)))
-      (if host
-          (funcall (host-unparse-file host) pathname)
-          (error
-           "can't determine the namestring for pathnames with no host:~%  ~S"
-           pathname)))))
+  (defun host-namestring (pathname)
+    "Return a string representation of the name of the host in PATHNAME."
+    (with-pathname (pathname pathname)
+      (let ((host (pathname-host-or-no-namestring pathname)))
+        (funcall (host-unparse-host host) pathname))))
 
-(defun enough-namestring (pathname
-                          &optional
-                          (defaults *default-pathname-defaults*))
-  "Return an abbreviated pathname sufficient to identify the pathname relative
-   to the defaults."
-  (declare (type pathname-designator pathname))
-  (with-pathname (pathname pathname)
-    (let ((host (%pathname-host pathname)))
-      (if host
-          (with-pathname (defaults defaults)
-            (funcall (host-unparse-enough host) pathname defaults))
-          (error
-           "can't determine the namestring for pathnames with no host:~%  ~S"
-           pathname)))))
+  (defun directory-namestring (pathname)
+    "Return a string representation of the directory in PATHNAME."
+    (with-pathname (pathname pathname)
+      (let ((host (pathname-host-or-no-namestring pathname)))
+        (funcall (host-unparse-directory host) pathname))))
+
+  (defun file-namestring (pathname)
+    "Return a string representation of the name in PATHNAME."
+    (with-pathname (pathname pathname)
+      (let ((host (pathname-host-or-no-namestring pathname)))
+        (funcall (host-unparse-file host) pathname))))
+
+  (defun enough-namestring (pathname
+                            &optional
+                            (defaults *default-pathname-defaults*))
+    "Return an abbreviated pathname sufficient to identify PATHNAME
+relative to DEFAULTS."
+    (with-pathname (pathname pathname)
+      (let ((host (pathname-host-or-no-namestring pathname)))
+        (with-pathname (defaults defaults)
+          (funcall (host-unparse-enough host) pathname defaults))))))
 
 ;;;; wild pathnames
 
@@ -1364,6 +1501,25 @@ unspecified elements into a completed to-pathname based on the to-wildname."
 ;;;;  into physical pathnames.
 
 ;;;; utilities
+
+;;; Access *DEFAULT-PATHNAME-DEFAULTS*, issuing a warning if its value
+;;; is silly. (Unlike the vaguely-analogous SANE-PACKAGE, we don't
+;;; actually need to reset the variable when it's silly, since even
+;;; crazy values of *DEFAULT-PATHNAME-DEFAULTS* don't leave the system
+;;; in a state where it's hard to recover interactively.)
+(defun sane-default-pathname-defaults ()
+  (let* ((dfd *default-pathname-defaults*)
+         (dfd-dir (pathname-directory dfd)))
+    ;; It's generally not good to use a relative pathname for
+    ;; *DEFAULT-PATHNAME-DEFAULTS*, since relative pathnames
+    ;; are defined by merging into a default pathname (which is,
+    ;; by default, *DEFAULT-PATHNAME-DEFAULTS*).
+    (when (and (consp dfd-dir)
+               (eql (first dfd-dir) :relative))
+      (warn
+       "~@<~S is a relative pathname. (But we'll try using it anyway.)~@:>"
+       '*default-pathname-defaults*))
+    dfd))
 
 (defun simplify-namestring (namestring &optional host)
   (funcall (host-simplify-namestring
@@ -1650,9 +1806,8 @@ unspecified elements into a completed to-pathname based on the to-wildname."
     (let* ((name (%pathname-name pathname))
            (type (%pathname-type pathname))
            (version (%pathname-version pathname))
-           (type-supplied (not (or (null type) (eq type :unspecific))))
-           (version-supplied (not (or (null version)
-                                      (eq version :unspecific)))))
+           (type-supplied (pathname-component-present-p type))
+           (version-supplied (pathname-component-present-p version)))
       (when name
         (when (and (null type)
                    (typep name 'string)
@@ -1671,7 +1826,7 @@ unspecified elements into a completed to-pathname based on the to-wildname."
         (unless type-supplied
           (error "cannot specify the version without a type: ~S" pathname))
         (etypecase version
-          ((member :newest) (strings ".NEWEST"))
+          ((member :newest) (strings ".NEWEST")) ; really? not in LPNIFY-NAMESTRING
           ((member :wild) (strings ".*"))
           (fixnum (strings ".") (strings (format nil "~D" version))))))
     (apply #'concatenate 'simple-string (strings))))
@@ -1763,6 +1918,12 @@ unspecified elements into a completed to-pathname based on the to-wildname."
                     (translate-pathname pathname from to)))))))
     (pathname pathname)
     (t (translate-logical-pathname (pathname pathname)))))
+
+;;; Given a pathname, return a corresponding physical pathname.
+(defun physicalize-pathname (possibly-logical-pathname)
+  (if (typep possibly-logical-pathname 'logical-pathname)
+      (translate-logical-pathname possibly-logical-pathname)
+      possibly-logical-pathname))
 
 (defvar *logical-pathname-defaults*
   (%make-logical-pathname

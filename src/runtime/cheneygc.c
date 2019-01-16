@@ -22,6 +22,7 @@
 #include "os.h"
 #include "gc.h"
 #include "gc-internal.h"
+#include "gc-private.h"
 #include "globals.h"
 #include "interrupt.h"
 #include "validate.h"
@@ -31,6 +32,8 @@
 #include "genesis/primitive-objects.h"
 #include "thread.h"
 #include "arch.h"
+#include "code.h"
+#include "private-cons.inc"
 
 /* So you need to debug? */
 #if 0
@@ -38,7 +41,6 @@
 #define DEBUG_SPACE_PREDICATES
 #define DEBUG_SCAVENGE_VERBOSE
 #define DEBUG_COPY_VERBOSE
-#define DEBUG_CODE_GC
 #endif
 
 lispobj *from_space;
@@ -49,6 +51,8 @@ lispobj *new_space_free_pointer;
 
 /* This does nothing. It's only to satisfy a reference from gc-common. */
 char gc_coalesce_string_literals = 0;
+
+boolean gc_active_p = 0;
 
 static void scavenge_newspace(void);
 
@@ -71,13 +75,10 @@ gc_general_alloc(sword_t bytes, int page_type_flag, int quick_p) {
     return new;
 }
 
-lispobj  copy_large_unboxed_object(lispobj object, sword_t nwords) {
-    return copy_object(object,nwords);
-}
 lispobj  copy_unboxed_object(lispobj object, sword_t nwords) {
     return copy_object(object,nwords);
 }
-lispobj  copy_large_object(lispobj object, sword_t nwords) {
+lispobj  copy_large_object(lispobj object, sword_t nwords, int page_type_flag) {
     return copy_object(object,nwords);
 }
 
@@ -106,6 +107,8 @@ collect_garbage(generation_index_t ignore)
     gettimeofday(&start_tv, (struct timezone *) 0);
 #endif
 
+    gc_active_p = 1;
+
     /* it's possible that signals are blocked already if this was called
      * from a signal handler (e.g. with the sigsegv gc_trigger stuff) */
     block_blockable_signals(&old);
@@ -129,10 +132,6 @@ collect_garbage(generation_index_t ignore)
         lose("GC lossage.  Current dynamic space is bogus!\n");
     }
     new_space_free_pointer = new_space;
-
-    /* Initialize the weak pointer list. */
-    weak_pointers = (struct weak_pointer *) NULL;
-
 
     /* Scavenge all of the roots. */
 #ifdef PRINTNOISE
@@ -183,7 +182,7 @@ collect_garbage(generation_index_t ignore)
 #ifdef PRINTNOISE
     printf("Scanning weak hash tables ...\n");
 #endif
-    scan_weak_hash_tables(weak_ht_alivep_funs);
+    cull_weak_hash_tables(weak_ht_alivep_funs);
 
     /* Scan the weak pointers. */
 #ifdef PRINTNOISE
@@ -224,6 +223,7 @@ collect_garbage(generation_index_t ignore)
     set_auto_gc_trigger(size_retained+bytes_consed_between_gcs);
     thread_sigmask(SIG_SETMASK, &old, 0);
 
+    gc_active_p = 0;
 
 #ifdef PRINTNOISE
     gettimeofday(&stop_tv, (struct timezone *) 0);
@@ -259,14 +259,16 @@ scavenge_newspace(void)
     lispobj *here, *next;
 
     here = new_space;
-    while (here < new_space_free_pointer) {
+
+    do {
         /*      printf("here=%lx, new_space_free_pointer=%lx\n",
                 here,new_space_free_pointer); */
         next = new_space_free_pointer;
         heap_scavenge(here, next);
-        scav_weak_hash_tables(weak_ht_alivep_funs, gc_scav_pair);
         here = next;
-    }
+    } while (new_space_free_pointer > here ||
+             (test_weak_triggers(0, 0) && new_space_free_pointer > here));
+    gc_dispose_private_pages();
     /* printf("done with newspace\n"); */
 }
 
@@ -310,13 +312,13 @@ print_garbage(lispobj *from_space, lispobj *from_space_free_pointer)
             case OTHER_POINTER_LOWTAG:
                 pointer = native_pointer(object);
                 header = *pointer;
-                type = widetag_of(header);
+                type = header_widetag(header);
                 nwords = (sizetab[type])(pointer);
                 break;
             default: nwords=1;  /* shut yer whinging, gcc */
             }
         } else {
-            type = widetag_of(object);
+            type = header_widetag(object);
             nwords = (sizetab[type])(start);
             total_words_not_copied += nwords;
             printf("%4d words not copied at 0x%16lx; ",
@@ -343,26 +345,6 @@ scav_weak_pointer(lispobj *where, lispobj object)
 }
 
 lispobj *
-search_read_only_space(void *pointer)
-{
-    lispobj* start = (lispobj*)READ_ONLY_SPACE_START;
-    lispobj* end = read_only_space_free_pointer;
-    if ((pointer < (void *)start) || (pointer >= (void *)end))
-        return NULL;
-    return gc_search_space(start, pointer);
-}
-
-lispobj *
-search_static_space(void *pointer)
-{
-    lispobj* start = (lispobj*)STATIC_SPACE_START;
-    lispobj* end = static_space_free_pointer;
-    if ((pointer < (void *)start) || (pointer >= (void *)end))
-        return NULL;
-    return gc_search_space(start, pointer);
-}
-
-lispobj *
 search_dynamic_space(void *pointer)
 {
     lispobj *start = (lispobj *) current_dynamic_space;
@@ -378,23 +360,9 @@ search_dynamic_space(void *pointer)
 void
 gc_init(void)
 {
+    weakobj_init();
     scavtab[WEAK_POINTER_WIDETAG] = scav_weak_pointer;
 }
-
-void
-gc_initialize_pointers(void)
-{
-    /* FIXME: We do nothing here.  We (briefly) misguidedly attempted
-       to set current_dynamic_space to DYNAMIC_0_SPACE_START here,
-       forgetting that (a) actually it could be the other and (b) it's
-       set in coreparse.c anyway.  There's a FIXME note left here to
-       note that current_dynamic_space is a violation of OAOO: we can
-       tell which dynamic space we're currently in by looking at
-       dynamic_space_free_pointer.  -- CSR, 2002-08-09 */
-}
-
-
-
 
 /* noise to manipulate the gc trigger stuff */
 
@@ -488,4 +456,27 @@ cheneygc_handle_wp_violation(os_context_t *context, void *addr)
         return 1;
     }
     return 0;
+}
+
+void gc_show_pte(lispobj obj)
+{
+    printf("unimplemented\n");
+}
+
+sword_t scav_code_header(lispobj *where, lispobj header)
+{
+    struct code *code = (struct code *) where;
+    sword_t n_header_words = code_header_words(code);
+
+    /* Scavenge the boxed section of the code data block. */
+    scavenge(where + 2, n_header_words - 2);
+
+    /* Scavenge the boxed section of each function object in the
+     * code data block. */
+    for_each_simple_fun(i, function_ptr, code, 1, {
+        scavenge(SIMPLE_FUN_SCAV_START(function_ptr),
+                 SIMPLE_FUN_SCAV_NWORDS(function_ptr));
+    })
+
+    return code_total_nwords(code);
 }

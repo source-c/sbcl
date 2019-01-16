@@ -7,20 +7,14 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!FORMAT")
+(in-package "SB-FORMAT")
 
-(defparameter *format-whitespace-chars*
-  (vector #\space
-          #\newline
-          ;; We leave out this non-STANDARD-CHARACTER entry from this table
-          ;; when we're running in the cross-compilation host, since ANSI
-          ;; doesn't require the cross-compilation host to know what a tab is.
-          #-sb-xc-host (code-char tab-char-code)))
-
-(defvar *format-directive-expanders*
-  (make-array base-char-code-limit :initial-element nil))
-(defvar *format-directive-interpreters*
-  (make-array base-char-code-limit :initial-element nil))
+(declaim (type (simple-vector 128)
+               *format-directive-expanders*
+               *format-directive-interpreters*))
+(defglobal *format-directive-expanders* (make-array 128 :initial-element nil))
+(define-load-time-global *format-directive-interpreters*
+  (make-array 128 :initial-element nil))
 
 (defvar *default-format-error-control-string* nil)
 (defvar *default-format-error-offset* nil)
@@ -33,8 +27,9 @@
 
 ;;; Used by the interpreter stuff. When it's non-NIL, it's a function
 ;;; that will invoke PPRINT-POP in the right lexical environemnt.
-(declaim (type (or null function) *logical-block-popper*))
 (defvar *logical-block-popper* nil)
+(declaim (type (or null function) *logical-block-popper*)
+         (always-bound *logical-block-popper*))
 
 ;;; Used by the expander stuff. This is bindable so that ~<...~:>
 ;;; can change it.

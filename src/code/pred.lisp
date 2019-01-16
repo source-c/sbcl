@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; miscellaneous non-primitive predicates
 
@@ -90,13 +90,16 @@
                     (stem (string-left-trim "%" (string-right-trim "P-" name)))
                     (article (if (position (schar name 0) "AEIOU") "an" "a")))
                `(defun ,pred (object)
-                  ,(format nil
-                           "Return true if OBJECT is ~A ~A, and NIL otherwise."
-                           article
-                           stem)
+                  ;; Document the standardized predicates and not the internal ones.
+                  ,@(when (eql (sb-xc:symbol-package pred) *cl-package*)
+                      (list (format nil
+                                    "Return true if OBJECT is ~A ~A, and NIL otherwise."
+                                    article
+                                    stem)))
                   ;; (falling through to low-level implementation)
                   (,pred object)))))
   (def-type-predicate-wrapper array-header-p)
+  (def-type-predicate-wrapper simple-array-header-p)
   (def-type-predicate-wrapper arrayp)
   (def-type-predicate-wrapper atom)
   ;; Testing for BASE-CHAR-P is usually redundant on #-sb-unicode,
@@ -138,8 +141,13 @@
   (def-type-predicate-wrapper short-float-p)
   (def-type-predicate-wrapper single-float-p)
   #!+sb-simd-pack (def-type-predicate-wrapper simd-pack-p)
+  #!+sb-simd-pack-256 (def-type-predicate-wrapper simd-pack-256-p)
   (def-type-predicate-wrapper %instancep)
+  (def-type-predicate-wrapper funcallable-instance-p)
   (def-type-predicate-wrapper symbolp)
+  ;; The interpreter needs this because it assumes that any type spec
+  ;; in SB-C::*BACKEND-TYPE-PREDICATES* has a callable predicate.
+  (def-type-predicate-wrapper non-null-symbol-p)
   (def-type-predicate-wrapper %other-pointer-p)
   (def-type-predicate-wrapper system-area-pointer-p)
   (def-type-predicate-wrapper unbound-marker-p)
@@ -158,8 +166,8 @@
                   ,@(map 'list
                          (lambda (saetp)
                            `(def-type-predicate-wrapper
-                                ,(symbolicate (sb!vm:saetp-primitive-type-name saetp) "-P")))
-                         sb!vm:*specialized-array-element-type-properties*))))
+                                ,(symbolicate (sb-vm:saetp-primitive-type-name saetp) "-P")))
+                         sb-vm:*specialized-array-element-type-properties*))))
     (saetp-defs))
   ;; Other array types
   (def-type-predicate-wrapper simple-array-p)
@@ -173,12 +181,6 @@
 (defun fixnum-mod-p (x limit)
   (and (fixnump x)
        (<= 0 x limit)))
-
-#!+(or x86 x86-64 ppc)
-(defun %other-pointer-subtype-p (x choices)
-  (and (%other-pointer-p x)
-       (member (%other-pointer-widetag x) choices)
-       t))
 
 ;;; Return the layout for an object. This is the basic operation for
 ;;; finding out the "type" of an object, and is used for generic
@@ -192,7 +194,7 @@
   (declare (optimize (speed 3) (safety 0)))
   #!+(and compact-instance-header x86-64)
   (values (%primitive layout-of x
-                      (load-time-value sb!kernel::**built-in-class-codes** t)))
+                      (load-time-value sb-kernel::**built-in-class-codes** t)))
   #!-(and compact-instance-header x86-64)
   (cond ((%instancep x) (%instance-layout x))
         ((funcallable-instance-p x) (%funcallable-instance-layout x))
@@ -202,7 +204,7 @@
         (t
          ;; Note that WIDETAG-OF is slightly suboptimal here and could be
          ;; improved - we've already ruled out some of the lowtags.
-         (svref (load-time-value sb!kernel::**built-in-class-codes** t)
+         (svref (load-time-value sb-kernel::**built-in-class-codes** t)
                 (widetag-of x)))))
 
 (declaim (inline classoid-of))
@@ -227,10 +229,10 @@
      (cond
        ((<= 0 object 1) 'bit)
        ((< object 0) 'fixnum)
-       (t '(integer 0 #.sb!xc:most-positive-fixnum))))
+       (t '(integer 0 #.sb-xc:most-positive-fixnum))))
     (integer
      (if (>= object 0)
-         '(integer #.(1+ sb!xc:most-positive-fixnum))
+         '(integer #.(1+ sb-xc:most-positive-fixnum))
          'bignum))
     (character
      (typecase object
@@ -244,21 +246,21 @@
     (symbol
      (cond ((eq object t) 'boolean)
            ((eq object nil) 'null)
-           ((eq (symbol-package object) *keyword-package*) 'keyword)
+           ((eq (sb-xc:symbol-package object) *keyword-package*) 'keyword)
            (t 'symbol)))
-    ((or array complex #!+sb-simd-pack simd-pack)
-     (let ((sb!kernel::*unparse-allow-negation* nil))
-       (declare (special sb!kernel::*unparse-allow-negation*)) ; forward ref
+    ((or array complex #!+sb-simd-pack simd-pack #!+sb-simd-pack-256 simd-pack-256)
+     (let ((sb-kernel::*unparse-allow-negation* nil))
+       (declare (special sb-kernel::*unparse-allow-negation*)) ; forward ref
        (type-specifier (ctype-of object))))
     (t
      (let* ((classoid (classoid-of object))
             (name (classoid-name classoid)))
        (if (%instancep object)
            (case name
-             (sb!alien-internals:alien-value
+             (sb-alien-internals:alien-value
               `(alien
-                ,(sb!alien-internals:unparse-alien-type
-                  (sb!alien-internals:alien-value-type object))))
+                ,(sb-alien-internals:unparse-alien-type
+                  (sb-alien-internals:alien-value-type object))))
              (t
               (let ((pname (classoid-proper-name classoid)))
                 (if (classoid-p pname)
@@ -379,8 +381,8 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
           ((consp x) (and (consp y)
                           (recurse (car x) (car y))
                           (recurse (cdr x) (cdr y))))
-          ((and (symbolp x) (not (symbol-package x)))
-           (and (symbolp y) (not (symbol-package y)) (string= x y)))
+          ((and (symbolp x) (not (sb-xc:symbol-package x)))
+           (and (symbolp y) (not (sb-xc:symbol-package y)) (string= x y)))
           (t
            (equal x y)))))
 
@@ -409,20 +411,20 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
                   `(let ((x-el (%instance-ref x i))
                          (y-el (%instance-ref y i)))
                      (or (eq x-el y-el) (equalp x-el y-el)))))
-         (if (eql (layout-bitmap layout-x) sb!kernel::+layout-all-tagged+)
-             (loop for i of-type index from sb!vm:instance-data-start
+         (if (eql (layout-bitmap layout-x) sb-kernel::+layout-all-tagged+)
+             (loop for i of-type index from sb-vm:instance-data-start
                    below (layout-length layout-x)
                    always (slot-ref-equalp))
              (let ((comparators (layout-equalp-tests layout-x)))
                (unless (= (length comparators)
-                          (- (layout-length layout-x) sb!vm:instance-data-start))
+                          (- (layout-length layout-x) sb-vm:instance-data-start))
                  (bug "EQUALP got incomplete instance layout"))
                ;; See remark at the source code for %TARGET-DEFSTRUCT
                ;; explaining how to use the vector of comparators.
-               (loop for i of-type index from sb!vm:instance-data-start
+               (loop for i of-type index from sb-vm:instance-data-start
                      below (layout-length layout-x)
                      for test = (data-vector-ref
-                                 comparators (- i sb!vm:instance-data-start))
+                                 comparators (- i sb-vm:instance-data-start))
                      always (cond ((eql test 0) (slot-ref-equalp))
                                   ((functionp test)
                                    (funcall test i x y))

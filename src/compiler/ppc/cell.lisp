@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; Data object ref/set stuff.
 
@@ -35,7 +35,6 @@
   (:info name dx-p offset lowtag)
   (:ignore name dx-p))
 
-#!+compare-and-swap-vops
 (define-vop (compare-and-swap-slot)
   (:args (object :scs (descriptor-reg))
          (old :scs (descriptor-reg any-reg))
@@ -59,7 +58,6 @@
 
 ;;;; Symbol hacking VOPs:
 
-#!+compare-and-swap-vops
 (define-vop (%compare-and-swap-symbol-value)
   (:translate %compare-and-swap-symbol-value)
   (:args (symbol :scs (descriptor-reg))
@@ -433,11 +431,19 @@
   (:variant funcallable-instance-info-offset fun-pointer-lowtag)
   (:translate %set-funcallable-instance-info))
 
-(define-vop (closure-ref slot-ref)
-  (:variant closure-info-offset fun-pointer-lowtag))
+(define-vop (closure-ref)
+  (:args (object :scs (descriptor-reg)))
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:info offset)
+  (:generator 4
+    (loadw value object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
-(define-vop (closure-init slot-set)
-  (:variant closure-info-offset fun-pointer-lowtag))
+(define-vop (closure-init)
+  (:args (object :scs (descriptor-reg))
+         (value :scs (descriptor-reg any-reg)))
+  (:info offset)
+  (:generator 4
+    (storew value object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
 (define-vop (closure-init-from-fp)
   (:args (object :scs (descriptor-reg)))
@@ -466,7 +472,9 @@
   (:result-types positive-fixnum)
   (:generator 4
     (loadw temp struct 0 instance-pointer-lowtag)
-    (inst srwi res temp n-widetag-bits)))
+    ;; shift right 8 and mask 15 low bits =
+    ;; rotate left 24, take bit indices 17 through 31.
+    (inst rlwinm res temp (- 32 n-widetag-bits) 17 31)))
 
 (define-vop (instance-index-ref word-index-ref)
   (:policy :fast-safe)
@@ -480,7 +488,6 @@
   (:variant instance-slots-offset instance-pointer-lowtag)
   (:arg-types instance positive-fixnum *))
 
-#!+compare-and-swap-vops
 (define-vop (%instance-cas word-index-cas)
   (:policy :fast-safe)
   (:translate %instance-cas)

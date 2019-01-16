@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; Type frobbing VOPs
 
@@ -75,6 +75,16 @@
   (:generator 6
     (load-type result function (- fun-pointer-lowtag))))
 
+(define-vop (fun-header-data)
+  (:translate fun-header-data)
+  (:policy :fast-safe)
+  (:args (x :scs (descriptor-reg)))
+  (:results (res :scs (unsigned-reg)))
+  (:result-types positive-fixnum)
+  (:generator 6
+    (loadw res x 0 fun-pointer-lowtag)
+    (inst lsr res res n-widetag-bits)))
+
 (define-vop (get-header-data)
   (:translate get-header-data)
   (:policy :fast-safe)
@@ -84,17 +94,6 @@
   (:generator 6
     (loadw res x 0 other-pointer-lowtag)
     (inst lsr res res n-widetag-bits)))
-
-(define-vop (get-closure-length)
-  (:translate get-closure-length)
-  (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 6
-    (loadw res x 0 fun-pointer-lowtag)
-    (inst ubfm res res n-widetag-bits
-          (+ -1 (integer-length short-header-max-words) n-widetag-bits))))
 
 (define-vop (set-header-data)
   (:translate set-header-data)
@@ -114,15 +113,14 @@
     (storew t1 x 0 other-pointer-lowtag)
     (move res x)))
 
-
 (define-vop (pointer-hash)
   (:translate pointer-hash)
   (:args (ptr :scs (any-reg descriptor-reg)))
   (:results (res :scs (any-reg descriptor-reg)))
   (:policy :fast-safe)
   (:generator 1
-    (inst and res ptr (bic-mask lowtag-mask))
-    (inst lsr res res 1)))
+    (inst and res ptr (dpb -1 (byte (- n-word-bits n-fixnum-tag-bits 1)
+                                    n-fixnum-tag-bits) 0))))
 
 ;;;; Allocation
 
@@ -160,10 +158,24 @@
   (:results (sap :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:generator 10
-    (loadw ndescr code 0 other-pointer-lowtag)
-    (inst ubfm ndescr ndescr n-widetag-bits (+ 15 n-widetag-bits))
-    (inst add sap code (lsl ndescr word-shift))
+    ;; 4 byte load, ignoring serial# in the high bits
+    (inst ldr (32-bit-reg ndescr) (@ code (- 8 other-pointer-lowtag)))
+    (inst add sap code ndescr)
     (inst sub sap sap other-pointer-lowtag)))
+
+(define-vop (code-trailer-ref)
+  (:translate code-trailer-ref)
+  (:policy :fast-safe)
+  (:args (code :scs (descriptor-reg) :to (:result 0))
+         (offset :scs (signed-reg) :to (:result 0)))
+  (:arg-types * fixnum)
+  (:results (res :scs (unsigned-reg) :from (:argument 0)))
+  (:result-types unsigned-num)
+  (:generator 10
+    (inst ldr (32-bit-reg res) (@ code (- 4 other-pointer-lowtag)))
+    (inst add res offset (lsl res word-shift))
+    (inst sub res res other-pointer-lowtag)
+    (inst ldr (32-bit-reg res) (@ code res))))
 
 (define-vop (compute-fun)
   (:args (code :scs (descriptor-reg))
@@ -172,13 +184,11 @@
   (:results (func :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) ndescr)
   (:generator 10
-    (loadw ndescr code 0 other-pointer-lowtag)
-    (inst ubfm ndescr ndescr n-widetag-bits (+ 15 n-widetag-bits))
-    (inst add ndescr offset (lsl ndescr word-shift))
+    (inst ldr (32-bit-reg ndescr) (@ code (- 8 other-pointer-lowtag)))
+    (inst add ndescr offset ndescr)
     (inst sub ndescr ndescr (- other-pointer-lowtag fun-pointer-lowtag))
     (inst add func code ndescr)))
 ;;;
-#!+symbol-info-vops
 (define-vop (symbol-info-vector)
   (:policy :fast-safe)
   (:translate symbol-info-vector)
@@ -194,7 +204,6 @@
     (loadw res res cons-cdr-slot list-pointer-lowtag)
     NE))
 
-#!+symbol-info-vops
 (define-vop (symbol-plist)
   (:policy :fast-safe)
   (:translate symbol-plist)
@@ -210,10 +219,10 @@
 
 ;;;; other miscellaneous VOPs
 
-(defknown sb!unix::receive-pending-interrupt () (values))
-(define-vop (sb!unix::receive-pending-interrupt)
+(defknown sb-unix::receive-pending-interrupt () (values))
+(define-vop (sb-unix::receive-pending-interrupt)
   (:policy :fast-safe)
-  (:translate sb!unix::receive-pending-interrupt)
+  (:translate sb-unix::receive-pending-interrupt)
   (:generator 1
     (inst brk pending-interrupt-trap)))
 
@@ -231,9 +240,6 @@
 
 #!+sb-thread
 (progn
-  (defknown current-thread-offset-sap (word)
-      system-area-pointer (flushable))
-
   (defun ldr-str-word-offset-encodable (x)
     (ldr-str-offset-encodable (ash x word-shift)))
 
@@ -251,8 +257,8 @@
     (:results (sap :scs (sap-reg)))
     (:result-types system-area-pointer)
     (:translate current-thread-offset-sap)
-    (:args (n :scs (unsigned-reg) :target sap))
-    (:arg-types unsigned-num)
+    (:args (n :scs (signed-reg) :target sap))
+    (:arg-types signed-num)
     (:policy :fast-safe)
     (:generator 2
                 (inst ldr sap (@ thread-tn (extend n :lsl word-shift))))))

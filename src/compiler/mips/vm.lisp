@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
 ;;;; Registers
@@ -79,6 +79,11 @@
   (defregset *register-arg-offsets*
       a0 a1 a2 a3 a4 a5)
 
+  ;; OAOOM: Same as runtime/mips-lispregs.h
+  (defregset boxed-regs
+      a0 a1 a2 a3 a4 a5 fdefn lexenv
+      nfp ocfp lra l0 l1 code)
+
   (defregset reserve-descriptor-regs
       fdefn lexenv)
 
@@ -88,12 +93,14 @@
 
 ;;;; SB and SC definition:
 
+(!define-storage-bases
 (define-storage-base registers :finite :size 32)
 (define-storage-base float-registers :finite :size 32)
 (define-storage-base control-stack :unbounded :size 8)
 (define-storage-base non-descriptor-stack :unbounded :size 0)
 (define-storage-base constant :non-packed)
 (define-storage-base immediate-constant :non-packed)
+)
 
 (!define-storage-classes
 
@@ -277,33 +284,33 @@
 (defun immediate-constant-sc (value)
   (typecase value
     ((integer 0 0)
-     (sc-number-or-lose 'zero))
+     zero-sc-number)
     (null
-     (sc-number-or-lose 'null))
+     null-sc-number)
     (symbol
      (if (static-symbol-p value)
-         (sc-number-or-lose 'immediate)
+         immediate-sc-number
          nil))
-    ((or (integer #.sb!xc:most-negative-fixnum #.sb!xc:most-positive-fixnum)
+    ((or (integer #.sb-xc:most-negative-fixnum #.sb-xc:most-positive-fixnum)
          character)
-     (sc-number-or-lose 'immediate))
+     immediate-sc-number)
     #-sb-xc-host ; There is no such object type in the host
     (system-area-pointer
-     (sc-number-or-lose 'immediate))
+     immediate-sc-number)
     (character
-     (sc-number-or-lose 'immediate))))
+     immediate-sc-number)))
 
 (defun boxed-immediate-sc-p (sc)
-  (or (eql sc (sc-number-or-lose 'zero))
-      (eql sc (sc-number-or-lose 'null))
-      (eql sc (sc-number-or-lose 'immediate))))
+  (or (eql sc zero-sc-number)
+      (eql sc null-sc-number)
+      (eql sc immediate-sc-number)))
 
 ;;;; Function Call Parameters
 
 ;;; The SC numbers for register and stack arguments/return values.
 ;;;
-(defconstant immediate-arg-scn (sc-number-or-lose 'any-reg))
-(defconstant control-stack-arg-scn (sc-number-or-lose 'control-stack))
+(defconstant immediate-arg-scn any-reg-sc-number)
+(defconstant control-stack-arg-scn control-stack-sc-number)
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 
@@ -355,7 +362,7 @@
       (immediate-constant "Immed"))))
 
 (defun combination-implementation-style (node)
-  (declare (type sb!c::combination node) (ignore node))
+  (declare (type sb-c::combination node) (ignore node))
   (values :default nil))
 
 (defun primitive-type-indirect-cell-type (ptype)

@@ -11,7 +11,40 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
+
+(defconstant sb-assem:assem-scheduler-p nil)
+(defconstant sb-assem:+inst-alignment-bytes+ 1)
+
+(defconstant +backend-fasl-file-implementation+ :x86-64)
+(defconstant-eqx +fixup-kinds+ #(:absolute :relative :absolute64)
+  #'equalp)
+
+;;; KLUDGE: It would seem natural to set this by asking our C runtime
+;;; code for it, but mostly we need it for GENESIS, which doesn't in
+;;; general have our C runtime code running to ask, so instead we set
+;;; it by hand. -- WHN 2001-04-15
+;;;
+;;; Actually any information that we can retrieve C-side would be
+;;; useless in SBCL, since it's possible for otherwise binary
+;;; compatible systems to return different values for getpagesize().
+;;; -- JES, 2007-01-06
+(defconstant +backend-page-bytes+ #!+win32 65536 #!-win32 32768)
+
+;;; The size in bytes of GENCGC cards, i.e. the granularity at which
+;;; writes to old generations are logged.  With mprotect-based write
+;;; barriers, this must be a multiple of the OS page size.
+(defconstant gencgc-card-bytes +backend-page-bytes+)
+;;; The minimum size of new allocation regions.  While it doesn't
+;;; currently make a lot of sense to have a card size lower than
+;;; the alloc granularity, it will, once we are smarter about finding
+;;; the start of objects.
+(defconstant gencgc-alloc-granularity 0)
+;;; The minimum size at which we release address ranges to the OS.
+;;; This must be a multiple of the OS page size.
+(defconstant gencgc-release-granularity +backend-page-bytes+)
+;;; The card size for immobile/low space
+(defconstant immobile-card-bytes 4096)
 
 ;;; ### Note: we simultaneously use ``word'' to mean a 32 bit quantity
 ;;; and a 16 bit quantity depending on context. This is because Intel
@@ -30,12 +63,6 @@
 ;;; the natural width of a machine word (as seen in e.g. register width,
 ;;; address space)
 (defconstant n-machine-word-bits 64)
-
-;;; The minimum immediate offset in a memory-referencing instruction.
-(defconstant minimum-immediate-offset (- (expt 2 31)))
-
-;;; The maximum immediate offset in a memory-referencing instruction.
-(defconstant maximum-immediate-offset (1- (expt 2 31)))
 
 (defconstant float-sign-shift 31)
 
@@ -99,33 +126,36 @@
 ;;; would be possible, but probably not worth the time and code bloat
 ;;; it would cause. -- JES, 2005-12-11
 
+#!+linux
+(!gencgc-space-setup #x50000000
+                     :fixedobj-space-size #.(* 30 1024 1024)
+                     :varyobj-space-size #.(* 130 1024 1024)
+                     :dynamic-space-start #x1000000000)
+
 ;;; The default dynamic space size is lower on OpenBSD to allow SBCL to
 ;;; run under the default 512M data size limit.
 
+#!-linux
 (!gencgc-space-setup #x20000000
                      :dynamic-space-start #x1000000000
-
-                     #!+openbsd :default-dynamic-space-size #!+openbsd #x1bcf0000
-
-                     #!+win32 :alignment #!+win32 #x10000)
+                     #!+openbsd :dynamic-space-size #!+openbsd #x1bcf0000)
 
 (defconstant linkage-table-entry-size 16)
 
 
-;;;; other miscellaneous constants
-
 (defenum (:start 8)
   halt-trap
   pending-interrupt-trap
-  error-trap
   cerror-trap
   breakpoint-trap
   fun-end-breakpoint-trap
   single-step-around-trap
   single-step-before-trap
   invalid-arg-count-trap
+  memory-fault-emulation-trap
   #!+sb-safepoint global-safepoint-trap
-  #!+sb-safepoint csp-safepoint-trap)
+  #!+sb-safepoint csp-safepoint-trap
+  error-trap)
 
 ;;;; static symbols
 
@@ -144,11 +174,12 @@
 
 (defconstant-eqx +static-symbols+
  `#(,@+common-static-symbols+
-    #!+immobile-space function-layout
+    #!+(and immobile-space (not sb-thread)) function-layout
     #!-sb-thread *alien-stack-pointer*    ; a thread slot if #!+sb-thread
      ;; interrupt handling
     #!-sb-thread *pseudo-atomic-bits*     ; ditto
-    #!-sb-thread *binding-stack-pointer*) ; ditto
+    #!-sb-thread *binding-stack-pointer* ; ditto
+    *cpuid-fn1-ecx*)
   #'equalp)
 
 ;;; FIXME: with #!+immobile-space, this should be the empty list,
@@ -173,4 +204,4 @@
   #'equalp)
 
 #!+sb-simd-pack
-(defvar *simd-pack-element-types* '(integer single-float double-float))
+(defglobal *simd-pack-element-types* '(integer single-float double-float))

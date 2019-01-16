@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!PRETTY")
+(in-package "SB-PRETTY")
 
 #!-sb-fluid (declaim (inline index-posn posn-index posn-column))
 (defun index-posn (index stream)
@@ -55,7 +55,7 @@
            (type (or index null) end))
   (let* ((end (or end (length string))))
     (unless (= start end)
-      (sb!impl::string-dispatch (simple-base-string
+      (sb-impl::string-dispatch (simple-base-string
                                  #!+sb-unicode
                                  (simple-array character (*)))
           string
@@ -703,8 +703,8 @@ line break."
 
 ;;;; pprint-dispatch tables
 
-(defglobal *standard-pprint-dispatch-table* nil)
-(defglobal *initial-pprint-dispatch-table* nil)
+(define-load-time-global *standard-pprint-dispatch-table* nil)
+(define-load-time-global *initial-pprint-dispatch-table* nil)
 
 (defstruct (pprint-dispatch-entry
             (:constructor make-pprint-dispatch-entry (type priority fun test-fn))
@@ -759,8 +759,8 @@ line break."
                            (and pred (fboundp pred)
                                 (symbol-function pred))))))))
       ;; avoid compiling code for CONS, ARRAY, VECTOR, etc
-      (awhen (assoc ctype sb!c::*backend-type-predicates* :test #'type=)
-        (symbol-function (cdr it)))
+      (awhen (sb-c::backend-type-predicate ctype)
+        (symbol-function it))
       ;; OK, compile something
       (let ((name
              ;; Keep name as a string, because NAMED-LAMBDA with a symbol
@@ -812,9 +812,9 @@ line break."
             :operation operation)))
 
 (defun defer-type-checker (entry)
-  (let ((saved-nonce sb!c::*type-cache-nonce*))
+  (let ((saved-nonce sb-c::*type-cache-nonce*))
     (lambda (obj)
-      (let ((nonce sb!c::*type-cache-nonce*))
+      (let ((nonce sb-c::*type-cache-nonce*))
         (if (eq nonce saved-nonce)
             nil
             (let ((ctype (specifier-type (pprint-dispatch-entry-type entry))))
@@ -848,7 +848,7 @@ line break."
                           (lambda (c)
                             (warn "~S is not a recognized type specifier"
                                   (parse-unknown-type-specifier c)))))
-                      (sb!c::careful-specifier-type type))
+                      (sb-c::careful-specifier-type type))
                     (error "~S is not a valid type-specifier" type)))
          (consp (and (cons-type-p ctype)
                      (eq (cons-type-cdr-type ctype) *universal-type*)
@@ -890,7 +890,7 @@ line break."
          (output-ugly-object stream array))
         ((and *print-readably*
               (not (array-readably-printable-p array)))
-         (sb!impl::output-unreadable-array-readably array stream))
+         (sb-impl::output-unreadable-array-readably array stream))
         ((vectorp array)
          (pprint-vector stream array))
         (t
@@ -993,17 +993,21 @@ line break."
 (defun pprint-lambda (stream list &rest noise)
   (declare (ignore noise))
   (funcall (formatter
+            ;; META: I disagree with the claim that we are not ANSI-compliant.
+            ;; The time at which INTERN occurs does not seem to me to lie within
+            ;; the scope of what is meant by "equivalent" with respect to behavior
+            ;; of the format control.
             ;; KLUDGE: This format string, and other format strings which also
-            ;; refer to SB!PRETTY, rely on the current SBCL not-quite-ANSI
+            ;; refer to SB-PRETTY, rely on the current SBCL not-quite-ANSI
             ;; behavior of FORMATTER in order to make code which survives the
-            ;; transition when SB!PRETTY is renamed to SB-PRETTY after cold
-            ;; init. (ANSI says that the FORMATTER functions should be
+            ;; transition when SB-PRETTY is renamed.
+            ;; (ANSI says that the FORMATTER functions should be
             ;; equivalent to the format string, but the SBCL FORMATTER
             ;; functions contain references to package objects, not package
             ;; names, so they keep right on going if the packages are renamed.)
             ;; If our FORMATTER behavior is ever made more compliant, the code
             ;; here will have to change. -- WHN 19991207
-            "~:<~^~W~^~3I ~:_~/SB!PRETTY:PPRINT-LAMBDA-LIST/~1I~@{ ~_~W~}~:>")
+            "~:<~^~W~^~3I ~:_~/SB-PRETTY:PPRINT-LAMBDA-LIST/~1I~@{ ~_~W~}~:>")
            stream
            list))
 
@@ -1020,7 +1024,7 @@ line break."
            (and (consp (cddr list))
                 (not (eq :in (third list)))))
       (funcall (formatter
-                "~:<~^~W~^ ~@_~:<~@{~:<~^~W~^~3I ~:_~/SB!PRETTY:PPRINT-LAMBDA-LIST/~1I~:@_~@{~W~^ ~_~}~:>~^ ~_~}~:>~1I~@:_~@{~W~^ ~_~}~:>")
+                "~:<~^~W~^ ~@_~:<~@{~:<~^~W~^~3I ~:_~/SB-PRETTY:PPRINT-LAMBDA-LIST/~1I~:@_~@{~W~^ ~_~}~:>~^ ~_~}~:>~1I~@:_~@{~W~^ ~_~}~:>")
                stream
                list)
       ;; for printing function names like (flet foo)
@@ -1034,7 +1038,7 @@ line break."
 
 (defun pprint-let (stream list &rest noise)
   (declare (ignore noise))
-  (funcall (formatter "~:<~^~W~^ ~@_~:<~@{~:<~^~W~@{ ~_~W~}~:>~^ ~_~}~:>~1I~:@_~@{~W~^ ~_~}~:>")
+  (funcall (formatter "~:<~^~W~^ ~@_~:<~@{~:<~^~W~@{ ~_~W~}~:>~^ ~_~}~:>~1I~^~:@_~@{~W~^ ~_~}~:>")
            stream
            list))
 
@@ -1119,8 +1123,7 @@ line break."
        (write-char #\space stream)
        (pprint-newline :mandatory stream)))))
 
-(eval-when (:compile-toplevel :execute)
-(sb!xc:defmacro pprint-tagbody-guts (stream)
+(defmacro pprint-tagbody-guts (stream)
   `(loop
      (pprint-exit-if-list-exhausted)
      (write-char #\space ,stream)
@@ -1129,7 +1132,7 @@ line break."
                       (if (atom form-or-tag) 0 1)
                       ,stream)
        (pprint-newline :linear ,stream)
-       (output-object form-or-tag ,stream)))))
+       (output-object form-or-tag ,stream))))
 
 (defun pprint-tagbody (stream list &rest noise)
   (declare (ignore noise))
@@ -1141,14 +1144,14 @@ line break."
 (defun pprint-case (stream list &rest noise)
   (declare (ignore noise))
   (funcall (formatter
-            "~:<~^~W~^ ~3I~:_~W~1I~@{ ~_~:<~^~:/SB!PRETTY:PPRINT-FILL/~^~@{ ~_~W~}~:>~}~:>")
+            "~:<~^~W~^ ~3I~:_~W~1I~@{ ~_~:<~^~:/SB-PRETTY:PPRINT-FILL/~^~@{ ~_~W~}~:>~}~:>")
            stream
            list))
 
 (defun pprint-defun (stream list &rest noise)
   (declare (ignore noise))
   (funcall (formatter
-            "~:<~^~W~^ ~@_~:I~W~^ ~:_~/SB!PRETTY:PPRINT-LAMBDA-LIST/~1I~@{ ~_~W~}~:>")
+            "~:<~^~W~^ ~@_~:I~W~^ ~:_~/SB-PRETTY:PPRINT-LAMBDA-LIST/~1I~@{ ~_~W~}~:>")
            stream
            list))
 
@@ -1159,7 +1162,7 @@ line break."
            (consp (third list)))
       (pprint-defun stream list)
       (funcall (formatter
-                "~:<~^~W~^ ~@_~:I~W~^ ~W~^ ~:_~/SB!PRETTY:PPRINT-LAMBDA-LIST/~1I~@{ ~_~W~}~:>")
+                "~:<~^~W~^ ~@_~:I~W~^ ~W~^ ~:_~/SB-PRETTY:PPRINT-LAMBDA-LIST/~1I~@{ ~_~W~}~:>")
                stream
                list)))
 
@@ -1173,7 +1176,7 @@ line break."
 (defun pprint-destructuring-bind (stream list &rest noise)
   (declare (ignore noise))
   (funcall (formatter
-            "~:<~^~W~^~3I ~_~:/SB!PRETTY:PPRINT-LAMBDA-LIST/~^ ~_~W~^~1I~@{ ~_~W~}~:>")
+            "~:<~^~W~^~3I ~_~:/SB-PRETTY:PPRINT-LAMBDA-LIST/~^ ~_~W~^~1I~@{ ~_~W~}~:>")
            stream list))
 
 (defun pprint-do (stream list &rest noise)
@@ -1230,7 +1233,7 @@ line break."
 ;;;        puts a newline in between INTO and COUNT.
 ;;;        It would be awesome to have code in common with the macro
 ;;;        the properly represents each clauses.
-(defglobal *loop-separating-clauses*
+(defconstant-eqx +loop-separating-clauses+
   '(:and
     :with :for
     :initially :finally
@@ -1244,7 +1247,8 @@ line break."
     :minimize :minimizing
     :if :when :unless :end
     :for :while :until :repeat :always :never :thereis
-    ))
+    )
+  #'equal)
 
 (defun pprint-extended-loop (stream list)
   (pprint-logical-block (stream list :prefix "(" :suffix ")")
@@ -1257,7 +1261,7 @@ line break."
     (write-char #\space stream)
     (loop for thing = (pprint-pop)
           when (and (symbolp thing)
-                    (member thing  *loop-separating-clauses* :test #'string=))
+                    (member thing +loop-separating-clauses+ :test #'string=))
           do (pprint-newline :mandatory stream)
           do (output-object thing stream)
           do (pprint-exit-if-list-exhausted)
@@ -1343,11 +1347,10 @@ line break."
 
 ;;;; the interface seen by regular (ugly) printer and initialization routines
 
-(eval-when (:compile-toplevel :execute)
-(sb!xc:defmacro with-pretty-stream ((stream-var
+(defmacro with-pretty-stream ((stream-var
                                      &optional (stream-expression stream-var))
                                     &body body)
-  (let ((flet-name (sb!xc:gensym "WITH-PRETTY-STREAM")))
+  (let ((flet-name (sb-xc:gensym "WITH-PRETTY-STREAM")))
     `(flet ((,flet-name (,stream-var)
               ,@body))
        (let ((stream ,stream-expression))
@@ -1357,7 +1360,7 @@ line break."
                (let ((stream (make-pretty-stream stream)))
                  (,flet-name stream)
                  (force-pretty-output stream)))))
-       nil))))
+       nil)))
 
 (defun call-logical-block-printer (proc stream prefix per-line-p suffix
                                    &optional (object nil obj-supplied-p))
@@ -1456,7 +1459,7 @@ line break."
     (set-pprint-dispatch '(cons symbol)
                          'pprint-data-list -2)
     (set-pprint-dispatch 'cons 'pprint-fill -2)
-    (set-pprint-dispatch 'sb!impl::comma 'pprint-unquoting-comma -3)
+    (set-pprint-dispatch 'sb-impl::comma 'pprint-unquoting-comma -3)
     ;; cons cells with interesting things for the car
     (/show0 "doing SET-PPRINT-DISPATCH for CONS with interesting CAR")
 

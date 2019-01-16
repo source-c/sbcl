@@ -10,20 +10,14 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 (defun muffle-warning-p (warning)
   (declare (special *muffled-warnings*))
   (typep warning *muffled-warnings*))
 
 ;; Host lisp does not need a value for this, so start it out as NIL.
-(defglobal **initial-handler-clusters** nil)
-(setq **initial-handler-clusters**
-  `(((,(find-classoid-cell 'warning :create t)
-      .
-      ,(named-lambda "MAYBE-MUFFLE" (warning)
-         (when (muffle-warning-p warning)
-           (muffle-warning warning)))))))
+(define-load-time-global **initial-handler-clusters** nil)
 
 ;;; Each cluster is an alist of the form
 ;;;
@@ -39,18 +33,23 @@
 ;;;
 ;;; Lists to which *HANDLER-CLUSTERS* is bound generally have dynamic
 ;;; extent.
-(defvar *handler-clusters* **initial-handler-clusters**)
+#!+sb-thread (!define-thread-local *handler-clusters* **initial-handler-clusters**)
+#!-sb-thread (defvar *handler-clusters* **initial-handler-clusters**)
 
 ;;; a list of lists of currently active RESTART instances. maintained
 ;;; by RESTART-BIND.
-;;; This variable is proclaimed to be "eventually" always-bound,
-;;; meaning in the loaded code. If DEFVAR were used, the compiler knows that
-;;; BOUNDP will be T, and therefore a code deletion note should be issused
-;;; for the initialization expression (UNLESS (BOUNDP x) <initform>).
-;;; Technically it's not even right to use DEFVAR because it works only
-;;; if the initializer is really NIL, since that is what %DEFVAR will assign
-;;; on account of the fact that an initializer was supplied at all.
-(defparameter *restart-clusters* '())
+(!define-thread-local *restart-clusters* nil)
+
+(defun !target-error-cold-init ()
+  (setq **initial-handler-clusters**
+        `(((,(find-classoid-cell 'warning :create t)
+            .
+            ,(named-lambda "MAYBE-MUFFLE" (warning)
+               (when (muffle-warning-p warning)
+                 (muffle-warning warning)))))))
+  ;;; If multithreaded, *HANDLER-CLUSTERS* is #<unbound> at this point.
+  ;;; This SETQ assigns to TLS since the value is not no-tls-value-marker.
+  (setq *handler-clusters* **initial-handler-clusters**))
 
 (defmethod print-object ((restart restart) stream)
   (if *print-escape*
@@ -58,7 +57,7 @@
         (prin1 (restart-name restart) stream))
       (restart-report restart stream)))
 
-(setf (fdocumentation 'restart-name 'function)
+(setf (documentation 'restart-name 'function)
       "Return the name of the given restart object.")
 
 (defun restart-report (restart stream)
@@ -210,7 +209,7 @@ with that condition (or with no condition) will be returned."
 
 ;;; To reduce expansion size of RESTART-CASE
 (defun with-simple-condition-restarts (function cerror-arg datum &rest arguments)
-  (let ((sb!debug:*stack-top-hint* (or sb!debug:*stack-top-hint*
+  (let ((sb-debug:*stack-top-hint* (or sb-debug:*stack-top-hint*
                                        'with-simple-condition-restarts))
         (condition (apply #'coerce-to-condition datum
                           (case function

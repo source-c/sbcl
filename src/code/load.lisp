@@ -14,7 +14,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!FASL")
+(in-package "SB-FASL")
 
 ;;;; miscellaneous load utilities
 
@@ -123,7 +123,7 @@
 
 (defun read-word-arg (stream)
   (declare (optimize (speed 0)))
-  (read-arg #.sb!vm:n-word-bytes stream))
+  (read-arg #.sb-vm:n-word-bytes stream))
 
 (defun read-unsigned-byte-32-arg (stream)
   (declare (optimize (speed 0)))
@@ -250,72 +250,28 @@
              (invalid-fasl-expected condition)))))
 
 (define-condition invalid-fasl-features (invalid-fasl)
-  ((potential-features :reader invalid-fasl-potential-features
-                       :initarg :potential-features)
-   (features :reader invalid-fasl-features :initarg :features))
+  ((features :reader invalid-fasl-features :initarg :features))
   (:report
    (lambda (condition stream)
-     (format stream "~@<incompatible ~S in fasl file ~S: ~2I~_~
-                     Of features affecting binary compatibility, ~4I~_~S~2I~_~
-                     the fasl has ~4I~_~A,~2I~_~
-                     while the runtime expects ~4I~_~A.~:>"
-             '*features*
-             (invalid-fasl-stream condition)
-             (invalid-fasl-potential-features condition)
+     (format stream "~@<incompatible features ~A ~_in fasl file ~S: ~2I~_~
+                     Runtime expects ~A~:>"
              (invalid-fasl-features condition)
+             (invalid-fasl-stream condition)
              (invalid-fasl-expected condition)))))
 
 ;;; Skips past the shebang line on stream, if any.
 (defun maybe-skip-shebang-line (stream)
   (let ((p (file-position stream)))
-    (flet ((next () (read-byte stream nil)))
-      (unwind-protect
-           (when (and (eq (next) (char-code #\#))
-                      (eq (next) (char-code #\!)))
-             (setf p nil)
-             (loop for x = (next)
-                   until (or (not x) (eq x (char-code #\newline)))))
-        (when p
-          (file-position stream p))))
-    t))
-
-;;; Returns T if the stream is a binary input stream with a FASL header.
-#-sb-xc-host ;; FIXME: function belongs in 'target-load'
-(defun fasl-header-p (stream &key errorp)
-  (unless (and (member (stream-element-type stream) '(character base-char))
-               ;; give up if it's not a file stream, or it's an
-               ;; fd-stream but it's either not bivalent or not
-               ;; seekable (doesn't really have a file)
-               (or (not (typep stream 'file-stream))
-                   (and (typep stream 'fd-stream)
-                        (or (not (sb!impl::fd-stream-bivalent-p stream))
-                            (not (sb!impl::fd-stream-file stream))))))
-    (let ((p (file-position stream)))
-      (unwind-protect
-           (let* ((header *fasl-header-string-start-string*)
-                  (buffer (make-array (length header) :element-type '(unsigned-byte 8)))
-                  (n 0))
-             (flet ((scan ()
-                      (maybe-skip-shebang-line stream)
-                      (setf n (read-sequence buffer stream))))
-               (if errorp
-                   (scan)
-                   (or (ignore-errors (scan))
-                       ;; no a binary input stream
-                       (return-from fasl-header-p nil))))
-             (if (mismatch buffer header
-                           :test #'(lambda (code char) (= code (char-code char))))
-                 ;; Immediate EOF is valid -- we want to match what
-                 ;; CHECK-FASL-HEADER does...
-                 (or (zerop n)
-                     (when errorp
-                       (error 'fasl-header-missing
-                              :stream stream
-                              :fhsss buffer
-                              :expected header)))
-                 t))
-        (file-position stream p)))))
-
+    (when p
+      (flet ((next () (read-byte stream nil)))
+        (unwind-protect
+             (when (and (eq (next) (char-code #\#))
+                        (eq (next) (char-code #\!)))
+               (setf p nil)
+               (loop for x = (next)
+                     until (or (not x) (eq x (char-code #\newline)))))
+          (when p
+            (file-position stream p)))))))
 
 ;;;; LOAD-AS-FASL
 ;;;;
@@ -361,18 +317,21 @@
                  (read-string-as-bytes stream result)
                  result)))
         ;; Read and validate implementation and version.
-        (let ((implementation (keywordicate (string-from-stream)))
+        (let ((implementation (string-from-stream))
               (expected-implementation +backend-fasl-file-implementation+))
           (unless (string= expected-implementation implementation)
             (error 'invalid-fasl-implementation
                    :stream stream
+                   ;; This slot used to hold a symbol. Now it's a string.
+                   ;; I don't think anyone should care, but if they do,
+                   ;; then this needs a call to KEYWORDICATE.
                    :implementation implementation
                    :expected expected-implementation)))
         (let* ((fasl-version (read-word-arg stream))
                (sbcl-version (if (<= fasl-version 76)
                                  "1.0.11.18"
                                  (string-from-stream)))
-               (expected-version (sb!xc:lisp-implementation-version)))
+               (expected-version (sb-xc:lisp-implementation-version)))
           (unless (string= expected-version sbcl-version)
             (restart-case
                 (error 'invalid-fasl-version
@@ -381,12 +340,12 @@
                        :expected expected-version)
               (continue () :report "Load the fasl file anyway"))))
         ;; Read and validate *FEATURES* which affect binary compatibility.
-        (let ((faff-in-this-file (string-from-stream)))
-          (unless (string= faff-in-this-file *features-affecting-fasl-format*)
+        (let ((faff-in-this-file (string-from-stream))
+              (expected (compute-features-affecting-fasl-format)))
+          (unless (string= faff-in-this-file expected)
             (error 'invalid-fasl-features
                    :stream stream
-                   :potential-features *features-potentially-affecting-fasl-format*
-                   :expected *features-affecting-fasl-format*
+                   :expected expected
                    :features faff-in-this-file)))
         ;; success
         t))))
@@ -395,7 +354,7 @@
 ;; executed.
 #!+sb-show
 (defvar *show-fops-p* nil)
-(defvar *fasl-source-info*)
+
 ;;;
 ;;; a helper function for LOAD-AS-FASL
 ;;;
@@ -414,15 +373,12 @@
   ;;
   (declare (ignorable print))
   (let ((stream (%fasl-input-stream fasl-input))
-        *fasl-source-info*
-        #!+sb-show (trace *show-fops-p*))
+        (trace #!+sb-show *show-fops-p*))
     (unless (check-fasl-header stream)
       (return-from load-fasl-group))
     (catch 'fasl-group-end
      (setf (svref (%fasl-input-table fasl-input) 0) 0)
-     (macrolet ((tracing (&body forms)
-                  #!+sb-show `(when trace ,@forms)
-                  #!-sb-show (progn forms nil)))
+     (macrolet ((tracing (&body forms) `(when trace ,@forms)))
       (loop
        (let* ((byte (the (unsigned-byte 8) (read-byte stream)))
               (function (svref **fop-funs** byte))
@@ -433,8 +389,7 @@
                   (1- (file-position stream))
                   (svref (%fasl-input-stack fasl-input) 0) ; stack pointer
                   (svref (%fasl-input-table fasl-input) 0) ; table pointer
-                  byte (and (functionp function)
-                            (nth-value 2 (function-lambda-expression function)))))
+                  byte (and (functionp function) (%fun-name function))))
          ;; Actually execute the fop.
          (let ((result
                  (cond ((not (functionp function))
@@ -442,15 +397,11 @@
                        ((zerop n-operands)
                         (funcall function fasl-input))
                        (t
-                        (let (arg1 arg2 arg3)
-                          (with-fast-read-byte ((unsigned-byte 8) stream)
-                            ;; The low 2 bits of the opcode determine the
-                            ;; number of octets used for the 1st operand.
-                            (setq arg1 (fast-read-var-u-integer (ash 1 (logand byte 3)))))
-                          (when (>= n-operands 2)
-                            (setq arg2 (read-varint-arg fasl-input))
-                            (when (>= n-operands 3)
-                              (setq arg3 (read-varint-arg fasl-input))))
+                        (let ((arg1 (read-varint-arg fasl-input))
+                              (arg2 (when (>= n-operands 2)
+                                      (read-varint-arg fasl-input)))
+                              (arg3 (when (>= n-operands 3)
+                                      (read-varint-arg fasl-input))))
                           (tracing (format *trace-output* "{~D~@[,~D~@[,~D~]~]}"
                                            arg1 arg2 arg3))
                           (case n-operands
@@ -479,7 +430,7 @@
                    (setf (%fasl-input-deprecated-stuff fasl-input) nil)
                    (loader-deprecation-warn
                     it
-                    (and (eq (svref stack 1) 'sb!impl::%defun) (svref stack 2))))
+                    (and (eq (svref stack 1) 'sb-impl::%defun) (svref stack 2))))
                  (when print
                    (load-fresh-line)
                    (prin1 result))))))))))))

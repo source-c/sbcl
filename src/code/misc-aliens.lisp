@@ -9,21 +9,14 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;; Declare each of the free space pointers (except dynamic) as an alien var
 (define-alien-variable ("read_only_space_free_pointer"
-                        sb!vm:*read-only-space-free-pointer*)
+                        sb-vm:*read-only-space-free-pointer*)
     system-area-pointer)
-(define-alien-variable ("static_space_free_pointer" sb!vm:*static-space-free-pointer*)
+(define-alien-variable ("static_space_free_pointer" sb-vm:*static-space-free-pointer*)
   system-area-pointer)
-#!+immobile-space
-(progn (define-alien-variable ("immobile_space_free_pointer"
-                               sb!vm:*immobile-space-free-pointer*)
-         system-area-pointer)
-       (define-alien-variable ("immobile_fixedobj_free_pointer"
-                               sb!vm:*immobile-fixedobj-free-pointer*)
-         system-area-pointer))
 
 (declaim (inline memmove))
 (define-alien-routine ("memmove" memmove) void
@@ -32,7 +25,7 @@
   (n unsigned-int))
 
 (define-alien-routine ("os_get_errno" get-errno) integer)
-(setf (fdocumentation 'get-errno 'function)
+(setf (documentation 'get-errno 'function)
       "Return the value of the C library pseudo-variable named \"errno\".")
 
 ;;; Decode errno into a string.
@@ -41,5 +34,5 @@
   (alien-funcall (extern-alien "strerror" (function c-string int)) errno))
 
 #!+win32
-(defun strerror (&optional (errno (sb!win32:get-last-error)))
-  (sb!win32:format-system-message errno))
+(defun strerror (&optional (errno (sb-win32:get-last-error)))
+  (sb-win32:format-system-message errno))

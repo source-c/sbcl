@@ -1,4 +1,4 @@
-(in-package "SB!ARM64-ASM")
+(in-package "SB-ARM64-ASM")
 
 (defun current-instruction (dstate &optional (offset 0))
   (sap-ref-int (dstate-segment-sap dstate)
@@ -251,7 +251,7 @@
 
 (defun print-cond (value stream dstate)
   (declare (ignore dstate))
-  (princ (svref sb!vm::+condition-name-vec+ value) stream))
+  (princ (svref sb-vm::+condition-name-vec+ value) stream))
 
 (defun use-label (value dstate)
   (let* ((value (if (consp value)
@@ -267,19 +267,19 @@
 
 (defun annotate-ldr-str (register offset dstate)
   (case register
-    (#.sb!vm::code-offset
+    (#.sb-vm::code-offset
      (note-code-constant offset dstate))
-    (#.sb!vm::null-offset
-     (let ((offset (+ sb!vm::nil-value offset)))
+    (#.sb-vm::null-offset
+     (let ((offset (+ sb-vm::nil-value offset)))
        (maybe-note-assembler-routine offset nil dstate)
        (maybe-note-static-symbol (logior offset other-pointer-lowtag)
                                               dstate)))
     #!+sb-thread
-    (#.sb!vm::thread-offset
+    (#.sb-vm::thread-offset
      (let* ((thread-slots
              (load-time-value
               (primitive-object-slots
-               (find 'sb!vm::thread *primitive-objects*
+               (find 'sb-vm::thread *primitive-objects*
                      :key #'primitive-object-name)) t))
             (slot (find (ash offset (- word-shift)) thread-slots
                         :key #'slot-offset)))
@@ -318,26 +318,27 @@
                         dstate))))
 
 ;;;; special magic to support decoding internal-error and related traps
-(defun snarf-error-junk (sap offset &optional length-only)
+(defun snarf-error-junk (sap offset trap-number &optional length-only)
+  (declare (ignore trap-number))
   (let* ((inst (sap-ref-32 sap (- offset 4)))
          (error-number (ldb (byte 8 13) inst))
-         (length (sb!kernel::error-length error-number))
+         (length (sb-kernel::error-length error-number))
          (index offset))
-    (declare (type sb!sys:system-area-pointer sap)
+    (declare (type sb-sys:system-area-pointer sap)
              (type (unsigned-byte 8) length))
     (cond (length-only
-           (loop repeat length do (sb!c::sap-read-var-integerf sap index))
+           (loop repeat length do (sb-c::sap-read-var-integerf sap index))
            (values 0 (- index offset) nil nil))
           (t
-           (collect ((sc-offsets)
+           (collect ((sc+offsets)
                      (lengths))
              (loop repeat length do
                   (let ((old-index index))
-                    (sc-offsets (sb!c::sap-read-var-integerf sap index))
+                    (sc+offsets (sb-c::sap-read-var-integerf sap index))
                     (lengths (- index old-index))))
              (values error-number
                      (- index offset)
-                     (sc-offsets)
+                     (sc+offsets)
                      (lengths)))))))
 
 (defun brk-control (chunk inst stream dstate)
@@ -350,11 +351,10 @@
         (#.pending-interrupt-trap
          (nt "Pending interrupt trap"))
         (#.error-trap
-         (nt "Error trap")
-         (handle-break-args #'snarf-error-junk stream dstate))
+         (handle-break-args #'snarf-error-junk code stream dstate))
         (#.cerror-trap
          (nt "Cerror trap")
-         (handle-break-args #'snarf-error-junk stream dstate))
+         (handle-break-args #'snarf-error-junk code stream dstate))
         (#.breakpoint-trap
          (nt "Breakpoint trap"))
         (#.fun-end-breakpoint-trap

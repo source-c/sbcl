@@ -23,11 +23,12 @@
 #include "sbcl.h"
 #include "print.h"
 #include "runtime.h"
-#include "gc-internal.h"
+#include "code.h"
 #include <stdarg.h>
 #include "thread.h"              /* genesis/primitive-objects.h needs this */
 #include <errno.h>
 #include <stdlib.h>
+#include <inttypes.h>
 
 /* FSHOW and odxprint provide debugging output for low-level information
  * (signal handling, exceptions, safepoints) which is hard to debug by
@@ -79,10 +80,6 @@ dyndebug_init()
     if (n != DYNDEBUG_NFLAGS)
         fprintf(stderr, "Bug in dyndebug_init\n");
 
-#if defined(LISP_FEATURE_GENCGC)
-    gencgc_verbose = dyndebug_config.dyndebug_gencgc_verbose;
-#endif
-
     char *featurelist = getenv("SBCL_DYNDEBUG");
     if (featurelist) {
         int err = 0;
@@ -120,6 +117,11 @@ dyndebug_init()
             }
         }
     }
+#if defined(LISP_FEATURE_GENCGC)
+    if (dyndebug_config.dyndebug_gencgc_verbose) {
+        gencgc_verbose = 1;
+    }
+#endif
 
 #undef dyndebug_init1
 #undef DYNDEBUG_NFLAGS
@@ -290,18 +292,24 @@ static void print_unknown(lispobj obj)
   printf("unknown object: %p", (void *)obj);
 }
 
+/* Except for Alpha, we define sword_t as intptr_t, and 32-bit Darwin
+ * defines intptr_t as long, so the printf conversion is "ld", not "d".
+ * Alpha (32-on-64) defines sword_t as s32, so we need just "d". */
+#ifdef LISP_FEATURE_ALPHA
+# define OBJ_FMTd "d"
+#elif defined(PRIdPTR)
+# define OBJ_FMTd PRIdPTR
+#else
+# error "Your inttypes.h is lame"
+#endif
+
 static void brief_fixnum(lispobj obj)
 {
     /* KLUDGE: Rather than update the tables in print_obj(), we
        declare all fixnum-or-unknown tags to be fixnums and sort it
        out here with a guard clause. */
     if (!fixnump(obj)) return print_unknown(obj);
-
-#ifndef LISP_FEATURE_ALPHA
-    printf("%ld", ((long)obj)>>N_FIXNUM_TAG_BITS);
-#else
-    printf("%d", ((s32)obj)>>N_FIXNUM_TAG_BITS);
-#endif
+    printf("%"OBJ_FMTd, fixnum_value(obj));
 }
 
 static void print_fixnum(lispobj obj)
@@ -310,12 +318,7 @@ static void print_fixnum(lispobj obj)
        declare all fixnum-or-unknown tags to be fixnums and sort it
        out here with a guard clause. */
     if (!fixnump(obj)) return print_unknown(obj);
-
-#ifndef LISP_FEATURE_ALPHA
-    printf(": %ld", ((long)obj)>>N_FIXNUM_TAG_BITS);
-#else
-    printf(": %d", ((s32)obj)>>N_FIXNUM_TAG_BITS);
-#endif
+    printf(": %"OBJ_FMTd, fixnum_value(obj));
 }
 
 static void brief_otherimm(lispobj obj)
@@ -323,7 +326,7 @@ static void brief_otherimm(lispobj obj)
     int type, c;
     char * charname = 0;
 
-    type = widetag_of(obj);
+    type = header_widetag(obj);
     switch (type) {
         case CHARACTER_WIDETAG:
             c = obj>>8; // no mask. show whatever's there
@@ -353,9 +356,9 @@ static void brief_otherimm(lispobj obj)
 
 static void print_otherimm(lispobj obj)
 {
-    printf(", %s", widetag_names[widetag_of(obj) >> 2]);
+    printf(", %s", widetag_names[header_widetag(obj) >> 2]);
 
-    switch (widetag_of(obj)) {
+    switch (header_widetag(obj)) {
     case CHARACTER_WIDETAG:
         printf(": ");
         brief_otherimm(obj);
@@ -380,7 +383,7 @@ static void brief_list(lispobj obj)
         printf("NIL");
     else {
         putchar('(');
-        while (lowtag_of(obj) == LIST_POINTER_LOWTAG) {
+        while (listp(obj)) {
             if (space)
                 putchar(' ');
             if (++length >= max_length) {
@@ -415,7 +418,7 @@ static void print_list(lispobj obj)
 // takes native pointer as input
 char * simple_base_stringize(struct vector * string)
 {
-  if (widetag_of(string->header) == SIMPLE_BASE_STRING_WIDETAG)
+  if (widetag_of(&string->header) == SIMPLE_BASE_STRING_WIDETAG)
       return (char*)string->data;
   int length = string->length;
   char * newstring = malloc(length+1);
@@ -448,7 +451,7 @@ static void brief_struct(lispobj obj)
 static boolean tagged_slot_p(struct layout *layout, int slot_index)
 {
   lispobj bitmap = layout->bitmap;
-  sword_t fixnum = (sword_t)bitmap >> N_FIXNUM_TAG_BITS; // optimistically
+  sword_t fixnum = fixnum_value(bitmap); // optimistically
   return fixnump(bitmap)
          ? bitmap == make_fixnum(-1) ||
             (slot_index < N_WORD_BITS && ((fixnum >> slot_index) & 1) != 0)
@@ -480,7 +483,7 @@ void show_lstring(struct vector * string, int quotes, FILE *s)
   int i, len = fixnum_value(string->length);
 
 #ifdef SIMPLE_CHARACTER_STRING_WIDETAG
-  if (widetag_of(string->header) == SIMPLE_CHARACTER_STRING_WIDETAG) {
+  if (widetag_of(&string->header) == SIMPLE_CHARACTER_STRING_WIDETAG) {
       ucs4_p = 1;
       if (quotes)
           putc('u', s); /* an arbitrary notational convention */
@@ -516,7 +519,7 @@ static void brief_otherptr(lispobj obj)
 
     ptr = native_pointer(obj);
     header = *ptr;
-    type = widetag_of(header);
+    type = header_widetag(header);
     switch (type) {
         case SYMBOL_WIDETAG:
             symbol = (struct symbol *)ptr;
@@ -539,7 +542,7 @@ static void brief_otherptr(lispobj obj)
                 // FIXME: more address validity checks perhaps?
                 lispobj name = ((struct fdefn*)ptr)->name;
                 if (lowtag_of(name) == OTHER_POINTER_LOWTAG
-                    && widetag_of(*native_pointer(name)) == SYMBOL_WIDETAG) {
+                    && widetag_of(native_pointer(name)) == SYMBOL_WIDETAG) {
                   printf(" for ");
                   struct vector* str = symbol_name(native_pointer(name));
                   safely_show_lstring(str, 0, stdout);
@@ -553,17 +556,22 @@ static void print_slots(char **slots, int count, lispobj *ptr)
 {
     while (count-- > 0) {
         if (*slots) {
-            print_obj(*slots++, *ptr++);
+            // kludge for half-lispword sized slot
+            print_obj(*slots,
+                      (N_WORD_BYTES == 8 && !strcmp(*slots, "boxed_size: "))
+                      ? *ptr & 0xFFFFFFFF : *ptr);
+            slots++;
         } else {
-            print_obj("???: ", *ptr++);
+            print_obj("???: ", *ptr);
         }
+        ptr++;
     }
 }
 
 static lispobj symbol_function(lispobj* symbol)
 {
     lispobj info = ((struct symbol*)symbol)->info;
-    if (lowtag_of(info) == LIST_POINTER_LOWTAG)
+    if (listp(info))
         info = CONS(info)->cdr;
     if (lowtag_of(info) == OTHER_POINTER_LOWTAG) {
         struct vector* v = VECTOR(info);
@@ -603,7 +611,7 @@ static void print_otherptr(lispobj obj)
     header = *ptr++;
     length = fixnum_value(*ptr);
     count = HeaderValue(header);
-    type = widetag_of(header);
+    type = header_widetag(header);
 
     print_obj("header: ", header);
     if (!other_immediate_lowtag_p(header)) {
@@ -730,8 +738,8 @@ static void print_otherptr(lispobj obj)
         break;
 
     case CODE_HEADER_WIDETAG:
-        count &= SHORT_HEADER_MAX_WORDS;
         // ptr was already bumped up
+        count = code_header_words((struct code*)(ptr-1));
         for_each_simple_fun(fun_index, fun, (struct code*)(ptr-1), 0, {
             sprintf(buffer, "f[%d]: ", fun_index);
             print_obj(buffer, make_lispobj(fun,FUN_POINTER_LOWTAG));
@@ -934,16 +942,14 @@ struct vector * layout_classoid_name(lispobj * layout)
   if (forwarding_pointer_p(layout))
       layout = native_pointer(forwarding_pointer_value(layout));
   lispobj classoid = ((struct layout*)layout)->classoid;
-  return lowtag_of(classoid) != INSTANCE_POINTER_LOWTAG ? NULL
-    : classoid_name(native_pointer(classoid));
+  return instancep(classoid) ? classoid_name(native_pointer(classoid)) : NULL;
 }
 struct vector * instance_classoid_name(lispobj * instance)
 {
   if (forwarding_pointer_p(instance))
       instance = native_pointer(forwarding_pointer_value(instance));
   lispobj layout = instance_layout(instance);
-  return lowtag_of(layout) != INSTANCE_POINTER_LOWTAG ? NULL
-    : layout_classoid_name(native_pointer(layout));
+  return instancep(layout) ? layout_classoid_name(native_pointer(layout)) : NULL;
 }
 void safely_show_lstring(struct vector * string, int quotes, FILE *s)
 {
@@ -952,11 +958,11 @@ void safely_show_lstring(struct vector * string, int quotes, FILE *s)
       string = (struct vector*)forwarding_pointer_value((lispobj*)string);
   if (
 #ifdef SIMPLE_CHARACTER_STRING_WIDETAG
-      widetag_of(string->header) == SIMPLE_CHARACTER_STRING_WIDETAG ||
+      header_widetag(string->header) == SIMPLE_CHARACTER_STRING_WIDETAG ||
 #endif
-      widetag_of(string->header) == SIMPLE_BASE_STRING_WIDETAG)
+      header_widetag(string->header) == SIMPLE_BASE_STRING_WIDETAG)
     show_lstring(string, quotes, s);
   else {
-    fprintf(s, "#<[widetag=%02X]>", widetag_of(string->header));
+    fprintf(s, "#<[widetag=%02X]>", header_widetag(string->header));
   }
 }

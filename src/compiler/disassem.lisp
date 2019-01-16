@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!DISASSEM")
+(in-package "SB-DISASSEM")
 
 ;;; types and defaults
 
@@ -34,14 +34,8 @@
 ;; and disassembler for other supported backends,
 ;; if that backend has been converted to use a distinct ASM package.
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (defparameter sb!assem::*backend-instruction-set-package*
+  (defparameter sb-assem::*backend-instruction-set-package*
     (find-package #.(sb-cold::backend-asm-package-name))))
-
-(defvar *disassem-inst-space* nil)
-
-;;; minimum alignment of instructions, in bytes
-(defvar *disassem-inst-alignment-bytes* sb!vm:n-word-bytes)
-(declaim (type alignment *disassem-inst-alignment-bytes*))
 
 ;; How many columns of output to allow for the address preceding each line.
 ;; If NIL, use the minimum possible width for the disassembly range.
@@ -88,7 +82,7 @@
 ;;; but there's really no easy way to do that at present.
 (defconstant dchunk-bits
   #!+x86-64 56
-  #!-x86-64 sb!vm:n-word-bits)
+  #!-x86-64 sb-vm:n-word-bits)
 
 (deftype dchunk ()
   `(unsigned-byte ,dchunk-bits))
@@ -158,54 +152,6 @@
   (declare (type dchunk x))
   (logcount x))
 
-(defstruct (instruction (:conc-name inst-)
-                        (:constructor
-                         make-instruction (name format-name print-name
-                                           length mask id printer labeller
-                                           prefilters control))
-                        (:copier nil))
-  (name nil :type (or symbol string) :read-only t)
-  (format-name nil :type (or symbol string) :read-only t)
-
-  (mask dchunk-zero :type dchunk :read-only t)   ; bits in the inst that are constant
-  (id dchunk-zero :type dchunk :read-only t)     ; value of those constant bits
-
-  (length 0 :type disassem-length :read-only t)  ; in bytes
-
-  (print-name nil :type symbol :read-only t)
-
-  ;; disassembly "functions"
-  (prefilters nil :type list :read-only t)
-  (labeller nil :type (or list vector) :read-only t)
-  (printer nil :type (or null function) :read-only t)
-  (control nil :type (or null function) :read-only t)
-
-  ;; instructions that are the same as this instruction but with more
-  ;; constraints
-  (specializers nil :type list))
-(defmethod print-object ((inst instruction) stream)
-  (print-unreadable-object (inst stream :type t :identity t)
-    (format stream "~A(~A)" (inst-name inst) (inst-format-name inst))))
-
-;;;; an instruction space holds all known machine instructions in a
-;;;; form that can be easily searched
-
-(defstruct (inst-space (:conc-name ispace-)
-                       (:copier nil))
-  (valid-mask dchunk-zero :type dchunk) ; applies to *children*
-  (choices nil :type list))
-(defmethod print-object ((ispace inst-space) stream)
-  (print-unreadable-object (ispace stream :type t :identity t)))
-
-;;; now that we've defined the structure, we can declaim the type of
-;;; the variable:
-(declaim (type (or null inst-space) *disassem-inst-space*))
-
-(defstruct (inst-space-choice (:conc-name ischoice-)
-                              (:copier nil))
-  (common-id dchunk-zero :type dchunk)  ; applies to *parent's* mask
-  (subspace (missing-arg) :type (or inst-space instruction)))
-
 (defstruct (arg (:constructor %make-arg (name))
                 (:copier nil)
                 (:predicate nil))
@@ -265,7 +211,7 @@
   (ecase when
     (:compile
      ;; At compile-time we get a restricted view of the DEFINE-ARG-TYPE args,
-     ;; just enough to macroexpand :READER definitions. :TYPE and ::SIGN-EXTEND
+     ;; just enough to macroexpand :READER definitions. :TYPE and :SIGN-EXTEND
      ;; are as specified, but :PREFILTER, :LABELLER, and :PRINTER are not
      ;; compile-time evaluated.
      (loop for (indicator val) on (cdr spec) by #'cddr
@@ -357,9 +303,11 @@
         ',format-name ',include ,length-in-bits nil
         ,@(mapcar (lambda (arg) `(list ',(car arg) ,@(massage-arg arg :compile)))
                   arg-specs)))
-     ,@(mapcan
-        (lambda (arg-spec)
-          (awhen (getf (cdr arg-spec) :reader)
+     #-sb-xc-host ; Host doesn't execute any stuff that comes with
+     (progn       ; format definitions, including dchunk readers
+      ,@(mapcan
+         (lambda (arg-spec)
+           (awhen (getf (cdr arg-spec) :reader)
             `((defun ,it (dchunk dstate)
                 (declare (ignorable dchunk dstate))
                 (flet ((local-filtered-value (offset)
@@ -382,12 +330,11 @@
                                 (expr (arg-value-form arg funstate :numeric)))
                            `(let* ,(make-arg-temp-bindings funstate) ,expr))))
                     (reader)))))))
-        arg-specs)
-     #-sb-xc-host ; Host doesn't need the real definition.
-     (%def-inst-format
-      ',format-name ',include ,length-in-bits ,default-printer
-      ,@(mapcar (lambda (arg) `(list ',(car arg) ,@(massage-arg arg :eval)))
-                arg-specs))))
+         arg-specs)
+      (%def-inst-format
+       ',format-name ',include ,length-in-bits ,default-printer
+       ,@(mapcar (lambda (arg) `(list ',(car arg) ,@(massage-arg arg :eval)))
+                 arg-specs)))))
 
 (defun %def-inst-format (name inherit length printer &rest arg-specs)
   (let ((args (if inherit (copy-list (format-args (format-or-lose inherit)))))
@@ -447,7 +394,7 @@
                                    instruction-format ~W bits wide.~:>"
                              (arg-name arg) bytespec format-length))
                     (correct-dchunk-bytespec-for-endianness
-                     bytespec format-length sb!c:*backend-byte-order*))
+                     bytespec format-length sb-c:*backend-byte-order*))
                   fields)))
   arg)
 
@@ -490,7 +437,7 @@
   (labels ((tempvars (n)
              (if (plusp n)
                  (cons (package-symbolicate
-                        (load-time-value (find-package "SB!DISASSEM"))
+                        #.(find-package "SB-DISASSEM")
                         ".T" (write-to-string (incf *!temp-var-counter*)))
                        (tempvars (1- n))))))
     (let* ((arg-cell (assq arg funstate))
@@ -555,7 +502,7 @@
                                unless (eq ind :type)
                                nconc (list ind val)))))
     `(progn
-       (eval-when (:compile-toplevel)
+       (eval-when (:compile-toplevel :execute)
          (%def-arg-type ',name ,inherit ,@(massage-arg pair :compile)))
        #-sb-xc-host ; Host doesn't need the real definition.
        (%def-arg-type ',name ,inherit ,@(massage-arg pair :eval)))))
@@ -612,7 +559,8 @@
          (sub-table (assq :printer cache)))
     (or (cdr (assoc guts (cdr sub-table) :test #'equal))
         (let ((template
-     '(lambda (chunk inst stream dstate
+     `(named-lambda (inst-printer ,@*current-instruction-flavor*)
+        (chunk inst stream dstate
                &aux (chunk (truly-the dchunk chunk))
                     (inst (truly-the instruction inst))
                     (stream (truly-the stream stream))
@@ -820,20 +768,10 @@
         ((atom source)
          `(local-princ ',source))
         ((eq (car source) :using)
-         (unless (or (stringp (cadr source))
-                     (and (listp (cadr source))
-                          (eq (caadr source) 'function)))
-           (pd-error "The first arg to :USING must be a string or #'function."))
-         ;; For (:using #'F) to be stuffed in properly, the printer as expressed
-         ;; in its DSL would have to compile-time expand into a thing that
-         ;; reconstructs it such that #'F forms don't appear inside quoted list
-         ;; structure. Lacking the ability to do that, we treat #'F as a bit of
-         ;; syntax to be evaluated manually.
-         (compile-print (caddr source) funstate
-                        (let ((f (cadr source)))
-                          (if (typep f '(cons (eql function) (cons symbol null)))
-                              (symbol-function (second f))
-                              f))))
+         (let ((f (cadr source)))
+          (unless (typep f '(or string (cons (eql function) (cons symbol null))))
+            (pd-error "The first arg to :USING must be a string or #'function."))
+          (compile-print (caddr source) funstate f)))
         ((eq (car source) :plus-integer)
          ;; prints the given field proceed with a + or a -
          (let ((form
@@ -913,6 +851,8 @@
           ((eq key :negative)
            `(< ,(arg-value-form (arg-or-lose subj funstate) funstate :numeric)
                0))
+          ((eq key :test)
+           `(,@body ,(arg-value-form (arg-or-lose subj funstate) funstate :numeric)))
           ((eq key :same-as)
            (let ((arg1 (arg-or-lose subj funstate))
                  (arg2 (arg-or-lose (car body) funstate)))
@@ -939,34 +879,17 @@
           (t
            (pd-error "bogus test-form: ~S" test)))))
 
-(defun compute-mask-id (args)
-  (let ((mask dchunk-zero)
-        (id dchunk-zero))
-    (dolist (arg args (values mask id))
-      (let ((av (arg-value arg)))
-        (when av
-          (do ((fields (arg-fields arg) (cdr fields))
-               (values (if (atom av) (list av) av) (cdr values)))
-              ((null fields))
-            (let ((field-mask (dchunk-make-mask (car fields))))
-              (when (/= (dchunk-and mask field-mask) dchunk-zero)
-                (pd-error "The field ~S in arg ~S overlaps some other field."
-                          (car fields)
-                          (arg-name arg)))
-              (dchunk-insertf id (car fields) (car values))
-              (dchunk-orf mask field-mask))))))))
-
 #!-sb-fluid (declaim (inline bytes-to-bits))
-(declaim (maybe-inline sign-extend aligned-p align tab tab0))
+(declaim (maybe-inline sign-extend tab tab0))
 
 (defun bytes-to-bits (bytes)
   (declare (type disassem-length bytes))
-  (* bytes sb!vm:n-byte-bits))
+  (* bytes sb-vm:n-byte-bits))
 
 (defun bits-to-bytes (bits)
   (declare (type disassem-length bits))
   (multiple-value-bind (bytes rbits)
-      (truncate bits sb!vm:n-byte-bits)
+      (truncate bits sb-vm:n-byte-bits)
     (when (not (zerop rbits))
       (error "~W bits is not a byte-multiple." bits))
     bytes))
@@ -978,18 +901,6 @@
       (dpb int (byte size 0) -1)
       int))
 
-;;; Is ADDRESS aligned on a SIZE byte boundary?
-(defun aligned-p (address size)
-  (declare (type address address)
-           (type alignment size))
-  (zerop (logand (1- size) address)))
-
-;;; Return ADDRESS aligned *upward* to a SIZE byte boundary.
-(defun align (address size)
-  (declare (type address address)
-           (type alignment size))
-  (logandc1 (1- size) (+ (1- size) address)))
-
 (defun tab (column stream)
   (funcall (formatter "~V,1t") stream column)
   nil)
@@ -999,129 +910,3 @@
 
 (defun princ16 (value stream)
   (write value :stream stream :radix t :base 16 :escape nil))
-
-(defstruct (storage-info (:copier nil))
-  (groups nil :type list)               ; alist of (name . location-group)
-  (debug-vars #() :type vector))
-
-(defstruct (segment (:conc-name seg-)
-                    (:constructor %make-segment)
-                    (:copier nil))
-  (sap-maker (missing-arg)
-             :type (function () #-sb-xc-host system-area-pointer))
-  ;; Length in bytes of the range of memory covered by this segment.
-  (length 0 :type disassem-length)
-  (virtual-location 0 :type address)
-  (storage-info nil :type (or null storage-info))
-  ;; KLUDGE: CODE-COMPONENT is not a type the host understands
-  #-sb-xc-host (code nil :type (or null code-component))
-  (unboxed-data-range nil :type (or null (cons fixnum fixnum)))
-  (hooks nil :type list))
-
-;;; All state during disassembly. We store some seemingly redundant
-;;; information so that we can allow garbage collect during disassembly and
-;;; not get tripped up by a code block being moved...
-(defstruct (disassem-state (:conc-name dstate-)
-                           (:constructor %make-dstate)
-                           (:copier nil))
-  ;; offset of current pos in segment
-  (cur-offs 0 :type offset)
-  ;; offset of next position
-  (next-offs 0 :type offset)
-  ;; a sap pointing to our segment
-  (segment-sap nil :type (or null #-sb-xc-host system-area-pointer))
-  ;; the current segment
-  (segment nil :type (or null segment))
-  ;; to avoid buffer overrun at segment end, we might need to copy bytes
-  ;; here first because sap-ref-dchunk reads a fixed length.
-  (scratch-buf (make-array 8 :element-type '(unsigned-byte 8)))
-  ;; what to align to in most cases
-  (alignment sb!vm:n-word-bytes :type alignment)
-  (byte-order :little-endian
-              :type (member :big-endian :little-endian))
-  ;; for user code to hang stuff off of
-  (properties nil :type list)
-  ;; for user code to hang stuff off of, cleared each time after a
-  ;; non-prefix instruction is processed
-  (inst-properties nil :type (or fixnum list))
-  (filtered-values (make-array max-filtered-value-index)
-                   :type filtered-value-vector)
-  ;; to avoid consing decoded values, a prefilter can keep a chain
-  ;; of objects in these slots. The objects returned here
-  ;; are reusable for the next instruction.
-  (filtered-arg-pool-in-use)
-  (filtered-arg-pool-free)
-  ;; used for prettifying printing
-  (addr-print-len nil :type (or null (integer 0 20)))
-  (argument-column 0 :type column)
-  ;; to make output look nicer
-  (output-state :beginning
-                :type (member :beginning
-                              :block-boundary
-                              nil))
-
-  ;; alist of (address . label-number)
-  (labels nil :type list)
-  ;; same as LABELS slot data, but in a different form
-  (label-hash (make-hash-table) :type hash-table)
-  ;; list of function
-  (fun-hooks nil :type list)
-
-  ;; alist of (address . label-number), popped as it's used
-  (cur-labels nil :type list)
-  ;; OFFS-HOOKs, popped as they're used
-  (cur-offs-hooks nil :type list)
-
-  ;; for the current location
-  (notes nil :type list)
-
-  ;; currently active source variables
-  (current-valid-locations nil :type (or null (vector bit))))
-(declaim (freeze-type disassem-state))
-(defmethod print-object ((dstate disassem-state) stream)
-  (print-unreadable-object (dstate stream :type t)
-    (format stream
-            "+~W~@[ in ~S~]"
-            (dstate-cur-offs dstate)
-            (dstate-segment dstate))))
-
-;;; Return the absolute address of the current instruction in DSTATE.
-(defun dstate-cur-addr (dstate)
-  (the address (+ (seg-virtual-location (dstate-segment dstate))
-                  (dstate-cur-offs dstate))))
-
-;;; Return the absolute address of the next instruction in DSTATE.
-(defun dstate-next-addr (dstate)
-  (the address (+ (seg-virtual-location (dstate-segment dstate))
-                  (dstate-next-offs dstate))))
-
-;;; Get the value of the property called NAME in DSTATE. Also SETF'able.
-;;;
-;;; KLUDGE: The associated run-time machinery for this is in
-;;; target-disassem.lisp (much later). This is here just to make sure
-;;; it's defined before it's used. -- WHN ca. 19990701
-(defmacro dstate-get-prop (dstate name)
-  `(getf (dstate-properties ,dstate) ,name))
-
-;;; Put PROPERTY into the set of instruction properties in DSTATE.
-;;; PROPERTY can be a fixnum or symbol, but any given backend
-;;; must exclusively use one or the other property representation.
-(defun dstate-put-inst-prop (dstate property)
-  (if (fixnump property)
-      (setf (dstate-inst-properties dstate)
-            (logior (or (dstate-inst-properties dstate) 0) property))
-      (push property (dstate-inst-properties dstate))))
-
-;;; Return non-NIL if PROPERTY is in the set of instruction properties in
-;;; DSTATE. As with -PUT-INST-PROP, we can have a bitmask or a plist.
-(defun dstate-get-inst-prop (dstate property)
-  (if (fixnump property)
-      (logtest (or (dstate-inst-properties dstate) 0) property)
-      (memq property (dstate-inst-properties dstate))))
-
-(declaim (ftype function read-suffix))
-(defun read-signed-suffix (length dstate)
-  (declare (type (member 8 16 32 64) length)
-           (type disassem-state dstate)
-           (optimize (speed 3) (safety 0)))
-  (sign-extend (read-suffix length dstate) length))

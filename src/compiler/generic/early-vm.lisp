@@ -7,7 +7,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; the number of bits per byte, where a byte is the smallest
 ;;; addressable object
@@ -62,24 +62,46 @@
 ;;; a mask to extract the type from a data block header word
 (defconstant widetag-mask (1- (ash 1 n-widetag-bits)))
 
-(defconstant sb!xc:most-positive-fixnum
+(defconstant sb-xc:most-positive-fixnum
     (1- (ash 1 n-positive-fixnum-bits))
   "the fixnum closest in value to positive infinity")
-(defconstant sb!xc:most-negative-fixnum
+(defconstant sb-xc:most-negative-fixnum
     (ash -1 n-positive-fixnum-bits)
   "the fixnum closest in value to negative infinity")
 
 (defconstant most-positive-word (1- (expt 2 n-word-bits))
   "The most positive integer that is of type SB-EXT:WORD.")
 
+(defconstant maximum-bignum-length
+  ;; Compute number of bits in the maximum length's representation
+  ;; leaving one bit for a GC mark bit.
+  (ldb (byte (- n-word-bits n-widetag-bits 1) 0) -1))
+
+(defconstant sb-xc:char-code-limit #!-sb-unicode 256 #!+sb-unicode #x110000
+  "the upper exclusive bound on values produced by CHAR-CODE")
+
+(defconstant base-char-code-limit #!-sb-unicode 256 #!+sb-unicode 128)
+
+;;; the size of the chunks returned by RANDOM-CHUNK
+(defconstant n-random-chunk-bits 32)
+
+;;; Internal time format.
+;;; 61 bits should give
+;;; seventy-three million one hundred seventeen thousand eight hundred two years of runtime
+;;; It's dangerous to run SBCL for that long without updating.
+;;; And it'll be a fixnum on 64-bit targets.
+;;; The result from querying get-internal-run-time with multiple cores
+;;; running full tilt will exhaust this faster, but it's still plenty enough.
+(defconstant sb-kernel::internal-time-bits 61)
+
 (defconstant most-positive-exactly-single-float-fixnum
-  (min (expt 2 single-float-digits) sb!xc:most-positive-fixnum))
+  (min (expt 2 single-float-digits) sb-xc:most-positive-fixnum))
 (defconstant most-negative-exactly-single-float-fixnum
-  (max (- (expt 2 single-float-digits)) sb!xc:most-negative-fixnum))
+  (max (- (expt 2 single-float-digits)) sb-xc:most-negative-fixnum))
 (defconstant most-positive-exactly-double-float-fixnum
-  (min (expt 2 double-float-digits) sb!xc:most-positive-fixnum))
+  (min (expt 2 double-float-digits) sb-xc:most-positive-fixnum))
 (defconstant most-negative-exactly-double-float-fixnum
-  (max (- (expt 2 double-float-digits)) sb!xc:most-negative-fixnum))
+  (max (- (expt 2 double-float-digits)) sb-xc:most-negative-fixnum))
 
 ;;;; Point where continuous area starting at dynamic-space-start bumps into
 ;;;; next space. Computed for genesis/constants.h, not used in Lisp.
@@ -115,7 +137,7 @@
 #+sb-xc-host
 (defun fixnump (x)
   (and (integerp x)
-       (<= sb!xc:most-negative-fixnum x sb!xc:most-positive-fixnum)))
+       (<= sb-xc:most-negative-fixnum x sb-xc:most-positive-fixnum)))
 
 ;;; Helper macro for defining FIXUP-CODE-OBJECT so that its body
 ;;; can be the same between the host and target.
@@ -125,17 +147,22 @@
 (defmacro !with-bigvec-or-sap (&body body)
   `(macrolet #-sb-xc-host ()
              #+sb-xc-host
-             ((code-instructions (code) `(sb!fasl::descriptor-mem ,code))
+             ((code-instructions (code) `(sb-fasl::descriptor-mem ,code))
               (sap-int (sap)
                 ;; KLUDGE: SAP is a bigvec; it doesn't know its address.
                 ;; Note that this shadows the uncallable stub function for SAP-INT
                 ;; that placates the host when compiling 'compiler/*/move.lisp'.
                 (declare (ignore sap))
                 `(locally
-                     (declare (notinline sb!fasl::descriptor-gspace)) ; fwd ref
-                   (sb!fasl::gspace-byte-address
-                    (sb!fasl::descriptor-gspace code)))) ; use CODE, not SAP
-              (sap-ref-8 (sap offset) `(sb!fasl::bvref-8 ,sap ,offset))
-              (sap-ref-32 (sap offset) `(sb!fasl::bvref-32 ,sap ,offset))
-              (sap-ref-word (sap offset) `(sb!fasl::bvref-word ,sap ,offset)))
+                     (declare (notinline sb-fasl::descriptor-gspace)) ; fwd ref
+                   (sb-fasl::gspace-byte-address
+                    (sb-fasl::descriptor-gspace code)))) ; use CODE, not SAP
+              (sap-ref-8 (sap offset) `(sb-fasl::bvref-8 ,sap ,offset))
+              (sap-ref-32 (sap offset) `(sb-fasl::bvref-32 ,sap ,offset))
+              (sap-ref-word (sap offset) `(sb-fasl::bvref-word ,sap ,offset)))
      ,@body))
+
+#!+sb-safepoint
+;;; The offset from the fault address reported to the runtime to the
+;;; END of the global safepoint page.
+(defconstant gc-safepoint-trap-offset n-word-bytes)

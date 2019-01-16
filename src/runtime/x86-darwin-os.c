@@ -10,6 +10,7 @@
 #include "interrupt.h"
 #include "x86-darwin-os.h"
 #include "genesis/fdefn.h"
+#include "gc-internal.h" // for gencgc_handle_wp_violation
 
 #include <mach/mach.h>
 #include <mach/mach_error.h>
@@ -85,17 +86,15 @@ int arch_os_thread_init(struct thread *thread) {
 #endif
 #ifdef LISP_FEATURE_MACH_EXCEPTION_HANDLER
     mach_lisp_thread_init(thread);
-#endif
-
-#ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
+#elif defined(LISP_FEATURE_C_STACK_IS_CONTROL_STACK)
     stack_t sigstack;
 
     /* Signal handlers are run on the control stack, so if it is exhausted
      * we had better use an alternate stack for whatever signal tells us
      * we've exhausted it */
-    sigstack.ss_sp=((void *) thread)+dynamic_values_bytes;
-    sigstack.ss_flags=0;
-    sigstack.ss_size = 32*SIGSTKSZ;
+    sigstack.ss_sp    = calc_altstack_base(thread);
+    sigstack.ss_flags = 0;
+    sigstack.ss_size  = calc_altstack_size(thread;
     sigaltstack(&sigstack,0);
 #endif
     return 1;                  /* success */
@@ -378,7 +377,7 @@ catch_exception_raise(mach_port_t exception_port,
     int signal = 0;
     void (*handler)(int, siginfo_t *, os_context_t *) = NULL;
     siginfo_t siginfo;
-    kern_return_t ret, dealloc_ret;
+    kern_return_t ret = KERN_SUCCESS, dealloc_ret;
 
     struct thread *th;
 
@@ -386,7 +385,7 @@ catch_exception_raise(mach_port_t exception_port,
 
     if (mach_port_get_context(mach_task_self(), exception_port, (mach_vm_address_t *)&th)
         != KERN_SUCCESS) {
-        lose("Can't find the thread for an exception %p", exception_port);
+        lose("Can't find the thread for an exception %u", exception_port);
     }
 
     /* Get state and info */
@@ -405,6 +404,14 @@ catch_exception_raise(mach_port_t exception_port,
             break;
         }
         addr = (void*)code_vector[1];
+        /* Just need to unprotect the page and do some bookkeeping, no need
+         * to run it from the faulting thread.
+         * And because the GC uses signals to stop the world it might
+         * interfere with that bookkeeping, because there's a window
+         * before block_blockable_signals is performed. */
+        if (gencgc_handle_wp_violation(addr))
+            goto do_not_handle;
+
         /* Undefined alien */
         if (os_trunc_to_page(addr) == undefined_alien_address) {
             handler = undefined_alien_handler;
@@ -475,6 +482,15 @@ catch_exception_raise(mach_port_t exception_port,
         /* Trap call */
         handler = sigtrap_handler;
         break;
+    case EXC_BREAKPOINT:
+        if (single_stepping) {
+            signal = SIGTRAP;
+            /* Clear TF or the signal emulation wrapper won't proceed
+               with single stepping enabled. */
+            thread_state.EFLAGS &= ~0x100;
+            handler = sigtrap_handler;
+            break;
+        }
     default:
         ret = KERN_INVALID_RIGHT;
     }
@@ -485,6 +501,7 @@ catch_exception_raise(mach_port_t exception_port,
       call_handler_on_thread(thread, &thread_state, signal, &siginfo, handler);
     }
 
+  do_not_handle:
     dealloc_ret = mach_port_deallocate (mach_task_self(), thread);
     if (dealloc_ret) {
       lose("mach_port_deallocate (thread) failed with return_code %d\n", dealloc_ret);

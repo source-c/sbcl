@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 (macrolet ((def (name constructor access src-type &optional explicit-check)
              `(defun ,name (object type)
@@ -46,7 +46,7 @@
   (declare (type sequence sequence))
   (dx-let ((result (list nil)))
     (let ((splice result))
-      (sb!sequence:dosequence (elt sequence (cdr result))
+      (sb-sequence:dosequence (elt sequence (cdr result))
         (let ((cell (list elt)))
           (setf (cdr splice) cell splice cell))))))
 
@@ -121,7 +121,7 @@
            (declare (optimize allow-non-returning-tail-call))
            (error 'simple-type-error
                   :format-control "~S can't be converted to type ~
-                                    ~/sb!impl:print-type-specifier/."
+                                    ~/sb-impl:print-type-specifier/."
                   :format-arguments (list object output-type-spec)
                   :datum object
                   :expected-type output-type-spec)))
@@ -206,7 +206,7 @@
                                                          (length object))))
                ((cons-type-p type)
                 (multiple-value-bind (min exactp)
-                    (sb!kernel::cons-type-length-info type)
+                    (sb-kernel::cons-type-length-info type)
                   (let ((length (length object)))
                     (if exactp
                         (unless (= length min)
@@ -218,7 +218,7 @@
              (if (sequencep object)
                  (cond
                    ((type= type (specifier-type 'list))
-                    (sb!sequence:make-sequence-like
+                    (sb-sequence:make-sequence-like
                      nil (length object) :initial-contents object))
                    ((type= type (specifier-type 'null))
                     (if (= (length object) 0)
@@ -227,14 +227,14 @@
                                                              (length object))))
                    ((cons-type-p type)
                     (multiple-value-bind (min exactp)
-                        (sb!kernel::cons-type-length-info type)
+                        (sb-kernel::cons-type-length-info type)
                       (let ((length (length object)))
                         (if exactp
                             (unless (= length min)
                               (sequence-type-length-mismatch-error type length))
                             (unless (>= length min)
                               (sequence-type-length-mismatch-error type length)))
-                        (sb!sequence:make-sequence-like
+                        (sb-sequence:make-sequence-like
                          nil length :initial-contents object))))
                    (t (sequence-type-too-hairy (type-specifier type))))
                  (coerce-error))))
@@ -249,10 +249,10 @@
             (coerce-error))))
         ((and (csubtypep type (specifier-type 'sequence))
               (find-class output-type-spec nil))
-         (let ((prototype (sb!mop:class-prototype
-                           (sb!pcl:ensure-class-finalized
+         (let ((prototype (sb-mop:class-prototype
+                           (sb-pcl:ensure-class-finalized
                             (find-class output-type-spec)))))
-           (sb!sequence:make-sequence-like
+           (sb-sequence:make-sequence-like
             prototype (length object) :initial-contents object)))
         ((csubtypep type (specifier-type 'function))
          (coerce-to-fun object))

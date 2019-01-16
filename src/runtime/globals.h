@@ -16,7 +16,7 @@
 # include <sys/types.h>
 # include <unistd.h>
 # include "runtime.h"
-# include "runtime-options.h"
+# include "os.h"
 #endif
 
 #include "sbcl.h"
@@ -35,7 +35,23 @@ extern int foreign_function_call_active;
 extern os_vm_size_t dynamic_space_size;
 extern os_vm_size_t thread_control_stack_size;
 
-extern struct runtime_options *runtime_options;
+#if defined(LISP_FEATURE_RELOCATABLE_HEAP)
+#ifdef LISP_FEATURE_CHENEYGC
+extern uword_t DYNAMIC_0_SPACE_START, DYNAMIC_1_SPACE_START;
+#else
+extern uword_t DYNAMIC_SPACE_START;
+#endif
+#endif
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+extern uword_t FIXEDOBJ_SPACE_START, VARYOBJ_SPACE_START;
+extern uword_t immobile_space_lower_bound, immobile_space_max_offset;
+extern uword_t immobile_range_1_max_offset, immobile_range_2_min_offset;
+extern unsigned int varyobj_space_size;
+#endif
+
+extern boolean alloc_profiling;
+extern os_vm_address_t alloc_profile_buffer;
+extern lispobj alloc_profile_data; // Lisp SIMPLE-VECTOR
 
 #ifdef LISP_FEATURE_WIN32
 #define ENVIRON _environ
@@ -75,8 +91,8 @@ extern lispobj *dynamic_space_free_pointer;
 extern lispobj *read_only_space_free_pointer;
 extern lispobj *static_space_free_pointer;
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
-extern lispobj *immobile_space_free_pointer;
-extern lispobj *immobile_fixedobj_free_pointer;
+extern lispobj *varyobj_free_pointer;
+extern lispobj *fixedobj_free_pointer;
 #endif
 extern os_vm_address_t anon_dynamic_space_start;
 
@@ -118,7 +134,7 @@ extern void globals_init(void);
 #  endif
 # endif
 /**/
-# ifdef LISP_FEATURE_PPC
+# if defined(LISP_FEATURE_PPC) || defined(LISP_FEATURE_PPC64)
 #  ifdef LISP_FEATURE_DARWIN
 #   define EXTERN(name,bytes) .globl _ ## name
 #  else

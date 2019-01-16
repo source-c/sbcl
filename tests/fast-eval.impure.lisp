@@ -18,6 +18,10 @@
 
 (in-package sb-interpreter)
 
+(test-util:with-test (:name :write-bogus-function-instance)
+  (write-to-string
+   (sb-pcl::class-prototype (find-class 'sb-interpreter:interpreted-function))))
+
 (test-util:with-test (:name :type-checker-for-function)
   ;; The test for (FUNCTION (HAIR) (MORE-HAIR)) is just FUNCTIONP.
   ;; The test for not that is (NOT FUNCTION).
@@ -285,3 +289,26 @@
                     (search "exited tagbody"
                             (simple-condition-format-control c)))))
      (:no-error (&rest whatever) (error "Expected an error"))))
+
+(test-util:with-test (:name :argless-lambda)
+  (assert (eq ((lambda () (declare (special *some-var*)) (setq *some-var* t)))
+              t)))
+
+(test-util:with-test (:name :typecheck-symbol-not-null)
+  (funcall (lambda (x) (the (and symbol (not null)) x))
+           'foo))
+
+(defstruct testme x)
+(let ((f #'testme-x))
+  (let ((source-loc (sb-interpreter:fun-source-location f)))
+    (setf (slot-value source-loc 'sb-c::namestring) "myfile.lisp")))
+(defun foo (s) (testme-x s))
+(test-util:with-test (:name :source-namestring)
+  (assert (string= (sb-kernel::function-file-namestring #'testme-x)
+                   "myfile.lisp"))
+  (foo (make-testme))
+  ;; check that implicit compilation happened
+  (assert (= (sb-kernel:widetag-of #'testme-x) sb-vm:simple-fun-widetag))
+  ;; check that source location namestring was preserved
+  (assert (string= (sb-kernel::function-file-namestring #'testme-x)
+                   "myfile.lisp")))

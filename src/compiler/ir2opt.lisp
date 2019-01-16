@@ -11,11 +11,11 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; We track pred/succ info at the IR2-block level, extrapolating
 ;;; most of the data from IR1 to initialise.
-(declaim (type hash-table *block-info*))
+(declaim (type hash-table *2block-info*))
 ;;; For blocks it's a cons with (pred . succ)
 ;;; For labels it maps to the label block
 (defvar *2block-info*)
@@ -121,7 +121,6 @@
 ;; 3. Execute the chosen conditional move VOP
 ;; 4. Convert the result from the common representation
 ;; 5. Jump to the successor
-#!-sb-fluid (declaim (inline convert-one-cmov))
 (defun convert-one-cmov (cmove-vop
                          value-if arg-if
                          value-else arg-else
@@ -129,54 +128,74 @@
                          flags info
                          label
                          vop node 2block)
-  (delete-vop vop)
-  (flet ((load-and-coerce (dst src)
-           (when (and dst (neq dst src))
-             (emit-and-insert-vop node 2block
-                                  (template-or-lose 'move)
-                                  (reference-tn src nil)
-                                  (reference-tn dst t)
-                                  (ir2-block-last-vop 2block)))))
-    (load-and-coerce arg-if   value-if)
-    (load-and-coerce arg-else value-else))
-  (emit-template node 2block (template-or-lose cmove-vop)
-                 (reference-tn-list (remove nil (list arg-if arg-else))
-                                    nil)
-                 (reference-tn res t)
-                 (list* flags info))
-  (emit-move node 2block res target)
-  (vop branch node 2block label)
-  (update-block-succ 2block (list label)))
+  (let ((prev (vop-prev vop)))
+    (delete-vop vop)
+    (flet ((reuse-if-eq-arg (value-if vop)
+             ;; Most of the time this means:
+             ;; if X is already NIL, don't load it again.
+             (when (and (eq (vop-name vop) 'if-eq)
+                        (constant-tn-p value-if))
+               (let* ((args (vop-args vop))
+                      (x-tn (tn-ref-tn args))
+                      (test (tn-ref-tn (tn-ref-across args))))
+                 (when (and (constant-tn-p test)
+                            (equal (tn-value value-if)
+                                   (tn-value test))
+                            (eq (tn-primitive-type x-tn)
+                                (tn-primitive-type res)))
+                   x-tn))))
+           (load-and-coerce (dst src)
+             (when (and dst (neq dst src))
+               (emit-and-insert-vop node 2block
+                                    (template-or-lose 'move)
+                                    (reference-tn src nil)
+                                    (reference-tn dst t)
+                                    (ir2-block-last-vop 2block)))))
+      (let ((reuse (reuse-if-eq-arg value-if prev)))
+        (if reuse
+            (setf arg-if reuse)
+            (load-and-coerce arg-if   value-if)))
+      (load-and-coerce arg-else value-else))
+    (emit-template node 2block (template-or-lose cmove-vop)
+                   (reference-tn-list (remove nil (list arg-if arg-else))
+                                      nil)
+                   (reference-tn res t)
+                   (list* flags info))
+    (emit-move node 2block res target)
+    (vop branch node 2block label)
+    (update-block-succ 2block (list label))))
 
 ;; Since conditional branches are always at the end of blocks,
 ;; it suffices to look at the last VOP in each block.
 (defun maybe-convert-one-cmov (2block)
-  (let* ((block (ir2-block-block 2block))
-         (succ (block-succ block))
-         (a    (first succ))
-         (b    (second succ))
-         (vop  (or (ir2-block-last-vop 2block)
-                   (return-from maybe-convert-one-cmov)))
-         (node (vop-node vop)))
+  (let ((vop (or (ir2-block-last-vop 2block)
+                 (return-from maybe-convert-one-cmov))))
     (unless (eq (vop-name vop) 'branch-if)
       (return-from maybe-convert-one-cmov))
-    (destructuring-bind (jump-target flags not-p) (vop-codegen-info vop)
-      (multiple-value-bind (label target value-a value-b)
-          (cmovp jump-target a b)
-        (unless label
-          (return-from maybe-convert-one-cmov))
-        (multiple-value-bind (cmove-vop arg-a arg-b res info)
-            (convert-conditional-move-p node target value-a value-b)
-          (unless cmove-vop
+    ;; The test and branch-if may be split between two IR1 blocks
+    ;; due to cleanups, can't use bloc-succ of the ir2-block-block
+    (let* ((node (vop-node vop))
+           (succ (block-succ (node-block node)))
+           (a    (first succ))
+           (b    (second succ)))
+
+      (destructuring-bind (jump-target not-p flags) (vop-codegen-info vop)
+        (multiple-value-bind (label target value-a value-b)
+            (cmovp jump-target a b)
+          (unless label
             (return-from maybe-convert-one-cmov))
-          (when not-p
-            (rotatef value-a value-b)
-            (rotatef arg-a arg-b))
-          (convert-one-cmov cmove-vop value-a arg-a
-                                      value-b arg-b
-                                      target  res
-                                      flags info
-                            label vop node 2block))))))
+          (multiple-value-bind (cmove-vop arg-a arg-b res info)
+              (convert-conditional-move-p node target value-a value-b)
+            (unless cmove-vop
+              (return-from maybe-convert-one-cmov))
+            (when not-p
+              (rotatef value-a value-b)
+              (rotatef arg-a arg-b))
+            (convert-one-cmov cmove-vop value-a arg-a
+                              value-b arg-b
+                              target  res
+                              flags info
+                              label vop node 2block)))))))
 
 (defun convert-cmovs (component)
   (do-ir2-blocks (2block component (values))
@@ -232,12 +251,120 @@
         (when (jump-falls-through-p 2block)
           (delete-vop (ir2-block-last-vop 2block)))))))
 
+(defun delete-no-op-vops (component)
+  (do-ir2-blocks (block component)
+    (do ((vop (ir2-block-start-vop block) (vop-next vop)))
+        ((null vop))
+      (let ((args (vop-args vop))
+            (results (vop-results vop)))
+       (case (vop-name vop)
+         ((move sb-vm::sap-move)
+          (let ((x (tn-ref-tn args))
+                (y (tn-ref-tn results)))
+            (when (location= x y)
+              (delete-vop vop)))))))))
+
+;;; Unchain BRANCHes that jump to a BRANCH.
+;;; Remove BRANCHes that are jumped over by BRANCH-IF
+;;; Should be run after DELETE-NO-OP-VOPS, otherwise the empty moves
+;;; will interfere.
+(defun ir2-optimize-jumps (component)
+  (flet ((start-vop (block)
+           (do ((block block (ir2-block-next block)))
+               ((null block) nil)
+             (when (ir2-block-start-vop block)
+               (return (ir2-block-start-vop block)))))
+         (next-label (block)
+           (do ((block (ir2-block-next block)
+                  (ir2-block-next block)))
+               ((null block) nil)
+             (let ((label (or (ir2-block-%trampoline-label block)
+                              (ir2-block-%label block))))
+               (cond (label
+                      (return label))
+                     ((ir2-block-start-vop block)
+                      (return nil)))))))
+    (let ((label-block-map (make-hash-table :test #'eq)))
+      (do-ir2-blocks (block component)
+        (setf (gethash (ir2-block-%trampoline-label block) label-block-map)
+              block)
+        (setf (gethash (ir2-block-%label block) label-block-map)
+              block))
+      (labels ((unchain-jumps (vop)
+                 (let* ((target (first (vop-codegen-info vop)))
+                        (target-block (gethash target label-block-map))
+                        (target-vop (start-vop target-block)))
+                   (when (and target-vop
+                              (eq (vop-name target-vop) 'branch)
+                              (neq target
+                                   (first (vop-codegen-info target-vop))))
+                     (setf (first (vop-codegen-info vop))
+                           (first (vop-codegen-info target-vop)))
+                     ;; What if it jumps to a jump too?
+                     (unchain-jumps vop))))
+               (remove-jump-overs (branch-if branch)
+                 ;; Turn BRANCH-IF L1 BRANCH L2 L1: into BRANCH-IF[NOT] L2
+                 (when (and branch
+                            (eq (vop-name branch) 'branch))
+                   (let* ((branch-if-info (vop-codegen-info branch-if))
+                          (branch-if-target (first branch-if-info))
+                          (branch-target (first (vop-codegen-info branch)))
+                          (next (next-label (vop-block branch))))
+                     (when (eq branch-if-target next)
+                       (setf (first branch-if-info) branch-target)
+                       ;; Reverse the condition
+                       (setf (second branch-if-info) (not (second branch-if-info)))
+                       (delete-vop branch)))))
+               (conditional-p (vop)
+                 (let ((info (vop-info vop)))
+                   (eq (vop-info-result-types info) :conditional))))
+        (do-ir2-blocks (block component)
+          (let ((last (ir2-block-last-vop block)))
+            (case (and last
+                       (vop-name last))
+              (branch
+                  (unchain-jumps last)
+                ;; A block may end up having BRANCH-IF BRANCH after coverting an IF
+                (let ((prev (vop-prev last)))
+                  (when (and prev
+                             (or (eq (vop-name prev) 'branch-if)
+                                 (conditional-p prev)))
+                    (unchain-jumps prev))))
+              (branch-if
+               (unchain-jumps last))
+              (t
+               (when (and last
+                          (conditional-p last))
+                 (unchain-jumps last))))))
+        ;; Need to unchain the jumps before handling jump-overs,
+        ;; otherwise the BRANCH over which BRANCH-IF jumps may be a
+        ;; target of some other BRANCH
+        (do-ir2-blocks (block component)
+          (let ((last (ir2-block-last-vop block)))
+            (case (and last
+                       (vop-name last))
+              (branch-if
+               (remove-jump-overs last
+                                  (start-vop (ir2-block-next block))))
+              (branch
+                  ;; A block may end up having BRANCH-IF BRANCH after coverting an IF
+                  (let ((prev (vop-prev last)))
+                    (when (and prev
+                               (or (eq (vop-name prev) 'branch-if)
+                                   (conditional-p prev)))
+                      (remove-jump-overs prev last))))
+              (t
+               (when (and last
+                          (conditional-p last))
+                 (remove-jump-overs last
+                                    (start-vop (ir2-block-next block))))))))
+        (delete-fall-through-jumps component)))))
+
 (defun ir2-optimize (component)
   (let ((*2block-info*  (make-hash-table :test #'eq)))
     (initialize-ir2-blocks-flow-info component)
 
     (convert-cmovs component)
-    (delete-unused-ir2-blocks component)
-    (delete-fall-through-jumps component))
+    (delete-unused-ir2-blocks component))
 
   (values))

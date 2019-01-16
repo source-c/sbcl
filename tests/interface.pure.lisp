@@ -11,15 +11,12 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(in-package :cl-user)
-
-(load "test-util.lisp")
-(load "compiler-test-util.lisp")
-(use-package :test-util)
 
 ;;;; properties of symbols, e.g. presence of doc strings for public symbols
 
-(with-test (:name (documentation :cl) :skipped-on '(:not :sb-doc))
+(enable-test-parallelism)
+
+(with-test (:name (documentation :cl) :skipped-on (:not :sb-doc))
   (let ((n 0))
     (do-symbols (s 'cl)
       (if (fboundp s)
@@ -28,6 +25,16 @@
     (assert (= n 594))))
 
 ;;;; tests of interface machinery
+
+(with-test (:name :defthingy-fail-early)
+  (dolist (form '((defun "hi" 3)
+                  (defconstant "hi" 3)
+                  (defvar "hi" 3)
+                  (define-modify-macro "hi" :operator 'wat)))
+    (multiple-value-bind (exp err) (ignore-errors (macroexpand-1 form))
+      (assert (and (not exp)
+                   (search "is not"
+                           (write-to-string err :escape nil)))))))
 
 ;;; APROPOS should accept a package designator, not just a package, and
 ;;; furthermore do the right thing when it gets a package designator.
@@ -71,7 +78,7 @@
   (assert (not (special-operator-p 'declare))))
 
 ;;; WITH-TIMEOUT should accept more than one form in its body.
-(with-test (:name (sb-ext:with-timeout :forms))
+(with-test (:name (sb-ext:with-timeout :forms) :slow t)
   (handler-bind ((sb-ext:timeout #'continue))
     (sb-ext:with-timeout 3
       (sleep 2)
@@ -79,8 +86,8 @@
 
 ;;; SLEEP should not cons except on 32-bit platforms when
 ;;; (> (mod seconds 1) (* most-positive-fixnum 1e-9))
-(with-test (:name (sleep :non-consing) :fails-on :win32
-                  :skipped-on :interpreter)
+(with-test (:name (sleep :non-consing)
+            :serial t :skipped-on :interpreter)
   (handler-case (sb-ext:with-timeout 5
                   (ctu:assert-no-consing (sleep 0.00001s0))
                   (locally (declare (notinline sleep))
@@ -158,7 +165,7 @@
 ;;; comprehensive test.
 (with-test (:name (sb-ext:gc :minimal :stress))
   (loop repeat 2
-     do (compile nil '(lambda (x) x))
+     do (checked-compile '(lambda (x) x))
      do (sb-ext:gc :full t)))
 
 ;;; On x86-64, the instruction definitions for CMP*[PS][SD] were broken
@@ -176,12 +183,12 @@
                     (the (complex single-float) y)))
                :stream (make-broadcast-stream)))
 
-;;; Data in the high bits of a fun header caused CODE-N-UNBOXED-DATA-WORDS
+;;; Data in the high bits of a fun header caused CODE-N-UNBOXED-DATA-BYTES
 ;;; to return a ridiculously huge value.
 (with-test (:name (disassemble :unboxed-data))
-  (assert (< (sb-kernel:code-n-unboxed-data-words
+  (assert (< (sb-kernel:code-n-unboxed-data-bytes
               (sb-kernel:fun-code-header #'expt))
-             100))) ; The exact value is irrelevant.
+             150))) ; The exact value is irrelevant.
 
 #+x86-64
 ;; The labeler for LEA would choke on an illegal encoding
@@ -211,25 +218,12 @@
     (assert (string= string1 string2)))))
 
 (with-test (:name :disassemble-assembly-routine)
-  (let ((code
-         #+immobile-space
-         (elt sb-fasl::*assembler-objects* 0)
-         #-immobile-space
-         (block nil
-           (sb-vm::map-allocated-objects
-            (lambda (obj type size)
-              (declare (ignore size))
-              (when (= type sb-vm:code-header-widetag)
-                (return obj)))
-            :read-only))))
-    (assert code) ; found something to disassemble
-    (sb-disassem:disassemble-code-component code
-     :stream (make-broadcast-stream))))
+  (disassemble sb-fasl:*assembler-routines* :stream (make-broadcast-stream)))
 
 ;;; This tests that the x86-64 disasembler does not crash
 ;;; on LEA with a rip-relative operand and no label.
-(with-test (:name :disassemble-no-labels
-                  :skipped-on '(not :x86-64))
+(with-test (:name (disassemble :no-labels)
+                  :skipped-on (not :x86-64))
   (let* ((lines
           (split-string
            (with-output-to-string (stream)
@@ -270,14 +264,12 @@
 (with-test (:name :bug-1095483)
   (assert-error (fboundp '(cas "foo"))))
 
-(with-test (:name :sleep-return-value)
-  (assert (equal (multiple-value-list
-                  (funcall
-                   (checked-compile `(lambda ()
-                                       (sleep 0.1)))))
-                 '(nil))))
+(with-test (:name (sleep :return-value))
+  (checked-compile-and-assert ()
+      `(lambda () (sleep 0.001))
+    (() nil)))
 
-(with-test (:name :time-no-print-length-abbreviation)
+(with-test (:name (time :no *print-length* :abbreviation))
   (let ((s (make-string-output-stream)))
     (let ((*trace-output* s))
       (time (progn)))
@@ -288,3 +280,23 @@
 (with-test (:name :split-seconds-for-sleep)
   (assert (< (nth-value 1 (sb-impl::split-seconds-for-sleep 7.2993028420866d7))
              1000000000)))
+#+x86-64
+(with-test (:name :restart-invalid-arg-counts.1)
+  (handler-bind ((error (lambda (c)
+                          (invoke-restart (find-restart 'sb-kernel::replace-function c) 'list))))
+    (assert (equal (eval '(cons 324)) '(324)))))
+
+#+x86-64
+(with-test (:name :restart-invalid-arg-counts.2)
+  (handler-bind ((error (lambda (c)
+                          (invoke-restart (find-restart 'sb-kernel::call-form c) 123))))
+    (assert (= (eval '(cons 1)) 123))))
+
+(with-test (:name :restart-bogus-arg-to-values-list-error
+                  :broken-on (not (or :x86 :x86-64 :arm :arm64)))
+  (let ((fun (checked-compile `(lambda (x) (values-list x)))))
+    (assert (equal (handler-bind ((sb-kernel::values-list-argument-error
+                                   #'continue))
+                     (multiple-value-list
+                      (funcall fun '(1 2 3 4 5 6 7 8 . 10))))
+                   '(1 2 3 4 5 6 7 8)))))

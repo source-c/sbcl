@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; NUMBER-STACK-DISPLACEMENT
 ;;;
@@ -83,6 +83,12 @@
   (defregset descriptor-regs
       fdefn a0 a1 a2 a3  ocfp lra cname lexenv l0 l1 #!-sb-thread l2 )
 
+  ;; OAOOM: Same as runtime/ppc-lispregs.h
+  (defregset boxed-regs
+      fdefn code cname lexenv ocfp lra
+      a0 a1 a2 a3
+      l0 l1 #!-sb-thread l2 #!+sb-thread thread)
+
 
  (defregset *register-arg-offsets*  a0 a1 a2 a3)
  (defparameter register-arg-names '(a0 a1 a2 a3)))
@@ -91,12 +97,14 @@
 
 ;;;; SB and SC definition:
 
+(!define-storage-bases
 (define-storage-base registers :finite :size 32)
 (define-storage-base float-registers :finite :size 32)
 (define-storage-base control-stack :unbounded :size 8)
 (define-storage-base non-descriptor-stack :unbounded :size 0)
 (define-storage-base constant :non-packed)
 (define-storage-base immediate-constant :non-packed)
+)
 
 (!define-storage-classes
 
@@ -253,21 +261,21 @@
 (defun immediate-constant-sc (value)
   (typecase value
     ((integer 0 0)
-     (sc-number-or-lose 'zero))
+     zero-sc-number)
     (null
-     (sc-number-or-lose 'null))
-    ((or (integer #.sb!xc:most-negative-fixnum #.sb!xc:most-positive-fixnum)
+     null-sc-number)
+    ((or (integer #.sb-xc:most-negative-fixnum #.sb-xc:most-positive-fixnum)
          character)
-     (sc-number-or-lose 'immediate))
+     immediate-sc-number)
     (symbol
      (if (static-symbol-p value)
-         (sc-number-or-lose 'immediate)
+         immediate-sc-number
          nil))))
 
 (defun boxed-immediate-sc-p (sc)
-  (or (eql sc (sc-number-or-lose 'zero))
-      (eql sc (sc-number-or-lose 'null))
-      (eql sc (sc-number-or-lose 'immediate))))
+  (or (eql sc zero-sc-number)
+      (eql sc null-sc-number)
+      (eql sc immediate-sc-number)))
 
 ;;; A predicate to see if a character can be used as an inline
 ;;; constant (the immediate field in the instruction used is sixteen
@@ -280,8 +288,8 @@
 ;;;; function call parameters
 
 ;;; the SC numbers for register and stack arguments/return values
-(defconstant immediate-arg-scn (sc-number-or-lose 'any-reg))
-(defconstant control-stack-arg-scn (sc-number-or-lose 'control-stack))
+(defconstant immediate-arg-scn any-reg-sc-number)
+(defconstant control-stack-arg-scn control-stack-sc-number)
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 
@@ -334,12 +342,12 @@
       (immediate-constant "Immed"))))
 
 (defun combination-implementation-style (node)
-  (declare (type sb!c::combination node))
+  (declare (type sb-c::combination node))
   (flet ((valid-funtype (args result)
-           (sb!c::valid-fun-use node
-                                (sb!c::specifier-type
+           (sb-c::valid-fun-use node
+                                (sb-c::specifier-type
                                  `(function ,args ,result)))))
-    (case (sb!c::combination-fun-source-name node)
+    (case (sb-c::combination-fun-source-name node)
       (logtest
        (cond
          ((or (valid-funtype '(fixnum fixnum) '*)
@@ -363,10 +371,10 @@
                                       ,type)
                                     'fixnum)
                      (destructuring-bind (size posn integer)
-                         (sb!c::basic-combination-args node)
+                         (sb-c::basic-combination-args node)
                        (declare (ignore integer))
-                       (<= (+ (sb!c::lvar-value size)
-                              (sb!c::lvar-value posn))
+                       (<= (+ (sb-c::lvar-value size)
+                              (sb-c::lvar-value posn))
                            width)))))
          (if (or (validp 'fixnum 29)
                  (validp '(signed-byte 32) 32)

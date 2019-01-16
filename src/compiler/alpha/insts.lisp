@@ -9,18 +9,16 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!ALPHA-ASM")
+(in-package "SB-ALPHA-ASM")
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   ;; Imports from this package into SB-VM
-  (import '(reg-tn-encoding) "SB!VM")
+  (import '(reg-tn-encoding) "SB-VM")
   ;; Imports from SB-VM into this package
-  (import '(sb!vm::zero sb!vm::fp-single-zero sb!vm::fp-double-zero
-            sb!vm::registers sb!vm::float-registers
-            sb!vm::zero-tn sb!vm::fp-single-zero-tn sb!vm::fp-double-zero-tn
-            sb!vm::zero-offset sb!vm::null-offset sb!vm::code-offset)))
-
-(setf *disassem-inst-alignment-bytes* 4)
+  (import '(sb-vm::zero sb-vm::fp-single-zero sb-vm::fp-double-zero
+            sb-vm::registers sb-vm::float-registers
+            sb-vm::zero-tn sb-vm::fp-single-zero-tn sb-vm::fp-double-zero-tn
+            sb-vm::zero-offset sb-vm::null-offset sb-vm::code-offset)))
 
 
 ;;;; utility functions
@@ -54,7 +52,7 @@
        (lambda (name)
          (cond ((null name) nil)
                (t (make-symbol (concatenate 'string "$" name)))))
-       sb!vm::*register-names*))
+       sb-vm::*register-names*))
 
 (define-arg-type reg
   :printer (lambda (value stream dstate)
@@ -480,31 +478,6 @@
 (define-instruction imb (segment)
   (:emitter (emit-lword segment #x00000086)))
 
-(defun bugchk-trap-control (chunk inst stream dstate)
-  (declare (ignore inst))
-  (flet ((nt (x) (if stream (note x dstate))))
-    (case (bugchk-trap-code chunk dstate)
-      (#.halt-trap
-       (nt "Halt trap"))
-      (#.pending-interrupt-trap
-       (nt "Pending interrupt trap"))
-      (#.error-trap
-       (nt "Error trap")
-       (handle-break-args #'snarf-error-junk stream dstate))
-      (#.cerror-trap
-       (nt "Cerror trap")
-       (handle-break-args #'snarf-error-junk stream dstate))
-      (#.breakpoint-trap
-       (nt "Breakpoint trap"))
-      (#.fun-end-breakpoint-trap
-       (nt "Function end breakpoint trap"))
-      (#.single-step-breakpoint-trap
-       (nt "Single step breakpoint trap"))
-      (#.single-step-around-trap
-       (nt "Single step around trap"))
-      (#.single-step-before-trap
-       (nt "Single step before trap")))))
-
 (define-instruction gentrap (segment code)
   (:printer bugchk () :default
             :control #'bugchk-trap-control)
@@ -654,7 +627,8 @@
   (emit-chooser
    ;; We emit either 12 or 4 bytes, so we maintain 8 byte alignments.
    segment 12 3
-   (lambda (segment posn delta-if-after)
+   (lambda (segment chooser posn delta-if-after)
+     (declare (ignore chooser))
      (let ((delta (funcall calc label posn delta-if-after)))
        (when (<= (- (ash 1 15)) delta (1- (ash 1 15)))
          (emit-back-patch segment 4

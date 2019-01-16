@@ -11,9 +11,6 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(load "assertoid.lisp")
-(use-package "ASSERTOID")
-
 ;;; type errors for inappropriate stream arguments, fixed in
 ;;; sbcl-0.7.8.19
 (with-test (:name (make-two-way-stream type-error))
@@ -583,7 +580,7 @@
     (delete-file pathname)))
 
 (with-test (:name (:bivalent stream unread-char read-byte :utf8)
-            :skipped-on '(:not :sb-unicode))
+            :skipped-on (:not :sb-unicode))
   (let ((pathname "bivalent-stream-unread-char-test.tmp"))
     (with-open-file (s pathname
                        :element-type :default
@@ -596,7 +593,7 @@
     (delete-file pathname)))
 
 (with-test (:name (:bivalent stream unread-char read-sequence :utf8)
-            :skipped-on '(:not :sb-unicode))
+            :skipped-on (:not :sb-unicode))
   (let ((pathname "bivalent-stream-unread-char-test.tmp"))
     (with-open-file (s pathname
                        :element-type :default
@@ -705,7 +702,7 @@
            (setf fifo nil))))
      sb-impl::*external-formats*)))
 
-(with-test (:name :bug-657183 :skipped-on '(not :sb-unicode))
+(with-test (:name :bug-657183 :skipped-on (not :sb-unicode))
   #+sb-unicode
   (let ((name (merge-pathnames "stream-impure.temp-test"))
         (text '(#\GREEK_SMALL_LETTER_LAMDA

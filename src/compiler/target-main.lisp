@@ -11,7 +11,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; CL:COMPILE
 
@@ -22,7 +22,7 @@
 (defun actually-compile (name form *lexenv* source-info tlf errorp)
   (let ((source-paths (when source-info *source-paths*)))
     (with-compilation-values
-      (sb!xc:with-compilation-unit ()
+      (sb-xc:with-compilation-unit ()
         ;; FIXME: These bindings were copied from SUB-COMPILE-FILE with
         ;; few changes. Once things are stable, the shared bindings
         ;; probably be merged back together into some shared utility
@@ -41,12 +41,12 @@
                   (*toplevel-lambdas* ())
                   (*block-compile* nil)
                   (*allow-instrumenting* nil)
-                  (*code-coverage-records* nil)
-                  (*code-coverage-blocks* nil)
+                  (*compiler-coverage-metadata* nil)
+                  (*msan-unpoison*
+                   (and (member :msan *features*)
+                        (find-dynamic-foreign-symbol-address "__msan_unpoison")))
                   (*current-path* nil)
-                  (*last-format-string* nil)
-                  (*last-format-args* nil)
-                  (*last-message-count* 0)
+                  (*last-message-count* (list* 0 nil nil))
                   (*last-error-context* nil)
                   (*gensym-counter* 0)
                   ;; KLUDGE: This rebinding of policy is necessary so that
@@ -81,10 +81,9 @@
                          ;; the error came from, not how the compiler got there.
                          (go :error))))
                  (return
-                   (with-world-lock ()
                      (%compile form (make-core-object)
                                :name name
-                               :path `(original-source-start 0 ,tlf))))))
+                               :path `(original-source-start 0 ,tlf)))))
            :error
              ;; Either signal the error right away, or return a function that
              ;; will signal the corresponding COMPILED-PROGRAM-ERROR. This is so
@@ -109,11 +108,11 @@
   (multiple-value-bind (sexpr lexenv)
       (typecase definition
         #!+sb-fasteval
-        (sb!interpreter:interpreted-function
-         (sb!interpreter:prepare-for-compile definition))
+        (sb-interpreter:interpreted-function
+         (sb-interpreter:prepare-for-compile definition))
         #!+sb-eval
-        (sb!eval:interpreted-function
-         (sb!eval:prepare-for-compile definition))
+        (sb-eval:interpreted-function
+         (sb-eval:prepare-for-compile definition))
         (t
          (values definition lexenv)))
     (multiple-value-bind (compiled-definition warnings-p failure-p)
@@ -323,3 +322,25 @@ not STYLE-WARNINGs occur during compilation, and NIL otherwise.
                      #'< :key 'caar))))
         (recurse path-to-find (cdaar list) (cdr list))))
     start-char))
+
+;;;; Coverage helpers
+
+(defun record-code-coverage (namestring cc)
+  (setf (gethash namestring (car *code-coverage-info*)) cc))
+
+(defun clear-code-coverage ()
+  (clrhash (car *code-coverage-info*))
+  (setf (cdr *code-coverage-info*) nil))
+
+(defun reset-code-coverage ()
+  (maphash (lambda (info cc)
+             (declare (ignore info))
+             (dolist (cc-entry cc)
+               (setf (cdr cc-entry) +code-coverage-unmarked+)))
+           (car *code-coverage-info*)))
+
+(defun code-coverage-record-marked (record)
+  (aver (consp record))
+  (ecase (cdr record)
+    ((#.+code-coverage-unmarked+) nil)
+    ((t) t)))

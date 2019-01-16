@@ -9,13 +9,13 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 (defun time-reinit ()
   (reinit-internal-real-time))
 
 ;;; Implemented in unix.lisp and win32.lisp.
-(setf (fdocumentation 'get-internal-real-time 'function)
+(setf (documentation 'get-internal-real-time 'function)
       "Return the real time (\"wallclock time\") since startup in the internal
 time format. (See INTERNAL-TIME-UNITS-PER-SECOND.)")
 
@@ -145,7 +145,7 @@ format."
   (multiple-value-bind (seconds-west daylight)
       (if time-zone
           (values (* time-zone 60 60) nil)
-          (sb!unix::get-timezone (truncate-to-unix-range universal-time)))
+          (sb-unix::get-timezone (truncate-to-unix-range universal-time)))
     (declare (fixnum seconds-west))
     (multiple-value-bind (weeks secs)
         (truncate (+ (- universal-time seconds-west) seconds-offset)
@@ -193,7 +193,7 @@ format."
           (truncate years 100))
        (truncate (+ years 300) 400))))
 
-(defglobal **days-before-month**
+(defconstant +days-before-month+
   #.(let ((reversed-result nil)
           (sum 0))
       (push nil reversed-result)
@@ -201,8 +201,6 @@ format."
         (push sum reversed-result)
         (incf sum days-in-month))
       (coerce (nreverse reversed-result) 'simple-vector)))
-
-(declaim (type (simple-vector 13) **days-before-month**))
 
 (defun encode-universal-time (second minute hour date month year
                                      &optional time-zone)
@@ -224,7 +222,7 @@ format."
                    year))
          (days (+ (1- date)
                   (truly-the (mod 335)
-                             (svref **days-before-month** month))
+                             (svref +days-before-month+ month))
                   (if (> month 2)
                       (leap-years-before (1+ year))
                       (leap-years-before year))
@@ -234,15 +232,14 @@ format."
     (if time-zone
         (setf encoded-time (+ second (* (+ minute (* (+ hours time-zone) 60)) 60)))
         (let* ((secwest-guess
-                (sb!unix::get-timezone
-                 (truncate-to-unix-range (* hours 60 60))))
+                 (sb-unix::get-timezone
+                  (truncate-to-unix-range (* hours 60 60))))
                (guess (+ second (* 60 (+ minute (* hours 60)))
                          secwest-guess))
                (secwest
-                (sb!unix::get-timezone
-                 (truncate-to-unix-range guess))))
+                 (sb-unix::get-timezone
+                  (truncate-to-unix-range guess))))
           (setf encoded-time (+ guess (- secwest secwest-guess)))))
-    (assert (typep encoded-time '(integer 0)))
     encoded-time))
 
 ;;;; TIME
@@ -315,7 +312,7 @@ normally during operations like SLEEP."
 
 ;;; Return all the data that we want TIME to report.
 (defun time-get-sys-info ()
-  (multiple-value-bind (user sys faults) (sb!sys:get-system-info)
+  (multiple-value-bind (user sys faults) (get-system-info)
     (values user sys faults (get-bytes-consed))))
 
 (defun elapsed-cycles (h0 l0 h1 l1)
@@ -328,7 +325,7 @@ normally during operations like SLEEP."
 (declaim (inline read-cycle-counter))
 (defun read-cycle-counter ()
   #!+cycle-counter
-  (sb!vm::%read-cycle-counter)
+  (sb-vm::%read-cycle-counter)
   #!-cycle-counter
   (values 0 0))
 
@@ -424,6 +421,7 @@ returns values returned by FUNCTION.
       NIL.)
 
 EXPERIMENTAL: Interface subject to change."
+  (declare (dynamic-extent timer function))
   (let (old-run-utime
         new-run-utime
         old-run-stime
@@ -467,9 +465,9 @@ EXPERIMENTAL: Interface subject to change."
     (setq old-real-time (get-internal-real-time))
     (let ((start-gc-internal-run-time *gc-run-time*)
           (*eval-calls* 0)
-          (sb!c::*lambda-conversions* 0)
+          (sb-c::*lambda-conversions* 0)
           (aborted t))
-      (declare (special *eval-calls* sb!c::*lambda-conversions*))
+      (declare (special *eval-calls* sb-c::*lambda-conversions*))
       (multiple-value-bind (h0 l0) (read-cycle-counter)
         (unwind-protect
              (multiple-value-prog1 (apply fun arguments)
@@ -495,8 +493,8 @@ EXPERIMENTAL: Interface subject to change."
                     (note :page-faults page-faults #'zerop)
                     ;; cycle counting isn't supported everywhere.
                     (when cycles
-                      (note :processor-cycles cycles #'zerop)
-                    (note :lambdas-converted sb!c::*lambda-conversions* #'zerop))
+                      (note :processor-cycles cycles #'zerop))
+                    (note :lambdas-converted sb-c::*lambda-conversions* #'zerop)
                     (note :eval-calls *eval-calls* #'zerop)
                     (note :gc-run-time-ms gc-internal-run-time)
                     (note :system-run-time-us system-run-time)

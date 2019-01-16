@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; When building the cross-compiler (and called by the host), read the
 ;;; dynamic-space-size file.
@@ -20,7 +20,9 @@
 (defun !read-dynamic-space-size ()
   (unless (member :sb-xc-host *features*)
     (return-from !read-dynamic-space-size (symbol-value 'default-dynamic-space-size)))
-  (with-open-file (f "output/dynamic-space-size.txt")
+  (with-open-file (f "output/dynamic-space-size.txt" :if-does-not-exist nil)
+    (unless f
+      (return-from !read-dynamic-space-size nil))
     (let ((line (read-line f)))
       (multiple-value-bind (number end)
           (parse-integer line :junk-allowed t)
@@ -42,8 +44,6 @@
 ;;     gencgc does not purify any more.  We can count on being able to
 ;;     allocate them with roughly the same size, and next to each other.
 ;;
-;;     There is one page of unmapped buffer between them for good measure.
-;;
 ;;     The linkage table (if enabled) can be treated the same way.
 ;;
 ;;     Dynamic space traditionally sits elsewhere, so has its own
@@ -51,30 +51,19 @@
 ;;     the other spaces (used on Windows/x86).
 ;;
 ;;     The safepoint page (if enabled) is to be allocated immediately
-;;     prior to static page.  For x86(-64) this would not matter, because
-;;     they can only reference it using an absolute fixup anyway, but
-;;     for RISC platforms we can (and must) do better.
-;;
-;;     The safepoint page needs to be small enough that the offset from
-;;     static space is immediate, e.g. >= -2^12 for SPARC.  #x1000 works
-;;     for almost all platforms, but is too small to make VirtualProtect
-;;     happy -- hence the need for an extra `alignment' configuration
-;;     option below, which parms.lisp can set to #x10000 on Windows.
-;;
+;;     prior to static page.
 (defmacro !gencgc-space-setup
     (small-spaces-start
           &key ((:dynamic-space-start dynamic-space-start*))
-               ((:default-dynamic-space-size default-dynamic-space-size*))
-               #!+immobile-space
-               ((:immobile-space-size immobile-space-size*) (* 128 1024 1024))
-               #!+immobile-space (immobile-code-space-size (* 104 1024 1024))
-               ;; Smallest os_validate()able alignment; used as safepoint
-               ;; page size.  Default suitable for POSIX platforms.
-               (alignment            #x1000)
-               ;; traditional distance between spaces -- including the margin:
-               (small-space-spread #x100000)
-               ;; traditional margin between spaces
-               (margin-size          #x1000))
+               ((:dynamic-space-size dynamic-space-size*))
+               ;; The immobile-space START parameters should not be used
+               ;; except in forcing discontiguous addresses for testing.
+               ;; And of course, don't use them if unsupported.
+               ((:fixedobj-space-start fixedobj-space-start*))
+               ((:fixedobj-space-size  fixedobj-space-size*) (* 24 1024 1024))
+               ((:varyobj-space-start  varyobj-space-start*))
+               ((:varyobj-space-size   varyobj-space-size*) (* 104 1024 1024))
+               (small-space-size #x100000))
   (declare (ignorable dynamic-space-start*)) ; might be unused in make-host-2
   (flet ((defconstantish (relocatable symbol value)
            (if (not relocatable) ; easy case
@@ -86,81 +75,79 @@
                ;; but can't be due to dependency order problem.
                )))
     (let*
-        ((spaces '(read-only static
-                   #!+linkage-table linkage-table
-                   #!+immobile-space immobile))
+        ((spaces (append `((read-only ,small-space-size)
+                           #!+sb-safepoint
+                           (safepoint ,(symbol-value '+backend-page-bytes+)
+                                      gc-safepoint-page-addr)
+                           (static ,small-space-size))
+                         #!+linkage-table
+                         `((linkage-table ,small-space-size))
+                         #!+immobile-space
+                         `((fixedobj ,fixedobj-space-size*)
+                           (varyobj ,varyobj-space-size*))))
          (ptr small-spaces-start)
-         safepoint-address
          (small-space-forms
-          (loop for (space next-space) on spaces appending
-                (let* ((relocatable
-                        ;; TODO: immobile and linkage-table should be relocatable
-                        #!+relocatable-heap (member space '(immobile)))
-                       (next-start
-                        (+ ptr (cond #!+immobile-space
-                                     ((eq space 'immobile)
-                                      ;; We subtract margin-size when
-                                      ;; computing FOO-SPACE-END,
-                                      ;; so add it in here to compensate.
-                                      (+ immobile-space-size* margin-size))
-                                     (t
-                                      small-space-spread))))
-                       (end next-start))
-                  (when (eq next-space 'static)
-                    ;; margin becomes safepoint page; substract margin again.
-                    (decf end alignment)
-                    (setf safepoint-address end))
-                  (let* ((start-sym (symbolicate space "-SPACE-START"))
-                         (start-val ptr)
-                         (end-val (- end margin-size)))
-                    (setf ptr next-start)
-                    `(,(defconstantish relocatable start-sym start-val)
-                      ,(if relocatable
-                           `(defconstant ,(symbolicate space "-SPACE-SIZE")
-                              ,(- end-val start-val))
-                           `(defconstant ,(symbolicate space "-SPACE-END")
-                              ,end-val)))))))
-         (safepoint-page-forms
-          (list #!+sb-safepoint
-                `(defconstant gc-safepoint-page-addr ,safepoint-address)))
-         )
-    #+ccl safepoint-address ; workaround for incorrect "Unused" warning
-    `(progn
-       ,@safepoint-page-forms
-       ,@small-space-forms
-       #!+immobile-space
-       (defconstant immobile-fixedobj-subspace-size
-         ,(- immobile-space-size* immobile-code-space-size))
-       ,(defconstantish (or #!+relocatable-heap t) 'dynamic-space-start
-          (or dynamic-space-start* ptr))
-       (defconstant default-dynamic-space-size
-         (or ,(!read-dynamic-space-size)
-             ,default-dynamic-space-size*
-             (ecase n-word-bits
-               (32 (expt 2 29))
-               (64 (expt 2 30)))))))))
+           (loop for (space size var-name) in spaces
+                 appending
+                 (let* ((relocatable
+                          ;; TODO: linkage-table could move with code, if the CPU
+                          ;; prefers PC-relative jumps, and we emit better code
+                          ;; (which we don't- for x86 we jmp via RBX always)
+                          #!+relocatable-heap (member space '(fixedobj varyobj)))
+                        (start ptr)
+                        (end (+ ptr size)))
+                   (setf ptr end)
+                   (if var-name
+                       `((defconstant ,var-name ,start))
+                       (let ((start-sym (symbolicate space "-SPACE-START")))
+                         ;; Allow expressly given addresses / sizes for immobile space.
+                         ;; The addresses are for testing only - you should not need them.
+                         (case space
+                           (varyobj  (setq start (or varyobj-space-start* start)
+                                           end (+ start varyobj-space-size*)))
+                           (fixedobj (setq start (or fixedobj-space-start* start)
+                                           end (+ start fixedobj-space-size*))))
+                         `(,(defconstantish relocatable start-sym start)
+                           ,(cond ((not relocatable)
+                                   `(defconstant ,(symbolicate space "-SPACE-END") ,end))
+                                  #-sb-xc-host ((eq space 'varyobj)) ; don't emit anything
+                                  (t
+                                   `(defconstant ,(symbolicate space "-SPACE-SIZE")
+                                      ,(- end start)))))))))))
+      `(progn
+         ,@small-space-forms
+         ,(defconstantish (or #!+relocatable-heap t) 'dynamic-space-start
+            (or dynamic-space-start* ptr))
+         (defconstant default-dynamic-space-size
+           ;; Build-time make-config.sh option "--dynamic-space-size" overrides
+           ;; keyword argument :dynamic-space-size which overrides general default.
+           ;; All are overridden by runtime --dynamic-space-size command-line arg.
+           (or ,(or (!read-dynamic-space-size) dynamic-space-size*)
+               (ecase n-word-bits
+                 (32 (expt 2 29))
+                 (64 (expt 2 30)))))))))
 
 (defconstant-eqx +c-callable-fdefns+
   '(sub-gc
-    sb!kernel::post-gc
+    sb-kernel::post-gc
     internal-error
-    sb!kernel::control-stack-exhausted-error
-    sb!kernel::binding-stack-exhausted-error
-    sb!kernel::alien-stack-exhausted-error
-    sb!kernel::heap-exhausted-error
-    sb!kernel::undefined-alien-variable-error
-    sb!kernel::memory-fault-error
-    sb!kernel::unhandled-trap-error
+    sb-kernel::control-stack-exhausted-error
+    sb-kernel::binding-stack-exhausted-error
+    sb-kernel::alien-stack-exhausted-error
+    sb-kernel::heap-exhausted-error
+    sb-kernel::undefined-alien-variable-error
+    sb-kernel::memory-fault-error
+    sb-kernel::unhandled-trap-error
     ;; On these it's called through the internal errors mechanism
     #!-(or arm arm64 x86-64) undefined-alien-fun-error
-    sb!di::handle-breakpoint
-    sb!di::handle-single-step-trap
-    #!+win32 sb!kernel::handle-win32-exception
-    #!+sb-thruption sb!thread::run-interruption
+    sb-di::handle-breakpoint
+    sb-di::handle-single-step-trap
+    #!+win32 sb-kernel::handle-win32-exception
+    #!+sb-thruption sb-thread::run-interruption
     enter-alien-callback
-    #!+sb-thread sb!thread::enter-foreign-callback
+    #!+sb-thread sb-thread::enter-foreign-callback
     #!+(and sb-safepoint-strictly (not win32))
-    sb!unix::signal-handler-callback)
+    sb-unix::signal-handler-callback)
   #'equal)
 
 ;;; Static symbols that C code must be able to assign to,
@@ -170,17 +157,15 @@
 ;;;  - static for efficiency of access but need not be
 (defconstant-eqx !per-thread-c-interface-symbols
   `((*free-interrupt-context-index* 0)
-    (sb!sys:*allow-with-interrupts* t)
-    (sb!sys:*interrupts-enabled* t)
+    (sb-sys:*allow-with-interrupts* t)
+    (sb-sys:*interrupts-enabled* t)
     *alloc-signal*
-    sb!sys:*interrupt-pending*
-    #!+sb-thruption sb!sys:*thruption-pending*
-    #!+sb-thruption sb!kernel:*restart-clusters*
+    sb-sys:*interrupt-pending*
+    #!+sb-thruption sb-sys:*thruption-pending*
     *in-without-gcing*
     *gc-inhibit*
     *gc-pending*
-    #!+sb-safepoint sb!impl::*gc-safe*
-    #!+sb-safepoint sb!impl::*in-safepoint*
+    #!+sb-safepoint sb-impl::*in-safepoint*
     #!+sb-thread *stop-for-gc-pending*
     ;; non-x86oid gencgc object pinning
     #!+(and gencgc (not (or x86 x86-64))) *pinned-objects*
@@ -204,7 +189,7 @@
 
     ;; sb-safepoint in addition to accessing this symbol via TLS,
     ;; uses the symbol itself as a value. Kinda weird.
-    #!+sb-safepoint *in-without-gcing*
+    #!+(and sb-safepoint sb-thread) *in-without-gcing*
 
     #!+immobile-space *immobile-freelist* ; not per-thread (yet...)
 
@@ -226,9 +211,9 @@
     ;; dynamic runtime linking support
     #!+sb-dynamic-core +required-foreign-symbols+
 
-    ;; for looking up assembler routine by name
-    ;; and patching them on runtime startup
-    sb!fasl::*assembler-routines*
+    ;; List of Lisp specials bindings made by create_thread_struct()
+    ;; excluding the names in !PER-THREAD-C-INTERFACE-SYMBOLS.
+    sb-thread::*thread-initial-bindings*
 
     ;;; The following symbols aren't strictly required to be static
     ;;; - they are not accessed from C - but we make them static in order
@@ -236,12 +221,12 @@
     ;;; However there is no efficiency gain if we have #!+immobile-space.
     #!-immobile-space ,@'(
      ;; arbitrary object that changes after each GC
-     sb!kernel::*gc-epoch*
+     sb-kernel::*gc-epoch*
      ;; Dispatch tables for generic array access
-     sb!impl::%%data-vector-reffers%%
-     sb!impl::%%data-vector-reffers/check-bounds%%
-     sb!impl::%%data-vector-setters%%
-     sb!impl::%%data-vector-setters/check-bounds%%))
+     %%data-vector-reffers%%
+     %%data-vector-reffers/check-bounds%%
+     %%data-vector-setters%%
+     %%data-vector-setters/check-bounds%%))
   #'equalp)
 
 ;;; Number of entries in the thread local storage. Limits the number
@@ -257,7 +242,5 @@
   (defconstant +highest-normal-generation+ 5)
   (defconstant +pseudo-static-generation+ 6))
 
-(defun !unintern-symbols ()
-  '("SB-VM"
-    +c-callable-fdefns+
-    +common-static-symbols+))
+(push '("SB-VM" +c-callable-fdefns+ +common-static-symbols+)
+      *!removable-symbols*)

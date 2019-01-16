@@ -12,41 +12,32 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
-(sb!int::/show0 "fdefinition.lisp 22")
+;; This variable properly belongs in 'target-hash-table',
+;; but it's compiled after this file is.
+(!define-load-time-global *user-hash-table-tests* nil)
+
 
 ;;;; fdefinition (fdefn) objects
 
 (defun make-fdefn (name)
   #!-immobile-space (make-fdefn name)
-  ;; This is %primitive because it needs pseudo-atomic,
-  ;; otherwise it would just be an alien-funcall.
   #!+immobile-space
-  (let ((fdefn (truly-the (values fdefn)
-                 (%primitive sb!vm::alloc-immobile-fdefn name))))
-    (%primitive fdefn-makunbound fdefn)
-    fdefn))
-
-(defun fdefn-name (fdefn)
-  (declare (type fdefn fdefn))
-  (fdefn-name fdefn))
-
-(defun fdefn-fun (fdefn)
-  (declare (type fdefn fdefn)
-           (values (or function null)))
-  (fdefn-fun fdefn))
+  (let ((fdefn (truly-the (values fdefn &optional)
+                          (sb-vm::alloc-immobile-fdefn))))
+    (sb-vm::%set-fdefn-name fdefn name)
+    ;; Return the result of FDEFN-MAKUNBOUND because it (strangely) returns its
+    ;; argument. Using FDEFN as the value of this function, as if we didn't know
+    ;; that FDEFN-MAKUNBOUND did that, would cause a redundant register move.
+    (truly-the fdefn (fdefn-makunbound fdefn))))
 
 (defun (setf fdefn-fun) (fun fdefn)
   (declare (type function fun)
            (type fdefn fdefn)
            (values function))
-  #!+immobile-code (sb!vm::%set-fdefn-fun fdefn fun)
+  #!+immobile-code (sb-vm::%set-fdefn-fun fdefn fun)
   #!-immobile-code (setf (fdefn-fun fdefn) fun))
-
-(defun fdefn-makunbound (fdefn)
-  (declare (type fdefn fdefn))
-  (fdefn-makunbound fdefn))
 
 #!-sb-fluid (declaim (inline symbol-fdefn))
 ;; Return SYMBOL's fdefinition, if any, or NIL. SYMBOL must already
@@ -98,9 +89,27 @@
       ;; We won't reach here if the name was not legal
       (let ((fdefn (get-info-value-initializing :function :definition name
                                                 (make-fdefn name))))
-        (when (typep name '(cons (eql sb!pcl::slot-accessor)))
-          (sb!pcl::ensure-accessor name))
+        (when (typep name '(cons (eql sb-pcl::slot-accessor)))
+          (sb-pcl::ensure-accessor name))
         fdefn)))
+
+;;; Return T if FUNCTION is the error-signaling trampoline for a macro or a
+;;; special operator. Test for this by seeing whether FUNCTION is the same
+;;; closure as for a known macro.
+(declaim (inline macro/special-guard-fun-p))
+(defun macro/special-guard-fun-p (function)
+  ;; When inlined, this is a few instructions shorter than CLOSUREP
+  ;; if we already know that FUNCTION is a function.
+  ;; It will signal a type error if not, which is the right thing to do anyway.
+  ;; (this isn't quite a true predicate)
+  (and (= (fun-subtype function) sb-vm:closure-widetag)
+       ;; This test needs to reference the name of any macro, but in order for
+       ;; cold-init to work, the macro has to be defined first.
+       ;; So pick DX-LET, as it's in primordial-extensions.
+       ;; Prior to cold-init fixing up the load-time-value, this compares
+       ;; %closure-fun to 0, which is ok - it returns NIL.
+       (eq (load-time-value (%closure-fun (symbol-function 'dx-let)) t)
+           (%closure-fun function))))
 
 ;;; Remove NAME's FTYPE information unless it was explicitly PROCLAIMED.
 ;;; The NEW-FUNCTION argument is presently unused, but could be used
@@ -118,61 +127,50 @@
 ;;; but as we've defined FDEFINITION, that strips encapsulations.
 (defmacro %coerce-name-to-fun (name &optional (lookup-fn 'find-fdefn)
                                     strictly-functionp)
-  `(block nil
-     (let ((name ,name))
-       (tagbody retry
-          (let ((fdefn (,lookup-fn name)))
-            (when fdefn
-              (let ((f (fdefn-fun (truly-the fdefn fdefn))))
+  (declare (boolean strictly-functionp))
+  `(let* ((name ,name) (fdefn (,lookup-fn name)) f)
+     (if (and fdefn
+              (setq f (fdefn-fun (truly-the fdefn fdefn)))
                 ;; If STRICTLY-FUNCTIONP is true, we make sure not to return an error
                 ;; trampoline. This extra check ensures that full calls such as
                 ;; (MAPCAR 'OR '()) signal an error that OR isn't a function.
                 ;; This accords with the non-requirement that macros store strictly
                 ;; a function in the symbol that names them. In many implementations,
                 ;; (FUNCTIONP (SYMBOL-FUNCTION 'OR)) => NIL. We want to pretend that.
-                (when f
-                  (,@(if strictly-functionp
-                         '(unless (macro/special-guard-fun-p f))
-                         '(progn))
-                   (return f)))))
-            (setf name
-                  (let ((name name))
-                    ;; Avoid making the initial NAME a value cell,
-                    ;; it will cons even if no restarts are reached
-                    (restart-case (error 'undefined-function :name name)
-                      (continue ()
-                        :report (lambda (stream)
-                                  (format stream "Retry using ~s." name))
-                        name)
-                      (use-value (value)
-                        :report (lambda (stream)
-                                  (format stream "Use specified function"))
-                        :interactive read-evaluated-form
-                        (when (functionp value)
-                          (return value))
-                        (the ,(if (eq lookup-fn 'symbol-fdefn)
-                                  'symbol
-                                  t)
-                             value)))))
-            (go retry))))))
+              ,@(if strictly-functionp '((not (macro/special-guard-fun-p f)))))
+         f
+         (retry-%coerce-name-to-fun name ,strictly-functionp))))
 
-;; Return T if FUNCTION is the error-signaling trampoline
-;; for a macro or a special operator. Test for this by seeing
-;; whether FUNCTION is the same closure as for a known macro.
-;; For cold-init to work, this must pick any macro defined before
-;; this function is. A safe choice is a macro from this same file.
-(declaim (inline macro/special-guard-fun-p))
-(defun macro/special-guard-fun-p (function)
-  ;; When inlined, this is a few instructions shorter than CLOSUREP
-  ;; if we already know that FUNCTION is a function.
-  ;; It will signal a type error if not, which is the right thing to do anyway.
-  ;; (this isn't quite a true predicate)
-  (and (= (fun-subtype function) sb!vm:closure-widetag)
-       ;; Prior to cold-init fixing up the load-time-value, this compares
-       ;; %closure-fun to 0, which is ok - it returns NIL.
-       (eq (load-time-value (%closure-fun (symbol-function '%coerce-name-to-fun))
-                            t)
-           (%closure-fun function))))
+;;; If %COERCE-NAME-TO-FUN fails, continue here.
+;;; LOOKUP-FN, being more about speed than semantics, is irrelevant.
+;;; Once we're forced down the slow path, it doesn't matter whether the fdefn
+;;; lookup considers generalized function names (which require a hash-table)
+;;; versus optimizing for just symbols (by using SYMBOL-INFO).
+;;;
+;;; Furthermore we explicitly allow any function name when retrying,
+;;; even if the erring caller was SYMBOL-FUNCTION. It is consistent
+;;; that both #'(SETF MYNEWFUN) and '(SETF MYNEWFUN) are permitted
+;;; as the object to use in the USE-VALUE restart.
+(defun retry-%coerce-name-to-fun (name strictly-functionp)
+  (setq name (restart-case (error 'undefined-function :name name)
+               (continue ()
+                 :report (lambda (stream)
+                           (format stream "Retry using ~s." name))
+                 name)
+               (use-value (value)
+                 :report (lambda (stream)
+                           (format stream "Use specified function"))
+                 :interactive read-evaluated-form
+                 (if (functionp value)
+                     (return-from retry-%coerce-name-to-fun value)
+                     value))))
+  (let ((fdefn (find-fdefn name)))
+    (when fdefn
+      (let ((f (fdefn-fun (truly-the fdefn fdefn))))
+        (when (and f (or (not strictly-functionp)
+                         (not (macro/special-guard-fun-p f))))
+          (return-from retry-%coerce-name-to-fun f)))))
+  (retry-%coerce-name-to-fun name strictly-functionp))
 
 ;; Coerce CALLABLE (a function-designator) to a FUNCTION.
 ;; The compiler emits this when someone tries to FUNCALL something.
@@ -189,6 +187,10 @@
   (etypecase callable
     (function callable)
     (symbol (%coerce-name-to-fun callable symbol-fdefn t))))
+
+;;; Bevahes just like %COERCE-CALLABLE-TO-FUN but has an ir2-convert optimizer.
+(%defun '%coerce-callable-for-call
+        #'%coerce-callable-to-fun)
 
 
 ;;;; definition encapsulation
@@ -212,7 +214,7 @@
 ;;; encapsulations of the same name.
 (defun encapsulate (name type function)
   (let* ((fdefn (find-fdefn name))
-         (underlying-fun (sb!c:safe-fdefn-fun fdefn)))
+         (underlying-fun (sb-c:safe-fdefn-fun fdefn)))
     (when (typep underlying-fun 'generic-function)
       (return-from encapsulate
         (encapsulate-generic-function underlying-fun type function)))
@@ -230,14 +232,6 @@
             (named-lambda encapsulation (&rest args)
               (apply function (encapsulation-info-definition info)
                      args))))))
-
-;;; This is like FIND-IF, except that we do it on a compiled closure's
-;;; environment.
-(defun find-if-in-closure (test closure)
-  (declare (closure closure))
-  (do-closure-values (value closure)
-    (when (funcall test value)
-      (return value))))
 
 ;;; Find the encapsulation info that has been closed over.
 (defun encapsulation-info (fun)
@@ -365,10 +359,8 @@
 
     ;; Check for hash-table stuff. Woe onto him that mixes encapsulation
     ;; with this.
-    (when (and (symbolp name) (fboundp name)
-               (boundp '*user-hash-table-tests*))
+    (when (and (symbolp name) (fboundp name))
       (let ((old (symbol-function name)))
-        (declare (special *user-hash-table-tests*))
         (dolist (spec *user-hash-table-tests*)
           (cond ((eq old (second spec))
                  ;; test-function
@@ -411,9 +403,9 @@
 
 ;; Byte index 2 of the fdefn's header is the statically-linked flag
 #!+immobile-code
-(defmacro sb!vm::fdefn-has-static-callers (fdefn)
+(defmacro sb-vm::fdefn-has-static-callers (fdefn)
   `(sap-ref-8 (int-sap (get-lisp-obj-address ,fdefn))
-              (- 2 sb!vm::other-pointer-lowtag)))
+              (- 2 sb-vm::other-pointer-lowtag)))
 
 (defun fmakunbound (name)
   "Make NAME have no global function definition."
@@ -423,8 +415,8 @@
     (let ((fdefn (find-fdefn name)))
       (when fdefn
         #!+immobile-code
-        (unless (eql (sb!vm::fdefn-has-static-callers fdefn) 0)
-          (sb!vm::remove-static-links fdefn))
+        (unless (eql (sb-vm::fdefn-has-static-callers fdefn) 0)
+          (sb-vm::remove-static-links fdefn))
         (fdefn-makunbound fdefn)))
     (undefine-fun-name name)
     name))

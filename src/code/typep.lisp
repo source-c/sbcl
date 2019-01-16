@@ -7,9 +7,9 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
-;;; (Note that when cross-compiling, SB!XC:TYPEP is interpreted as a
+;;; (Note that when cross-compiling, SB-XC:TYPEP is interpreted as a
 ;;; test that the host Lisp object OBJECT translates to a target SBCL
 ;;; type TYPE. This behavior is needed e.g. to test for the validity
 ;;; of numeric subtype bounds read when cross-compiling.)
@@ -53,7 +53,9 @@
                          (realpart object)
                          object)))
             (ecase (numeric-type-class type)
-              (integer (integerp num))
+              (integer (and (integerp num)
+                            (or (not (complexp object))
+                                (integerp (imagpart object)))))
               (rational (rationalp num))
               (float
                (ecase (numeric-type-format type)
@@ -150,14 +152,20 @@
           (let* ((tag (%simd-pack-tag object))
                  (name (nth tag *simd-pack-element-types*)))
             (not (not (member name (simd-pack-type-element-type type)))))))
+    #!+sb-simd-pack-256
+    (simd-pack-256-type
+     (and (simd-pack-256-p object)
+          (let* ((tag (%simd-pack-256-tag object))
+                 (name (nth tag *simd-pack-element-types*)))
+            (not (not (member name (simd-pack-256-type-element-type type)))))))
     (character-set-type
      (and (characterp object)
-         (let ((code (char-code object))
-               (pairs (character-set-type-pairs type)))
-           (dolist (pair pairs nil)
-             (destructuring-bind (low . high) pair
-               (when (<= low code high)
-                 (return t)))))))
+          (let ((code (char-code object))
+                (pairs (character-set-type-pairs type)))
+            (dolist (pair pairs nil)
+              (destructuring-bind (low . high) pair
+                (when (<= low code high)
+                  (return t)))))))
     (unknown-type
      ;; dunno how to do this ANSIly -- WHN 19990413
      #+sb-xc-host (error "stub: %%TYPEP UNKNOWN-TYPE in xcompilation host")
@@ -188,15 +196,15 @@
          (satisfies
           (unless (proper-list-of-length-p hairy-spec 2)
             (error "invalid type specifier: ~S" hairy-spec))
-          (values (funcall (symbol-function (cadr hairy-spec)) object))))))
+          (and (funcall (symbol-function (cadr hairy-spec)) object) t)))))
     (alien-type-type
-     (sb!alien-internals:alien-typep object (alien-type-type-alien-type type)))
+     (sb-alien-internals:alien-typep object (alien-type-type-alien-type type)))
     (fun-type
      (if strict
          (error "Function types are not a legal argument to TYPEP:~%  ~S"
                 (type-specifier type))
          (and (functionp object)
-              (csubtypep (specifier-type (sb!impl::%fun-type object)) type))))))
+              (csubtypep (specifier-type (sb-impl::%fun-type object)) type))))))
 
 (defun cached-typep (cache object)
   (let* ((type (cdr cache))
@@ -223,7 +231,7 @@
                     (lambda (cache object)
                       (%%typep object (cdr (truly-the cons cache)))))))
           (setf (cdr cache) ctype)
-          (sb!thread:barrier (:write))
+          (sb-thread:barrier (:write))
           (setf (car cache) fun)
           (funcall fun cache object)))))
 
@@ -241,6 +249,34 @@
     (classoid-typep layout classoid object)))
 
 ;;; Test whether OBJ-LAYOUT is from an instance of CLASSOID.
+
+;;; IMPORTANT: If none of the classes involved (directly or indirectly)
+;;; in a call to CLASSOID-TYPEP gets redefined during execution of the predicate,
+;;; the layout update loop should require at most 2 iterations.
+;;; Theoretically, ensuring validity of the classoid layout and the object layout
+;;; could be done in either order, * HOWEVER * it is less racy to perform
+;;; them in this exact order. Consider the case that OBJ-LAYOUT is T
+;;; for a class that satisfies CLASS-FINALIZED-P and suppose these operations were
+;;; reversed from the order below. UPDATE-OBJECT-LAYOUT-OR-INVALID is going to make
+;;; a new layout, registering it and installing into the classoid.
+;;; Then %ENSURE-CLASSOID-VALID is going to call %FORCE-CACHE-FLUSHES which is going
+;;; to make yet another new layout. The "transitivity of wrapper updates" usually
+;;; causes the first new layout to automatically update to the second new layout,
+;;; except that the other thread has already fetched the old layout.
+;;; But by using the order below, there will not be two new layouts made, only one,
+;;; because UPDATE-OBJECT-LAYOUT-OR-INVALID is able to use the layout
+;;; that was updated into the classoid by %ENSURE-CLASSOID-VALID.
+;;; All other things being equal, one new layout is better than two.
+;;; At least I think that's what happens.
+;;; So consider what happens if two threads are both doing this -
+;;; with the opposite order, there could have been as many as 5 new layouts
+;;; created (empirically observed via instrumentation of MAKE-LAYOUT) -
+;;; two per thread; plus one more, which is the failing one.
+;;; It was even possible to have *BOTH* threads fail the AVER, although more often it
+;;; was just one of them that fails.
+;;; With the order of operations below, I observed no failures in hundreds
+;;; of thousands of iterations of 'classoid-typep.impure.lisp'
+
 (defun classoid-typep (obj-layout classoid object)
   ;; FIXME & KLUDGE: We could like to grab the *WORLD-LOCK* here (to ensure that
   ;; class graph doesn't change while we're doing the typep test), but in
@@ -258,9 +294,9 @@
                 (not (layout-invalid layout)))
            (values obj-layout layout))
         (aver (< i 2))
+        (%ensure-classoid-valid classoid layout "typep")
         (when (layout-invalid obj-layout)
-          (setq obj-layout (update-object-layout-or-invalid object layout)))
-        (%ensure-classoid-valid classoid layout "typep"))
+          (setq obj-layout (update-object-layout-or-invalid object layout))))
     (or (eq obj-layout layout)
         (let ((obj-inherits (layout-inherits obj-layout)))
           (dotimes (i (length obj-inherits) nil)

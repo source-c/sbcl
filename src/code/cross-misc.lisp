@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;; Forward declarations
 
@@ -22,20 +22,6 @@
 (defmacro named-lambda (name args &body body)
   (declare (ignore name))
   `#'(lambda ,args ,@body))
-
-;;; Interrupt control isn't an issue in the cross-compiler: we don't
-;;; use address-dependent (and thus GC-dependent) hashes, and we only
-;;; have a single thread of control.
-(defmacro without-interrupts (&rest forms)
-  `(macrolet ((allow-with-interrupts (&body body)
-                `(progn ,@body))
-              (with-local-interrupts (&body body)
-                `(progn ,@body)))
-     ,@forms))
-
-(defmacro with-locked-hash-table ((table) &body body)
-  (declare (ignore table))
-  `(progn ,@body))
 
 (defmacro with-locked-system-table ((table) &body body)
   (declare (ignore table))
@@ -51,16 +37,31 @@
 
 (defmacro define-load-time-global (&rest args) `(defvar ,@args))
 
+;;; Necessary only to placate the host compiler in %COMPILER-DEFGLOBAL.
+(defun set-symbol-global-value (sym val)
+  (error "Can't set symbol-global-value: ~S ~S" sym val))
+
 ;;; The GENESIS function works with fasl code which would, in the
 ;;; target SBCL, work on ANSI-STREAMs (streams which aren't extended
 ;;; Gray streams). In ANSI Common Lisp, an ANSI-STREAM is just a
 ;;; CL:STREAM.
 (deftype ansi-stream () 'stream)
 
+;;; In the target SBCL, the INSTANCE type refers to a base
+;;; implementation for compound types with lowtag
+;;; INSTANCE-POINTER-LOWTAG. There's no way to express exactly that
+;;; concept portably, but we can get essentially the same effect by
+;;; testing for any of the standard types which would, in the target
+;;; SBCL, be derived from INSTANCE:
 (deftype instance ()
   '(or condition structure-object standard-object))
+(defun %instancep (x)
+  (typep x 'instance))
+
 (deftype funcallable-instance ()
   (error "not clear how to represent FUNCALLABLE-INSTANCE type"))
+(defun funcallable-instance-p (x)
+  (error "Called FUNCALLABLE-INSTANCE-P ~s" x))
 
 ;; The definition of TYPE-SPECIFIER for the target appears in the file
 ;; 'deftypes-for-target' - it allows CLASSes and CLASOIDs as specifiers.
@@ -69,28 +70,6 @@
 ;; define the types CLASS, CLASSOID, and TYPE-SPECIFIER.
 (deftype type-specifier () '(or list symbol))
 
-;;; In the target SBCL, the INSTANCE type refers to a base
-;;; implementation for compound types with lowtag
-;;; INSTANCE-POINTER-LOWTAG. There's no way to express exactly that
-;;; concept portably, but we can get essentially the same effect by
-;;; testing for any of the standard types which would, in the target
-;;; SBCL, be derived from INSTANCE:
-(defun %instancep (x)
-  (typep x '(or condition structure-object standard-object)))
-
-;;; There aren't any FUNCALLABLE-INSTANCEs in the cross-compilation
-;;; host Common Lisp.
-(defun funcallable-instance-p (x)
-  (if (typep x 'generic-function)
-    ;; In the target SBCL, FUNCALLABLE-INSTANCEs are used to implement
-    ;; generic functions, so any case which tests for this might in
-    ;; fact be trying to test for generic functions. My (WHN 19990313)
-    ;; expectation is that this case won't arise in the
-    ;; cross-compiler, but if it does, it deserves a little thought,
-    ;; rather than reflexively returning NIL.
-    (error "not clear how to handle GENERIC-FUNCTION")
-    nil))
-
 ;;; This seems to be the portable Common Lisp type test which
 ;;; corresponds to the effect of the target SBCL implementation test...
 (defun array-header-p (x)
@@ -98,14 +77,14 @@
        (or (not (typep x 'simple-array))
            (/= (array-rank x) 1))))
 
-(defvar sb!xc:*gensym-counter* 0)
+(defvar sb-xc:*gensym-counter* 0)
 
-(defun sb!xc:gensym (&optional (thing "G"))
+(defun sb-xc:gensym (&optional (thing "G"))
   (declare (type string thing))
-  (let ((n sb!xc:*gensym-counter*))
+  (let ((n sb-xc:*gensym-counter*))
     (prog1
         (make-symbol (concatenate 'string thing (write-to-string n :base 10 :radix nil :pretty nil)))
-      (incf sb!xc:*gensym-counter*))))
+      (incf sb-xc:*gensym-counter*))))
 
 ;;; These functions are needed for constant-folding.
 (defun simple-array-nil-p (object)
@@ -135,16 +114,6 @@
 (defun %with-array-data/fp (array start end)
   (assert (typep array '(simple-array * (*))))
   (values array start end 0))
-
-(defun signed-byte-32-p (number)
-  (typep number '(signed-byte 32)))
-
-;; This has an obvious portable implementation
-;; as (typep number 'ratio), but apparently we
-;; expect never to need it.
-(defun ratiop (number)
-  (declare (ignore number))
-  (error "Should not call RATIOP"))
 
 (defun make-value-cell (value)
   (declare (ignore value))
@@ -182,29 +151,35 @@
 ;; But portably we have to just fallback to PACKAGE-NAME.
 (defun package-%name (x) (package-name x))
 
+;;; This definition collapses SB-XC back into COMMON-LISP.
+;;; Use CL:SYMBOL-PACKAGE if that's not the behavior you want.
+;;; Notice that to determine whether a package is really supposed to be CL,
+;;; we look for the symbol in the restricted lisp package, not the real
+;;; host CL package. This works around situations where the host has *more*
+;;; symbols exported from CL than should be.
+(defun sb-xc:symbol-package (symbol)
+  (let ((p (cl:symbol-package symbol)))
+    (if (and p
+             (or (eq (find-symbol (string symbol) "XC-STRICT-CL") symbol)
+                 (eq (find-symbol (string symbol) "SB-XC") symbol)))
+        *cl-package*
+        p)))
+
 ;;; printing structures
 
 (defun default-structure-print (structure stream depth)
   (declare (ignore depth))
   (write structure :stream stream :circle t))
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 (defun %find-position (item seq from-end start end key test)
   (let ((position (position item seq :from-end from-end
                             :start start :end end :key key :test test)))
     (values (if position (elt seq position) nil) position)))
 
-(defun sb!impl::split-seconds-for-sleep (&rest args)
+(defun sb-impl::split-seconds-for-sleep (&rest args)
   (declare (ignore args))
   (error "Can't call SPLIT-SECONDS-FOR-SLEEP"))
-
-;;; Avoid an unknown type reference from globaldb.
-(deftype fdefn () '(satisfies fdefn-p))
-
-;;; Avoid an unknown function reference from globaldb on some build
-;;; hosts.  It doesn't really matter what this function does: we don't
-;;; have FDEFN objects on the host anyway.
-(defun fdefn-p (x) (declare (ignore x)) nil)
 
 ;;; Needed for constant-folding
 (defun system-area-pointer-p (x) x nil) ; nothing is a SAP
@@ -214,3 +189,52 @@
 (defmacro without-gcing (&body body) `(progn ,@body))
 
 (defun logically-readonlyize (x) x)
+
+;;; Mainly for the fasl loader
+(defun %fun-name (f) (nth-value 2 (function-lambda-expression f)))
+
+;;;; Variables which have meaning only to the cross-compiler, defined here
+;;;; in lieu of #+sb-xc-host elsewere which messes up toplevel form numbers.
+(in-package "SB-C")
+
+;;; For macro lambdas that are processed by the host
+(declaim (declaration top-level-form))
+
+;;; Set of function names whose definition will never be seen in make-host-2,
+;;; as they are deferred until warm load.
+;;; The table is populated by compile-cold-sbcl, and not present in the target.
+(defparameter *undefined-fun-whitelist* (make-hash-table :test 'equal))
+
+;;; The opposite of the whitelist - if certain full calls are seen, it is probably
+;;; the result of a missed transform and/or misconfiguration.
+(defparameter *full-calls-to-warn-about*
+  '(;mask-signed-field ;; Too many to fix
+    ))
+
+;;; Used by OPEN-FASL-OUTPUT
+(defun string-to-octets (string &key external-format)
+  (assert (eq external-format :utf-8))
+  (let* ((n (length string))
+         (a (make-array n :element-type '(unsigned-byte 8))))
+    (dotimes (i n a)
+      (let ((code (sb-xc:char-code (char string i))))
+        (unless (<= 0 code 127)
+          (setf code (sb-xc:char-code #\?)))
+        (setf (aref a i) code)))))
+
+;;;; Stubs for host
+(defun sb-c:compile-in-lexenv (lambda lexenv &rest rest)
+  (declare (ignore lexenv))
+  (assert (null rest))
+  (compile nil lambda))
+
+(defun eval-tlf (form index &optional lexenv)
+  (declare (ignore index lexenv))
+  (eval form))
+
+(defmacro sb-format:tokens (string) string)
+
+;;; Used by our lockfree memoization functions (define-hash-cache)
+(defmacro sb-thread:barrier ((kind) &body body)
+  (declare (ignore kind))
+  `(progn ,@body))

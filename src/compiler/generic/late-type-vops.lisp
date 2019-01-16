@@ -8,40 +8,71 @@
 ;;;; public domain. The software is in the public domain and is
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
-(define-vop (type-predicate)
-  (:args (value :scs (any-reg descriptor-reg)))
-  (:temporary #!+(or x86 x86-64)
-              (:sc unsigned-reg :offset eax-offset)
-              #!-(or x86 x86-64)
-              (:sc non-descriptor-reg)
-              temp)
-  #!+(or x86 x86-64)
-  (:ignore temp)
-  (:conditional)
-  (:info target not-p)
-  (:policy :fast-safe))
+;;; FIXME: backend-specific junk doesn't belong in compiler/generic.
 
 #!+(or x86 x86-64)
+(progn
+(define-vop (type-predicate)
+  (:args (value :scs (any-reg descriptor-reg)))
+  ;; x86 code has to avoid 'esi' and 'edi' for the temp
+  ;; since they can't be accessed as an 8-bit byte.
+  ;; x86-64 being more regular, any reg can serve as the temp.
+  ;; In all likelihood, it'll get rax anyway just because.
+  (:temporary (:sc unsigned-reg #!+x86 :offset #!+x86 eax-offset) temp)
+  (:conditional)
+  (:info target not-p)
+  (:args-var args)
+  (:policy :fast-safe))
 (define-vop (simple-type-predicate)
   (:args (value :scs (any-reg descriptor-reg control-stack)))
   (:conditional)
   (:info target not-p)
+  (:args-var args)
   (:policy :fast-safe))
+;; A vop that accepts a computed set of widetags.
+(define-vop (%other-pointer-subtype-p type-predicate)
+  (:translate %other-pointer-subtype-p)
+  (:info target not-p widetags)
+  (:arg-types * (:constant t)) ; voodoo - 'target' and 'not-p' are absent
+  (:generator 15 ; arbitrary
+    (multiple-value-bind (headers except) (canonicalize-widetags+exceptions widetags)
+      (%test-headers value temp target not-p nil headers :except except
+                                                         :value-tn-ref args)))))
+
+#!-(or x86 x86-64)
+(progn
+(define-vop (type-predicate)
+  (:args (value :scs (any-reg descriptor-reg)))
+  (:temporary (:sc non-descriptor-reg) temp)
+  (:conditional)
+  (:info target not-p)
+  (:args-var args)
+  (:policy :fast-safe))
+;; A vop that accepts a computed set of widetags.
+(define-vop (%other-pointer-subtype-p type-predicate)
+  (:translate %other-pointer-subtype-p)
+  (:info target not-p widetags)
+  (:arg-types * (:constant t)) ; voodoo - 'target' and 'not-p' are absent
+  (:args-var args)
+  (:generator 15 ; arbitrary
+    (%test-headers value temp target not-p nil (canonicalize-widetags widetags)
+                   :value-tn-ref args))))
 
 (defmacro !define-type-vop (pred-name type-codes
                              &optional (inherit 'type-predicate))
-  (let ((cost (+ (* 2 (length type-codes))
-                 (if (> (reduce #'max type-codes :key #'eval) lowtag-limit)
-                     7
-                     2))))
+  (let ((cost (if (> (reduce #'max type-codes :key #'eval) lowtag-limit)
+                  7
+                  4)))
     `(define-vop (,pred-name ,inherit)
        (:translate ,pred-name)
        (:generator ,cost
-         (test-type value target not-p ,type-codes
-                    #!-(or x86-64 x86) :temp #!-(or x86-64 x86) temp)))))
+         (test-type value
+                    ,(if (eq inherit 'simple-type-predicate) nil 'temp)
+                    target not-p ,type-codes
+                    :value-tn-ref args)))))
 
 (!define-type-vop fixnump
   #.fixnum-lowtags
@@ -50,6 +81,8 @@
 (!define-type-vop functionp (fun-pointer-lowtag))
 
 (!define-type-vop listp (list-pointer-lowtag))
+
+(!define-type-vop non-null-symbol-p (symbol-widetag))
 
 (!define-type-vop %instancep (instance-pointer-lowtag))
 
@@ -123,6 +156,9 @@
    #!+sb-unicode complex-character-string-widetag
    complex-base-string-widetag complex-bit-vector-widetag
    complex-vector-widetag complex-array-widetag complex-vector-nil-widetag))
+
+(!define-type-vop simple-array-header-p
+  (simple-array-widetag))
 
 (!define-type-vop stringp
   (#!+sb-unicode simple-character-string-widetag
@@ -216,5 +252,8 @@
 
 #!+sb-simd-pack
 (!define-type-vop simd-pack-p (simd-pack-widetag))
+#!+sb-simd-pack-256
+(!define-type-vop simd-pack-256-p (simd-pack-256-widetag))
 
 (!define-type-vop unbound-marker-p (unbound-marker-widetag))
+

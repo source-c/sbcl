@@ -13,35 +13,41 @@
 ;;;; files for more information.
 
 ;;; from alieneval.lisp
-(in-package "SB!ALIEN")
+(in-package "SB-ALIEN")
 (defsetf slot %set-slot)
 (defsetf deref (alien &rest indices) (value)
   `(%set-deref ,alien ,value ,@indices))
 (defsetf %heap-alien %set-heap-alien)
 
 ;;; from arch-vm.lisp
-(in-package "SB!VM")
+(in-package "SB-VM")
 (defsetf context-register %set-context-register)
+(defsetf boxed-context-register %set-boxed-context-register)
 (defsetf context-float-register %set-context-float-register)
 ;;; from bit-bash.lisp
 (defsetf word-sap-ref %set-word-sap-ref)
 
 ;;; from debug-int.lisp
-(in-package "SB!DI")
+(in-package "SB-DI")
 (defsetf stack-ref %set-stack-ref)
 (defsetf debug-var-value %set-debug-var-value)
 (defsetf debug-var-value %set-debug-var-value)
 (defsetf breakpoint-info %set-breakpoint-info)
 
 ;;; from bignum.lisp
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 (defsetf %bignum-ref %bignum-set)
 
 ;;; from defstruct.lisp
 (defsetf %instance-ref %instance-set)
 
 (defsetf %raw-instance-ref/word %raw-instance-set/word)
-#!+raw-signed-word
+;; The *FEATURE* formerly known as :RAW-SIGNED-WORD
+;; This condition would be better as
+;;   (vop-translates sb-kernel:%raw-instance-ref/signed-word)
+;; however the defknown is only executed if the raw slot type exists.
+;; (See compiler/generic/vm-fndb where it maps over *raw-slot-data*)
+#!+(vop-named sb-vm::raw-instance-ref/signed-word)
 (defsetf %raw-instance-ref/signed-word %raw-instance-set/signed-word)
 (defsetf %raw-instance-ref/single %raw-instance-set/single)
 (defsetf %raw-instance-ref/double %raw-instance-set/double)
@@ -77,14 +83,14 @@
     (if (eq sub-accessor 'nthcdr) ; random N
         (lambda (access-form env)
           (declare (ignore env))
-          (declare (sb!c::lambda-list (n list)))
+          (declare (sb-c::lambda-list (n list)))
           (destructuring-bind (n list) (cdr access-form) ; for effect
             (declare (ignore n list)))
           (expand '(nthcdr) access-form))
         ;; NTHCDR of fixed N, or CxxxxR composition
         (lambda (access-form env)
           (declare (ignore env))
-          (declare (sb!c::lambda-list (list)))
+          (declare (sb-c::lambda-list (list)))
           (destructuring-bind (list) (cdr access-form) ; for effect
             (declare (ignore list)))
           (expand sub-accessor access-form))))))
@@ -184,7 +190,7 @@
 (defsetf code-header-ref code-header-set)
 
 ;;; from pcl
-(defsetf slot-value sb!pcl::set-slot-value)
+(defsetf slot-value sb-pcl::set-slot-value)
 
 ;;; from sxhash.lisp
 (define-modify-macro mixf (y) mix)
@@ -198,14 +204,14 @@
 ;; it. In particular, this must fail: (SETF (GET 'SYM 'IND (ERROR "Foo")) 3).
 
 (defsetf get (symbol indicator &optional default &environment e) (newval)
-  (let ((constp (sb!xc:constantp default e)))
+  (let ((constp (sb-xc:constantp default e)))
     ;; always reference default's temp var to "use" it
     `(%put ,symbol ,indicator ,(if constp newval `(progn ,default ,newval)))))
 
 ;; A possible optimization for read/modify/write of GETHASH
 ;; would be to predetermine the vector element where the key/value pair goes.
 (defsetf gethash (key hashtable &optional default &environment e) (newval)
-  (let ((constp (sb!xc:constantp default e)))
+  (let ((constp (sb-xc:constantp default e)))
     ;; always reference default's temp var to "use" it
     `(%puthash ,key ,hashtable ,(if constp newval `(progn ,default ,newval)))))
 
@@ -214,7 +220,7 @@
 (define-setf-expander the (&whole form type place &environment env)
   (binding* ((op (car form))
              ((temps subforms store-vars setter getter)
-              (sb!xc:get-setf-expansion place env)))
+              (sb-xc:get-setf-expansion place env)))
     (values temps subforms store-vars
             `(multiple-value-bind ,store-vars (,op ,type (values ,@store-vars))
                ,setter)
@@ -222,7 +228,7 @@
 
 (define-setf-expander getf (place prop &optional default &environment env)
   (binding* (((place-tempvars place-tempvals stores set get)
-              (sb!xc:get-setf-expansion place env))
+              (sb-xc:get-setf-expansion place env))
              ((call-tempvars call-tempvals call-args bitmask)
               (collect-setf-temps (list prop default) env '(indicator default)))
              (newval (gensym "NEW")))
@@ -244,7 +250,7 @@
   (let (all-dummies all-vals newvals setters getters)
     (dolist (place places)
       (multiple-value-bind (dummies vals newval setter getter)
-          (sb!xc:get-setf-expansion place env)
+          (sb-xc:get-setf-expansion place env)
         ;; ANSI 5.1.2.3 explains this logic quite precisely.  --
         ;; CSR, 2004-06-29
         (setq all-dummies (append all-dummies dummies (cdr newval))
@@ -306,8 +312,8 @@ place with bits from the low-order end of the new value."
                   (collect-setf-temps (list spec) env '(bytespec))))
              (byte (if (cdr byte-args) (cons 'byte byte-args) (car byte-args)))
              ((place-tempvars place-tempvals stores setter getter)
-              (sb!xc:get-setf-expansion place env))
-             (newval (sb!xc:gensym "NEW"))
+              (sb-xc:get-setf-expansion place env))
+             (newval (sb-xc:gensym "NEW"))
              (new-int `(,store-fun
                         ,(if (eq load-fun 'logbitp) `(if ,newval 1 0) newval)
                         ,byte ,getter)))
@@ -333,9 +339,10 @@ place with bits from the low-order end of the new value."
 (locally (declare (notinline info)) ; can't inline
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (%defsetf 'truly-the (info :setf :expander 'the))
+  (%defsetf 'the* (info :setf :expander 'the))
 
   (%defsetf 'mask-field (info :setf :expander 'ldb)
-  "The first argument is a byte specifier. The second is any place form
+            "The first argument is a byte specifier. The second is any place form
 acceptable to SETF. Replaces the specified byte of the number in this place
 with bits from the corresponding position in the new value.")
 
@@ -345,3 +352,18 @@ with bits from the corresponding position in the new value.")
 ;;; Additionally (setf (logbitp N x) t) is extremely stupid- it first clears
 ;;; and then sets the bit, though it does manage to pre-shift the constants.
    (%defsetf 'logbitp (info :setf :expander 'ldb))))
+
+;;; Rather than have a bunch of SB-PCL::FAST-METHOD function names all point
+;;; to one that is randomly chosen - and therefore looks confusing -
+;;; use these trivial do-nothing functions which are compiled asap.
+;;; The selection is deterministic since ties are broken by serial number.
+(export '(0-arg-nil 1-arg-nil 2-arg-nil 3-arg-nil n-arg-nil
+          1-arg-t n-arg-t)
+        "SB-IMPL") ; export to prevent death by tree-shaker
+(defun n-arg-nil () (declare (optimize (sb-c::verify-arg-count 0))) nil)
+(defun n-arg-t   () (declare (optimize (sb-c::verify-arg-count 0))) t)
+(defun 0-arg-nil () nil)
+(defun 1-arg-nil (a) (declare (ignore a)) nil)
+(defun 1-arg-t   (a) (declare (ignore a)) t)
+(defun 2-arg-nil (a b) (declare (ignore a b)) nil)
+(defun 3-arg-nil (a b c) (declare (ignore a b c)) nil)

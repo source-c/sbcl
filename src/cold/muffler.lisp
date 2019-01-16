@@ -12,21 +12,22 @@
 
 ;; These have to be stated three times:
 ;;  - once for the host if self-hosted,
-;;  - once for the cross-compiler (but substituting SB!INT for SB-INT)
+;;  - once for the cross-compiler
 ;;  - once again for warm load.
 
 ;; This avoids muffling "could not optimize away %SAP-ALIEN"
 ;; and "SAP to pointer conversion" in case we care.
 (defun unable-to-optimize-note-p (condition)
-  (and (typep condition
-              #-sb-xc 'sb-int:simple-compiler-note  ; make-host-1 and warm
-              #+sb-xc 'sb!int:simple-compiler-note) ; make-host-2
-       (or (search "unable to" (simple-condition-format-control condition))
-           (let ((args (simple-condition-format-arguments condition)))
-             (and (typep (car args) '(cons string))
-                  (search "forced to do" (caar args)))))))
+  (and (string= (type-of condition) "SIMPLE-COMPILER-NOTE")
+       (let ((fc (simple-condition-format-control condition)))
+         (and (stringp fc)
+              (or (search "unable to" fc)
+                  (let ((args (simple-condition-format-arguments condition)))
+                    (and (typep (car args) '(cons string))
+                         (search "forced to do" (caar args)))))))))
 
 (defun optional+key-style-warning-p (condition)
-    (and (typep condition '(and simple-condition style-warning))
-         (search "&OPTIONAL and &KEY found"
-                 (simple-condition-format-control condition))))
+  (and (typep condition '(and simple-condition style-warning))
+       (let ((fc (simple-condition-format-control condition)))
+         (and (stringp fc)
+              (search "&OPTIONAL and &KEY found" fc)))))

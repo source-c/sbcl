@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
 ;;;; Allocator for the array header.
@@ -80,7 +80,7 @@
   (:generator 5
     (let ((error (generate-error-code vop 'invalid-array-index-error
                                       array bound index)))
-      (%test-fixnum index error t :temp temp)
+      (%test-fixnum index temp error t)
       (inst cmplw index bound)
       (inst bge error))))
 
@@ -139,7 +139,6 @@
   (def-data-vector-frobs simple-array-signed-byte-32 word-index
     signed-num signed-reg))
 
-#!+compare-and-swap-vops
 (define-vop (%compare-and-swap-svref word-index-cas)
   (:note "inline array compare-and-swap")
   (:policy :fast-safe)

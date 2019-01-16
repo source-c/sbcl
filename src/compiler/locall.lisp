@@ -19,7 +19,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; This function propagates information from the variables in the
 ;;; function FUN to the actual arguments in CALL. This is also called
@@ -38,7 +38,7 @@
         for args on (basic-combination-args call)
         and var in (lambda-vars fun)
         do (assert-lvar-type (car args) (leaf-type var) policy
-                             (cons :bind (lambda-var-%source-name var)))
+                             (lambda-var-%source-name var))
         do (unless (leaf-refs var)
              (flush-dest (car args))
              (setf (car args) nil)))
@@ -89,7 +89,8 @@
 (defun merge-tail-sets (call &optional (new-fun (combination-lambda call)))
   (declare (type basic-combination call) (type clambda new-fun))
   (let ((return (node-dest call)))
-    (when (return-p return)
+    (when (and (return-p return)
+               (not (memq (functional-kind new-fun) '(:deleted :zombie))))
       (let ((call-set (lambda-tail-set (node-home-lambda call)))
             (fun-set (lambda-tail-set new-fun)))
         (unless (eq call-set fun-set)
@@ -162,62 +163,98 @@
      (let* ((n-supplied (gensym))
             (nargs (length (lambda-vars fun)))
             (temps (make-gensym-list nargs)))
-       #!+precise-arg-count-error
        `(lambda (,n-supplied ,@temps)
           (declare (type index ,n-supplied)
                    (ignore ,n-supplied))
-          (%funcall ,fun ,@temps))
-       #!-precise-arg-count-error
-       `(lambda (,n-supplied ,@temps)
-          (declare (type index ,n-supplied))
-          ,(if (policy *lexenv* (zerop verify-arg-count))
-               `(declare (ignore ,n-supplied))
-               `(%verify-arg-count ,n-supplied ,nargs))
           (%funcall ,fun ,@temps))))
     (optional-dispatch
+     ;; Force convertion of all entries
+     (optional-dispatch-entry-point-fun fun 0)
      (let* ((min (optional-dispatch-min-args fun))
             (max (optional-dispatch-max-args fun))
             (more (optional-dispatch-more-entry fun))
             (n-supplied (gensym))
-            (temps (make-gensym-list max)))
-       (collect ((entries))
-         ;; Force convertion of all entries
-         (optional-dispatch-entry-point-fun fun 0)
-         (loop for ep in (optional-dispatch-entry-points fun)
-               and n from min
-               do (entries `((eql ,n-supplied ,n)
-                             (%funcall ,(force ep) ,@(subseq temps 0 n)))))
-         #!+precise-arg-count-error
-         `(lambda (,n-supplied ,@temps)
-            (declare (type index ,n-supplied))
-            (cond
-              ,@(butlast (entries))
-              (t
-               ;; Arg-checking is performed before this step,
-               ;; arranged by INIT-XEP-ENVIRONMENT,
-               ;; perform the last action unconditionally,
-               ;; and without this the function derived type will be bad.
-               ,(if more
-                    (with-unique-names (n-context n-count)
-                      `(multiple-value-bind (,n-context ,n-count)
-                           (%more-arg-context ,n-supplied ,max)
-                         (%funcall ,more ,@temps ,n-context ,n-count)))
-                    (cadar (last (entries)))))))
-         #!-precise-arg-count-error
-         `(lambda (,n-supplied ,@temps)
-            (declare (type index ,n-supplied))
-            (cond
-             ,@(if more (butlast (entries)) (entries))
-             ,@(when more
-                 ;; KLUDGE: (NOT (< ...)) instead of >= avoids one round of
-                 ;; deftransforms and lambda-conversion.
-                 `((,(if (zerop min) t `(not (< ,n-supplied ,max)))
-                    ,(with-unique-names (n-context n-count)
-                       `(multiple-value-bind (,n-context ,n-count)
-                            (%more-arg-context ,n-supplied ,max)
-                          (%funcall ,more ,@temps ,n-context ,n-count))))))
-             (t
-              (%local-arg-count-error ,n-supplied ',(leaf-debug-name fun))))))))))
+            (temps (make-gensym-list max))
+            (main (optional-dispatch-main-entry fun))
+            (optional-vars (nthcdr min (lambda-vars main)))
+            (keyp (optional-dispatch-keyp fun))
+            (used-eps (nreverse
+                       ;; Ignore only the entries at the tail, can't
+                       ;; deal with the values being used by
+                       ;; subsequent default forms at the moment
+                       (loop with previous-unused = t
+                             for last = t then nil
+                             for promise in (reverse (optional-dispatch-entry-points fun))
+                             for ep = (force promise)
+                             for n downfrom max
+                             for optional-n downfrom (- max min)
+                             unless (and previous-unused
+                                         (can-ignore-optional-ep optional-n optional-vars
+                                                                 keyp))
+                             collect (cons ep n)
+                             and do (setf previous-unused (eq ep main))
+                             else if (and last more)
+                             collect (cons main (1+ n))))))
+       `(lambda (,n-supplied ,@temps)
+          (declare (type index ,n-supplied)
+                   (ignorable ,n-supplied))
+          (cond
+            ,@(loop for previous-n = (1- min) then n
+                    for ((ep . n) . next) on used-eps
+                    collect
+                    (cond (next
+                           `(,(if (= (1+ previous-n) n)
+                                  `(eql ,n-supplied ,n)
+                                  `(<= ,n-supplied ,n))
+                             (%funcall ,ep ,@(subseq temps 0 n))))
+                          (more
+                           (with-unique-names (n-context n-count)
+                             `(t
+                               ,(if (= max n)
+                                    `(multiple-value-bind (,n-context ,n-count)
+                                         (%more-arg-context ,n-supplied ,max)
+                                       (%funcall ,more ,@temps ,n-context ,n-count))
+                                    ;; The &rest var is unused, call the main entry point directly
+                                    `(%funcall ,ep
+                                               ,@(loop for supplied-p = nil
+                                                       then (and info
+                                                                 (arg-info-supplied-p info))
+                                                       with vars = temps
+                                                       for x in (lambda-vars ep)
+                                                       for info = (lambda-var-arg-info x)
+                                                       collect
+                                                       (cond (supplied-p
+                                                              t)
+                                                             ((and info
+                                                                   (eq (arg-info-kind info)
+                                                                       :more-count))
+                                                              0)
+                                                             (t
+                                                              (pop vars)))))))))
+                          (t
+                           `(t
+                             ;; Arg-checking is performed before this step,
+                             ;; arranged by INIT-XEP-ENVIRONMENT,
+                             ;; perform the last action unconditionally,
+                             ;; and without this the function derived type will be bad.
+                             (%funcall ,ep ,@(subseq temps 0 n))))))))))))
+
+(defun can-ignore-optional-ep (n vars keyp)
+  (let ((var (loop with i = n
+                   for var in vars
+                   when (and (lambda-var-arg-info var)
+                             (minusp (decf i)))
+                   return var)))
+    (when (and var
+               (not (lambda-var-refs var))
+               (eql (lambda-var-type var) *universal-type*))
+      (let* ((info (lambda-var-arg-info var))
+             (kind (arg-info-kind info)))
+        (or (and (eq kind :optional)
+                 (not (arg-info-supplied-p info))
+                 (constantp (arg-info-default info)))
+            (and (eq kind :rest)
+                 (not keyp)))))))
 
 ;;; Make an external entry point (XEP) for FUN and return it. We
 ;;; convert the result of MAKE-XEP-LAMBDA in the correct environment,
@@ -266,7 +303,8 @@
   (declare (type ref ref))
   (let ((fun (ref-leaf ref)))
     (unless (or (xep-p fun)
-                (member (functional-kind fun) '(:escape :cleanup)))
+                (member (functional-kind fun) '(:escape :cleanup
+                                                :zombie :deleted)))
       (change-ref-leaf ref (or (functional-entry-fun fun)
                                (make-xep fun))))))
 
@@ -297,7 +335,9 @@
                       (eq (lvar-uses lvar) ref))
 
                  (convert-call-if-possible ref dest)
-
+                 ;; It might have been deleted by CONVERT-CALL-IF-POSSIBLE
+                 (when (eq (functional-kind fun) :deleted)
+                   (return-from locall-analyze-fun-1))
                  (unless (eq (basic-combination-kind dest) :local)
                    (reference-entry-point ref)
                    (setq local-p nil)))
@@ -525,9 +565,10 @@
                      arg
                      (make-short-values-type
                       (and vars
-                       (loop repeat (nth-value 1 (values-types
+                       (loop for var in vars
+                             repeat (nth-value 1 (values-types
                                                   (lvar-derived-type arg)))
-                             collect (leaf-type (pop vars)))))
+                             collect (leaf-type var))))
                      (lexenv-policy (node-lexenv call)))))))))
   (values))
 
@@ -946,7 +987,11 @@
     ;; CLAMBDA no longer has an independent existence as an entity
     ;; which calls things or has DFO dependencies.
     (setf (lambda-calls-or-closes clambda) nil)
-
+    ;; Make sure the exits that are no longer non-local are deleted
+    (loop for entry in (lambda-entries home)
+          do (loop for exit in (entry-exits entry)
+                   when (eq (node-home-lambda entry) home)
+                   do (reoptimize-node exit)))
     ;; All of CLAMBDA's ENTRIES belong to HOME now.
     (setf (lambda-entries home)
           (nconc (lambda-entries clambda)
@@ -983,6 +1028,7 @@
           (derive-node-type use call-type)))
       (substitute-lvar-uses lvar result
                             (and lvar (eq (lvar-uses lvar) call)))))
+
   (values))
 
 ;;; We are converting FUN to be a LET when the call is in a non-tail
@@ -998,6 +1044,7 @@
         (let ((this-call (node-dest ref)))
           (when (and this-call
                      (node-tail-p this-call)
+                     (not (node-to-be-deleted-p this-call))
                      (eq (node-home-lambda this-call) fun))
             (setf (node-tail-p this-call) nil)
             (ecase (functional-kind called)
@@ -1006,8 +1053,9 @@
                      (lvar (node-lvar call)))
                  (unlink-blocks block (first (block-succ block)))
                  (link-blocks block next-block)
-                 (aver (not (node-lvar this-call)))
-                 (add-lvar-use this-call lvar)))
+                 (if (eq (node-derived-type this-call) *empty-type*)
+                     (maybe-terminate-block this-call nil)
+                     (add-lvar-use this-call lvar))))
               (:deleted)
               ;; The called function might be an assignment in the
               ;; case where we are currently converting that function.
@@ -1050,9 +1098,15 @@
          (call-return (lambda-return call-fun)))
     (when (and call-return
                (block-delete-p (node-block call-return)))
+      (flush-dest (return-result call-return))
       (delete-return call-return)
-      (unlink-node call-return)
-      (setq call-return nil))
+      ;; A new return will be put into that lambda, don't want
+      ;; DELETE-RETURN called by DELETE-BLOCK to delete the new return
+      ;; from the lambda.
+      ;; (Previously, UNLINK-NODE was called on the return, but it
+      ;; doesn't work well on deleted blocks)
+      (setf (return-lambda call-return) nil
+            call-return nil))
     (cond ((not return))
           ((or next-block call-return)
            (unless (block-delete-p (node-block return))
@@ -1065,7 +1119,7 @@
            (setf (lambda-return call-fun) return)
            (setf (return-lambda return) call-fun)
            (setf (lambda-return fun) nil))))
-  (%delete-lvar-use call) ; LET call does not have value semantics
+  (delete-lvar-use call) ; LET call does not have value semantics
   (values))
 
 ;;; Actually do LET conversion. We call subfunctions to do most of the
@@ -1158,13 +1212,12 @@
              ((csubtypep (single-value-type (node-derived-type use))
                          (leaf-type var))
               (let ((use-component (node-component use)))
+                (propagate-lvar-annotations-to-refs arg var)
+                (update-lvar-dependencies leaf arg)
                 (substitute-leaf-if
                  (lambda (ref)
-                   (cond ((eq (node-component ref) use-component)
-                          (setf done-something t))
-                         (t
-                          (aver (lambda-toplevelish-p (lambda-home fun)))
-                          nil)))
+                   (when (eq (node-component ref) use-component)
+                     (setf done-something t)))
                  leaf var)))
              ;; otherwise, we can still play LVAR-level tricks for single
              ;;  destination variables.
@@ -1321,7 +1374,8 @@
       (when (and (dolist (ref (leaf-refs clambda) t)
                    (let ((dest (node-dest ref)))
                      (when (or (not dest)
-                               (block-delete-p (node-block dest)))
+                               (node-to-be-deleted-p ref)
+                               (node-to-be-deleted-p dest))
                        (return nil))
                      (let ((home (node-home-lambda ref)))
                        (unless (eq home clambda)

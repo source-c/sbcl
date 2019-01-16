@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; defining the registers
 
@@ -80,16 +80,24 @@
   (defregset descriptor-regs
     fdefn lexenv nargs ocfp lra a0 a1 a2 a3 a4 a5 l0 l1 l2)
 
+  ;; OAOOM: Same as runtime/alpha-lispregs.h
+  (defregset boxed-regs
+      code fdefn lexenv nargs ocfp lra
+      a0 a1 a2 a3 a4 a5
+      l0 l1 l2)
+
   (defregset *register-arg-offsets*
     a0 a1 a2 a3 a4 a5)
   (defparameter register-arg-names '(a0 a1 a2 a3 a4 a5)))
 
+(!define-storage-bases
 (define-storage-base registers :finite :size 32)
 (define-storage-base float-registers :finite :size 64)
 (define-storage-base control-stack :unbounded :size 8)
 (define-storage-base non-descriptor-stack :unbounded :size 0)
 (define-storage-base constant :non-packed)
 (define-storage-base immediate-constant :non-packed)
+)
 
 (!define-storage-classes
 
@@ -258,29 +266,29 @@
 (defun immediate-constant-sc (value)
   (typecase value
     ((integer 0 0)
-     (sc-number-or-lose 'zero))
+     zero-sc-number)
     (null
-     (sc-number-or-lose 'null ))
-    ((or (integer #.sb!xc:most-negative-fixnum #.sb!xc:most-positive-fixnum)
+     null-sc-number)
+    ((or (integer #.sb-xc:most-negative-fixnum #.sb-xc:most-positive-fixnum)
          character)
-     (sc-number-or-lose 'immediate ))
+     immediate-sc-number)
     (symbol
      (if (static-symbol-p value)
-         (sc-number-or-lose 'immediate )
+         immediate-sc-number
          nil))
     (single-float
      (if (eql value 0f0)
-         (sc-number-or-lose 'fp-single-zero )
+         fp-single-zero-sc-number
          nil))
     (double-float
      (if (eql value 0d0)
-         (sc-number-or-lose 'fp-double-zero )
+         fp-double-zero-sc-number
          nil))))
 
 (defun boxed-immediate-sc-p (sc)
-  (or (eql sc (sc-number-or-lose 'zero))
-      (eql sc (sc-number-or-lose 'null))
-      (eql sc (sc-number-or-lose 'immediate))))
+  (or (eql sc zero-sc-number)
+      (eql sc null-sc-number)
+      (eql sc immediate-sc-number)))
 
 ;;; A predicate to see if a character can be used as an inline
 ;;; constant (the immediate field in the instruction used is eight
@@ -293,8 +301,8 @@
 ;;;; function call parameters
 
 ;;; the SC numbers for register and stack arguments/return values
-(defconstant immediate-arg-scn (sc-number-or-lose 'any-reg))
-(defconstant control-stack-arg-scn (sc-number-or-lose 'control-stack))
+(defconstant immediate-arg-scn any-reg-sc-number)
+(defconstant control-stack-arg-scn control-stack-sc-number)
 
 (eval-when  (:compile-toplevel :load-toplevel :execute)
 
@@ -339,7 +347,7 @@
       (immediate-constant "Immed"))))
 
 (defun combination-implementation-style (node)
-  (declare (type sb!c::combination node) (ignore node))
+  (declare (type sb-c::combination node) (ignore node))
   (values :default nil))
 
 (defun primitive-type-indirect-cell-type (ptype)

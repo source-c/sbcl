@@ -23,7 +23,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!UNIX")
+(in-package "SB-UNIX")
 
 (/show0 "unix.lisp 21")
 
@@ -42,7 +42,7 @@
 ;;;; Lisp types used by syscalls
 
 (deftype unix-pathname () 'simple-string)
-(deftype unix-fd () `(integer 0 ,sb!xc:most-positive-fixnum))
+(deftype unix-fd () `(integer 0 ,sb-xc:most-positive-fixnum))
 
 (deftype unix-file-mode () '(unsigned-byte 32))
 (deftype unix-pid () '(unsigned-byte 32))
@@ -55,7 +55,7 @@
 
 ;;; FIXME: The various FOO-SYSCALL-BAR macros, and perhaps some other
 ;;; macros in this file, are only used in this file, and could be
-;;; implemented using SB!XC:DEFMACRO wrapped in EVAL-WHEN.
+;;; implemented using SB-XC:DEFMACRO wrapped in EVAL-WHEN.
 ;;;
 ;;; SB-EXECUTABLE, at least, uses one of these macros; other libraries
 ;;; and programs have been known to use them as well.  Perhaps they
@@ -66,7 +66,7 @@
     (setf name
           (concatenate 'string #!+win32 "_" (subseq name 3))))
   `(locally
-    (declare (optimize (sb!c::float-accuracy 0)))
+    (declare (optimize (sb-c::float-accuracy 0)))
     (let ((result (alien-funcall (extern-alien ,name (function int ,@arg-types))
                                 ,@args)))
       (if (minusp result)
@@ -78,7 +78,7 @@
 ;;; never really get an error.
 (defmacro syscall* ((name &rest arg-types) success-form &rest args)
   `(locally
-    (declare (optimize (sb!c::float-accuracy 0)))
+    (declare (optimize (sb-c::float-accuracy 0)))
     (let ((result (alien-funcall (extern-alien ,name (function int ,@arg-types))
                                  ,@args)))
       (if (minusp result)
@@ -140,7 +140,7 @@ corresponds to NAME, or NIL if there is none."
 (define-alien-type nil
   (struct fd-set
           (fds-bits (array fd-mask #.(/ fd-setsize
-                                        sb!vm:n-machine-word-bits)))))
+                                        sb-vm:n-machine-word-bits)))))
 
 (/show0 "unix.lisp 304")
 
@@ -162,7 +162,7 @@ corresponds to NAME, or NIL if there is none."
            (type unix-file-mode mode)
            #!+win32
            (ignore mode))
-  #!+win32 (sb!win32:unixlike-open path flags :overlapped overlapped)
+  #!+win32 (sb-win32:unixlike-open path flags :overlapped overlapped)
   #!-win32
   (with-restarted-syscall (value errno)
     (int-syscall ("open" c-string int int)
@@ -175,7 +175,7 @@ corresponds to NAME, or NIL if there is none."
 ;;; associated with it.
 (/show0 "unix.lisp 391")
 (defun unix-close (fd)
-  #!+win32 (sb!win32:unixlike-close fd)
+  #!+win32 (sb-win32:unixlike-close fd)
   #!-win32 (declare (type unix-fd fd))
   #!-win32 (void-syscall ("close" int) fd))
 
@@ -200,7 +200,7 @@ corresponds to NAME, or NIL if there is none."
                                mode)))
         (if (minusp fd)
             (values nil (get-errno))
-            (values #!-win32 fd #!+win32 (sb!win32::duplicate-and-unwrap-fd fd)
+            (values #!-win32 fd #!+win32 (sb-win32::duplicate-and-unwrap-fd fd)
                     (octets-to-string template-buffer)))))))
 
 ;;;; resourcebits.h
@@ -270,7 +270,7 @@ corresponds to NAME, or NIL if there is none."
 (defun unix-isatty (fd)
   (declare (type unix-fd fd))
   #!-win32 (int-syscall ("isatty" int) fd)
-  #!+win32 (sb!win32::windows-isatty fd))
+  #!+win32 (sb-win32::windows-isatty fd))
 
 (defun unix-lseek (fd offset whence)
   "Unix-lseek accepts a file descriptor and moves the file pointer by
@@ -288,7 +288,7 @@ corresponds to NAME, or NIL if there is none."
                                              #!+largefile "lseek_largefile"
                                              (function off-t int off-t int))
                         fd offset whence)
-          #!+win32 (sb!win32:lseeki64 fd offset whence)))
+          #!+win32 (sb-win32:lseeki64 fd offset whence)))
     (if (minusp result)
         (values nil (get-errno))
       (values result 0))))
@@ -298,7 +298,6 @@ corresponds to NAME, or NIL if there is none."
 ;;; and store them into the buffer. It returns the actual number of
 ;;; bytes read.
 
-#!-sb!fluid
 (declaim (maybe-inline unix-read))
 
 (defun unix-read (fd buf len)
@@ -347,7 +346,7 @@ corresponds to NAME, or NIL if there is none."
 
 #!+win32
 (defun unix-pipe ()
-  (sb!win32::windows-pipe))
+  (sb-win32::windows-pipe))
 
 ;; Windows mkdir() doesn't take the mode argument. It's cdecl, so we could
 ;; actually call it passing the mode argument, but some sharp-eyed reader
@@ -389,17 +388,17 @@ corresponds to NAME, or NIL if there is none."
   ;;
   ;; Signal an error at compile-time, since it's needed for the
   ;; runtime to start up
-  #!-(or android linux openbsd freebsd netbsd sunos osf1 darwin hpux win32 dragonfly)
+  #!-(or android linux openbsd freebsd netbsd sunos darwin hpux win32 dragonfly)
   #.(error "POSIX-GETCWD is not implemented.")
   (or
-   #!+(or linux openbsd freebsd netbsd sunos osf1 darwin hpux win32 dragonfly)
+   #!+(or linux openbsd freebsd netbsd sunos darwin hpux win32 dragonfly)
    (newcharstar-string (alien-funcall (extern-alien "getcwd"
                                                     (function (* char)
                                                               (* char)
                                                               size-t))
                                       nil
                                       #!+(or linux openbsd freebsd netbsd darwin win32 dragonfly) 0
-                                      #!+(or sunos osf1 hpux) 1025))
+                                      #!+(or sunos hpux) 1025))
    #!+android
    (with-alien ((ptr (array char #.path-max)))
      ;; Older bionic versions do not have the above feature.
@@ -534,8 +533,8 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
 #!-win32
 (defun unix-ioctl (fd cmd arg)
   (declare (type unix-fd fd)
-           (type (signed-byte 32) cmd))
-  (void-syscall ("ioctl" int int (* char)) fd cmd arg))
+           (type word cmd))
+  (void-syscall ("ioctl" int unsigned-long (* char)) fd cmd arg))
 
 ;;;; sys/resource.h
 
@@ -609,7 +608,7 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
        (format *debug-io*
                "~&=== Starting a ~A without a timeout while interrupts are disabled. ===~%"
                type)
-       (sb!debug:print-backtrace)))
+       (sb-debug:print-backtrace)))
     nil))
 
 ;;;; poll.h
@@ -696,29 +695,29 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
     (fixnum
      (setf (deref (slot fdset 'fds-bits) 0) num)
      (loop for index from 1 below (/ fd-setsize
-                                     sb!vm:n-machine-word-bits)
+                                     sb-vm:n-machine-word-bits)
            do (setf (deref (slot fdset 'fds-bits) index) 0)))
     (t
      (loop for index from 0 below (/ fd-setsize
-                                     sb!vm:n-machine-word-bits)
+                                     sb-vm:n-machine-word-bits)
            do (setf (deref (slot fdset 'fds-bits) index)
-                    (ldb (byte sb!vm:n-machine-word-bits
-                               (* index sb!vm:n-machine-word-bits))
+                    (ldb (byte sb-vm:n-machine-word-bits
+                               (* index sb-vm:n-machine-word-bits))
                          num))))))
 
 (defun fd-set-to-num (nfds fdset)
-  (if (<= nfds sb!vm:n-machine-word-bits)
+  (if (<= nfds sb-vm:n-machine-word-bits)
       (deref (slot fdset 'fds-bits) 0)
       (loop for index below (/ fd-setsize
-                               sb!vm:n-machine-word-bits)
+                               sb-vm:n-machine-word-bits)
             sum (ash (deref (slot fdset 'fds-bits) index)
-                     (* index sb!vm:n-machine-word-bits)))))
+                     (* index sb-vm:n-machine-word-bits)))))
 
 ;;; Examine the sets of descriptors passed as arguments to see whether
 ;;; they are ready for reading and writing. See the UNIX Programmer's
 ;;; Manual for more information.
 (defun unix-select (nfds rdfds wrfds xpfds to-secs &optional (to-usecs 0))
-  (declare (muffle-conditions t))
+  (declare (muffle-conditions compiler-note))
   (declare (type integer nfds)
            (type unsigned-byte rdfds wrfds xpfds)
            (type (or (unsigned-byte 31) null) to-secs)
@@ -754,28 +753,28 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
 (declaim (inline fd-set fd-clr fd-isset fd-zero))
 (defun fd-set (offset fd-set)
   (multiple-value-bind (word bit) (floor offset
-                                            sb!vm:n-machine-word-bits)
+                                            sb-vm:n-machine-word-bits)
      (setf (deref (slot fd-set 'fds-bits) word)
-           (logior (truly-the (unsigned-byte #.sb!vm:n-machine-word-bits)
+           (logior (truly-the (unsigned-byte #.sb-vm:n-machine-word-bits)
                               (ash 1 bit))
                    (deref (slot fd-set 'fds-bits) word)))))
 
 (defun fd-clr (offset fd-set)
   (multiple-value-bind (word bit) (floor offset
-                                         sb!vm:n-machine-word-bits)
+                                         sb-vm:n-machine-word-bits)
     (setf (deref (slot fd-set 'fds-bits) word)
           (logand (deref (slot fd-set 'fds-bits) word)
-                  (sb!kernel:word-logical-not
-                   (truly-the (unsigned-byte #.sb!vm:n-machine-word-bits)
+                  (sb-kernel:word-logical-not
+                   (truly-the (unsigned-byte #.sb-vm:n-machine-word-bits)
                               (ash 1 bit)))))))
 
 (defun fd-isset (offset fd-set)
   (multiple-value-bind (word bit) (floor offset
-                                         sb!vm:n-machine-word-bits)
+                                         sb-vm:n-machine-word-bits)
      (logbitp bit (deref (slot fd-set 'fds-bits) word))))
 
 (defun fd-zero (fd-set)
-  (loop for index below (/ fd-setsize sb!vm:n-machine-word-bits)
+  (loop for index below (/ fd-setsize sb-vm:n-machine-word-bits)
         do (setf (deref (slot fd-set 'fds-bits) index) 0)))
 
 #!-os-provides-poll
@@ -892,7 +891,7 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
 (defun unix-fstat (fd)
   #!-win32
   (declare (type unix-fd fd))
-  (#!-win32 funcall #!+win32 sb!win32::call-with-crt-fd
+  (#!-win32 funcall #!+win32 sb-win32::call-with-crt-fd
    (lambda (fd)
      (with-alien ((buf (struct wrapped_stat)))
        (syscall ("fstat_wrapper" int (* (struct wrapped_stat)))
@@ -1045,7 +1044,7 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
 ;;; removed by hand.
 
 (defconstant micro-seconds-per-internal-time-unit
-  (/ 1000000 sb!xc:internal-time-units-per-second))
+  (/ 1000000 sb-xc:internal-time-units-per-second))
 
 ;;; UNIX specific code, that has been cleanly separated from the
 ;;; Windows build.
@@ -1110,9 +1109,9 @@ the UNIX epoch (January 1st 1970.)"
         (c-sec 0)
         (c-msec 0)
         (now 0))
-    (declare (type sb!kernel:internal-seconds e-sec c-sec)
-             (type sb!kernel:internal-seconds e-msec c-msec)
-             (type sb!kernel:internal-time now))
+    (declare (type sb-kernel:internal-seconds e-sec c-sec)
+             (type sb-kernel:internal-seconds e-msec c-msec)
+             (type sb-kernel:internal-time now))
     (defun reinit-internal-real-time ()
       (setf (values e-sec e-msec) (system-real-time-values)
             c-sec 0
@@ -1136,7 +1135,7 @@ the UNIX epoch (January 1st 1970.)"
       (multiple-value-bind (sec msec) (system-real-time-values)
         (unless (and (= msec c-msec) (= sec c-sec))
           (setf now (+ (* (- sec e-sec)
-                          sb!xc:internal-time-units-per-second)
+                          sb-xc:internal-time-units-per-second)
                        (- msec e-msec))
                 c-msec msec
                 c-sec sec))
@@ -1153,7 +1152,7 @@ the UNIX epoch (January 1st 1970.)"
                ;; to sometimes return 1000000 exactly.)
                (type fixnum utime-usec stime-usec))
       (let ((result (+ (* (+ utime-sec stime-sec)
-                          sb!xc:internal-time-units-per-second)
+                          sb-xc:internal-time-units-per-second)
                        (floor (+ utime-usec
                                  stime-usec
                                  (floor micro-seconds-per-internal-time-unit 2))

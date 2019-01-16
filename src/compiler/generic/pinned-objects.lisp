@@ -9,9 +9,9 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
-(sb!xc:defmacro with-pinned-objects ((&rest objects) &body body)
+(defmacro with-pinned-objects ((&rest objects) &body body)
   #.(concatenate 'string
   "Arrange with the garbage collector that the pages occupied by
 OBJECTS will not be moved in memory for the duration of BODY.
@@ -30,7 +30,7 @@ garbage collection."
   #!+(and gencgc (or x86 x86-64))
   (if objects
       (let ((pins (make-gensym-list (length objects)))
-            (wpo (sb!xc:gensym "WITH-PINNED-OBJECTS-THUNK")))
+            (wpo (sb-xc:gensym "WITH-PINNED-OBJECTS-THUNK")))
         ;; BODY is stuffed in a function to preserve the lexical
         ;; environment.
         `(flet ((,wpo () (progn ,@body)))

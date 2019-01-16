@@ -333,7 +333,8 @@
         (remf info key)))
     (equal info info2)))
 
-(deftest allocation-infromation.1
+
+(deftest allocation-information.1
     (tai nil :heap '(:space :static))
   t)
 
@@ -349,7 +350,7 @@
 (deftest allocation-information.2c
   ;; This is a a test of SBCL genesis that leverages sb-introspect.
     (tai (sb-kernel::find-fdefn (elt sb-vm:+static-fdefns+ 0))
-         :heap '(:space #-immobile-space :static #+immobile-space :immobile))
+         :heap '(:space #+immobile-code :immobile #-immobile-code :static))
   t)
 
 (deftest allocation-information.3
@@ -361,11 +362,6 @@
     (tai 42s0 :immediate nil)
   t)
 
-;;; Skip the whole damn test on GENCGC PPC -- the combination is just
-;;; too flaky for this to make too much sense.  GENCGC SPARC almost
-;;; certainly exhibits the same behavior patterns (or antipatterns) as
-;;; GENCGC PPC.
-;;;
 ;;; -- It appears that this test can also fail due to systematic issues
 ;;; (possibly with the C compiler used) which we cannot detect based on
 ;;; *features*.  Until this issue has been fixed, I am marking this test
@@ -376,16 +372,12 @@
 (deftest* (allocation-information.4
            ;; Ignored as per the comment above, even though it seems
            ;; unlikely that this is the right condition.
-           :fails-on (or :win32 (and (or :ppc :sparc) :gencgc)))
+           :fails-on (or :win32 (and :sparc :gencgc)))
     #+gencgc
     (tai (make-list 1) :heap
-         ;; FIXME: This is the canonical GENCGC result. On PPC we sometimes get
-         ;; :LARGE T, which doesn't seem right -- but ignore that for now.
-         ;; Also the :write-protected value NIL, indicating that the page
-         ;; has been written, seems ok to me, so ignore that too.
-         `(:space :dynamic :generation 0
+         `(:space :dynamic :generation 0 :write-protected nil
            :boxed t :pinned nil :large nil)
-         :ignore (list :page :write-protected #+ppc :large))
+         :ignore (list :page))
     #-gencgc
     (tai :cons :heap
          ;; FIXME: Figure out what's the right cheney-result. SPARC at least
@@ -394,18 +386,98 @@
          :ignore '(:space))
   t)
 
+(setq sb-ext:*evaluator-mode* :compile)
+(sb-ext:defglobal *large-obj* nil)
 
-#+(and gencgc x86-64 (not win32))
+#+(and gencgc (or x86 x86-64 ppc) (not win32))
 (progn
   (setq *print-array* nil)
-  (defvar *large-array* (make-array (* sb-vm:gencgc-card-bytes 4)
-                                    :element-type '(unsigned-byte 8)))
-  (sb-ext:gc :gen 1) ; Array won't move to a large boxed page until GC'd
-  (deftest* (allocation-information.5)
-          (tai *large-array* :heap
+  (setq *large-obj* (make-array (* sb-vm:gencgc-card-bytes 4)
+                                :element-type '(unsigned-byte 8)))
+  (sb-ext:gc :gen 1) ; Array won't move to a large unboxed page until GC'd
+  (deftest allocation-information.5
+          (tai *large-obj* :heap
                `(:space :dynamic :generation 1 :boxed nil :pinned nil :large t)
                :ignore (list :page :write-protected))
       t))
+
+(defun page-and-gen (thing)
+  (let ((props (nth-value 1 (allocation-information thing))))
+    (values (getf props :page)
+            (getf props :generation))))
+
+(defun assert-large-page/gen/boxedp (thing-name page gen boxedp)
+  (sb-ext:gc :gen gen)
+  (let ((props (nth-value 1 (allocation-information (symbol-value thing-name)))))
+    ;; Don't leave any pointers to THING from the stack.
+    ;; Without it, the next test iteration (after next GC) will fail.
+    (sb-sys:scrub-control-stack)
+    ;; Check that uncopyableness isn't due to pin,
+    ;; or else the test proves nothing.
+    (and (eq (getf props :pinned :missing) nil)
+         (eq (getf props :large) t)
+         (= (getf props :page) page)
+         (= (getf props :generation) gen)
+         (eq (getf props :boxed :missing) boxedp))))
+#+gencgc
+(deftest* (allocation-information.6 :fails-on (or :sparc :x86))
+    ;; Remember, all tests run after all toplevel forms have executed,
+    ;; so if this were (DEFGLOBAL *LARGE-CODE* ... ) or something,
+    ;; the garbage collection explicitly requested for ALLOCATION-INFORMATION.5
+    ;; would have already happened, and thus affected this test as well.
+    ;; So we need to make the objects within each test,
+    ;; while avoiding use of lexical vars that would cause conservative pinning.
+    (multiple-value-bind (page gen)
+        (page-and-gen
+         (setq *large-obj*
+               ;; To get a large-object page, a code object has to exceed
+               ;; LARGE_OBJECT_SIZE and not fit within an open region.
+               ;; (This is a minor bug, because one should be able to
+               ;; create regions as large as desired without affecting
+               ;; determination of whether an object is large.
+               ;; Practically it means is that a small object region
+               ;; is limited to at most 3 pages)
+               ;; 32-bit machines use 64K for code allocation regions,
+               ;; but the large object size can be as small as 16K.
+               ;; 16K might fit in the free space of an open region,
+               ;; and by accident would not go on a large object page.
+               (sb-c:allocate-code-object nil 0
+                (max (* 4 sb-vm:gencgc-card-bytes) #-64-bit 65536))))
+      (declare (notinline format))
+      (format (make-string-output-stream) "~%")
+      (loop for i from 1 to sb-vm:+highest-normal-generation+
+            always (assert-large-page/gen/boxedp '*large-obj* page i t)))
+  t)
+(sb-ext:defglobal *b* nil)
+(sb-ext:defglobal *negb* nil)
+(sb-ext:defglobal *small-bignum* nil)
+(defun get-small-bignum-allocation-information ()
+  (setq *small-bignum* (+ (+ *b* (ash 1 100)) *negb*))
+  (nth-value 1 (allocation-information *small-bignum*)))
+#+gencgc
+(deftest allocation-information.7
+    (locally
+      (declare (notinline format))
+      ;; Create a bignum using 4 GC cards
+      (setq *b* (ash 1 (* sb-vm:gencgc-card-bytes sb-vm:n-byte-bits 4)))
+      (setq *negb* (- *b*))
+      (and (let ((props (get-small-bignum-allocation-information)))
+             ;; *SMALL-BIGNUM* was created as a large boxed object
+             (and (eq (getf props :large) t)
+                  (eq (getf props :boxed) t)))
+           (multiple-value-bind (page gen) (page-and-gen *b*)
+             (format (make-string-output-stream) "~%")
+             (loop for i from 1 to sb-vm:+highest-normal-generation+
+                   always
+                   (and (assert-large-page/gen/boxedp '*b* page i nil)
+                        (let ((props (nth-value 1 (allocation-information *small-bignum*))))
+                          ;; Scrub away the ref to *small-bignum* by making a random call
+                          (format (make-broadcast-stream) "~S" props)
+                          ;; Assert that *SMALL-BIGNUM* got moved to a small unboxed page
+                          (and (not (getf props :pinned :fail))
+                               (not (getf props :large :fail))
+                               (not (getf props :boxed :fail)))))))))
+  t)
 
 #.(if (and (eq sb-ext:*evaluator-mode* :compile) (member :sb-thread *features*))
 '(deftest allocation-information.thread.1
@@ -696,3 +768,42 @@
      (car (sb-introspect:find-definition-sources-by-name
            'cl-user::with-a-local-function :function)))
   0)
+
+(deftest object-size
+    (plusp (sb-introspect::object-size #'print-object))
+  t)
+
+;;; ASDF.  I can't even.
+(compile 'sb-introspect:map-root)
+(defun count-pointees (x simple &aux (n 0))
+  (sb-introspect:map-root (lambda (obj)
+                            (declare (ignore obj))
+                            (incf n))
+                          x
+                          :simple simple)
+  n)
+
+;;; A closure points to its underlying function, all closed-over values,
+;;; and possibly the closure's name.
+;;; #'SB-INT:CONSTANTLY-T is a nameless closure over 1 value
+(deftest map-root-closure-un (count-pointees #'SB-INT:CONSTANTLY-T nil) 2)
+;;; (SYMBOL-FUNCTION 'AND) is a named closure over 1 value
+(deftest map-root-closure-named (count-pointees (symbol-function 'and) nil) 3)
+
+;;; GFs point to their layout, implementation, slots,
+;;; and a hash-code, except that 64-bit headers can store the hash code
+;;; in the slot vector's high header bytes.
+;;; However, in either case we expect only 3 referenced objects,
+;;; because due to a strange design choice in MAP-ROOT,
+;;; it does not invoke the funarg on fixnums (or characters).
+(deftest map-root-gf (count-pointees #'make-load-form nil) 3)
+
+;;; Simple functions should point to their name, type, arglist, info,
+;;; and unless SIMPLE is specified to MAP-ROOT, the containing code.
+(deftest map-root-function-simple (count-pointees #'car t) 4)
+(deftest map-root-function-unsimple (count-pointees #'car nil) 5)
+
+(deftest largest-objects-smoketest
+    (let ((*standard-output* (make-broadcast-stream)))
+      (sb-introspect::largest-objects))
+  nil)

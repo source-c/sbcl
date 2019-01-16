@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; Data object ref/set stuff.
 
@@ -24,7 +24,7 @@
 
 (define-vop (set-slot)
   (:args (object :scs (descriptor-reg))
-         (value :scs (descriptor-reg any-reg null)))
+         (value :scs (descriptor-reg any-reg)))
   (:info name offset lowtag)
   (:ignore name)
   (:results)
@@ -80,7 +80,7 @@
 (progn
   (define-vop (set)
     (:args (object :scs (descriptor-reg))
-           (value :scs (descriptor-reg any-reg null)))
+           (value :scs (descriptor-reg any-reg)))
     (:temporary (:sc any-reg) tls-index)
     (:generator 4
       (inst ldr (32-bit-reg tls-index) (tls-index-of object))
@@ -317,13 +317,13 @@
                                                n-word-bytes)))
       (inst str value (@ thread-tn tls-index))))
 
-  (define-vop (unbind)
-    (:info n)
+  (define-vop (unbind-n)
+    (:info symbols)
     (:temporary (:sc descriptor-reg) value)
     (:temporary (:sc any-reg) tls-index bsp)
     (:generator 0
       (load-binding-stack-pointer bsp)
-      (loop repeat n
+      (loop for symbol in symbols
             do
             (inst ldp value tls-index (@ bsp (* (- binding-value-slot binding-size)
                                                 n-word-bytes)))
@@ -404,17 +404,25 @@
 
 (define-full-setter set-funcallable-instance-info *
   funcallable-instance-info-offset fun-pointer-lowtag
-  (descriptor-reg any-reg null) * %set-funcallable-instance-info)
+  (descriptor-reg any-reg) * %set-funcallable-instance-info)
 
 (define-full-reffer funcallable-instance-info *
   funcallable-instance-info-offset fun-pointer-lowtag
   (descriptor-reg any-reg) * %funcallable-instance-info)
 
-(define-vop (closure-ref slot-ref)
-  (:variant closure-info-offset fun-pointer-lowtag))
+(define-vop (closure-ref)
+  (:args (object :scs (descriptor-reg)))
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:info offset)
+  (:generator 4
+    (loadw value object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
-(define-vop (closure-init slot-set)
-  (:variant closure-info-offset fun-pointer-lowtag))
+(define-vop (closure-init)
+  (:args (object :scs (descriptor-reg))
+         (value :scs (descriptor-reg any-reg)))
+  (:info offset)
+  (:generator 4
+    (storew value object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
 (define-vop (closure-init-from-fp)
   (:args (object :scs (descriptor-reg)))
@@ -441,13 +449,14 @@
   (:result-types positive-fixnum)
   (:generator 4
     (loadw temp struct 0 instance-pointer-lowtag)
-    (inst lsr res temp n-widetag-bits)))
+    (inst ubfm res temp n-widetag-bits
+          (+ -1 (integer-length short-header-max-words) n-widetag-bits))))
 
 (define-full-reffer instance-index-ref * instance-slots-offset
   instance-pointer-lowtag (descriptor-reg any-reg) * %instance-ref)
 
 (define-full-setter instance-index-set * instance-slots-offset
-  instance-pointer-lowtag (descriptor-reg any-reg null) * %instance-set)
+  instance-pointer-lowtag (descriptor-reg any-reg) * %instance-set)
 
 (define-vop (%instance-cas word-index-cas)
   (:policy :fast-safe)
@@ -461,7 +470,7 @@
   (descriptor-reg any-reg) * code-header-ref)
 
 (define-full-setter code-header-set * 0 other-pointer-lowtag
-  (descriptor-reg any-reg null) * code-header-set)
+  (descriptor-reg any-reg) * code-header-set)
 
 ;;;; raw instance slot accessors
 

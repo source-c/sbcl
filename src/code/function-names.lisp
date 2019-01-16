@@ -1,7 +1,7 @@
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; generalized function names
-(!defvar *valid-fun-names-alist* nil)
+(!define-load-time-global *valid-fun-names-alist* nil)
 
 (defun %define-fun-name-syntax (symbol checker)
   (let ((found (assoc symbol *valid-fun-names-alist* :test #'eq)))
@@ -79,7 +79,4 @@ use as a BLOCK name in the function in question."
                   (valid-function-name-p fun))))))))
 
 (define-function-name-syntax defmacro (name)
-  (macro-function-name name))
-
-(define-function-name-syntax macrolet (name)
   (macro-function-name name))

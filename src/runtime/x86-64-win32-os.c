@@ -36,7 +36,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "thread.h"             /* dynamic_values_bytes */
-#include "cpputil.h"
+#include "align.h"
 
 #include "validate.h"
 size_t os_vm_page_size;
@@ -131,8 +131,8 @@ os_context_register_addr(os_context_t *context, int offset)
         offsetof(CONTEXT,R15),
     };
     return
-        (offset >= 0 && offset < 32) ?
-        ((void*)(context->win32_context)) + offsets[offset>>1]  : 0;
+        (offset >= 0 && offset < 16) ?
+        ((void*)(context->win32_context)) + offsets[offset]  : 0;
 }
 
 os_context_register_t *

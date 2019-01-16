@@ -46,7 +46,7 @@
 ;;; fail to infer (< I FIXNUM): it does not understand that this
 ;;; constraint follows from (TYPEP I (INTEGER 0 0)).
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; *CONSTRAINT-UNIVERSE* gets bound in IR1-PHASES to a fresh,
 ;;; zero-length, non-zero-total-size vector-with-fill-pointer.
@@ -72,7 +72,14 @@
   ;; EQL
   ;;     X is a LAMBDA-VAR and Y is a LVAR, a LAMBDA-VAR or a CONSTANT.
   ;;     The relation is asserted to hold.
-  (kind nil :type (member typep < > eql))
+  ;;
+  ;; ARRAY-IN-BOUNDS-P
+  ;;     To handle (array-in-bounds-p array var) and
+  ;;     (array-in-bounds-p array 10) X can be either the lambda-var
+  ;;     of ARRAY or VAR, while Y is either the lambda-var of VAR or a
+  ;;     constant.
+  (kind nil :type (member typep < > eql
+                          array-in-bounds-p))
   ;; The operands to the relation.
   (x nil :type lambda-var)
   (y nil :type constraint-y)
@@ -293,7 +300,7 @@
   (etypecase y
     (ctype
        (awhen (lambda-var-ctype-constraints x)
-         (dolist (con (gethash (sb!kernel::type-class-info y) it) nil)
+         (dolist (con (gethash (sb-kernel::type-class-info y) it) nil)
            (when (and (eq (constraint-kind con) kind)
                       (eq (constraint-not-p con) not-p)
                       (type= (constraint-y con) y))
@@ -338,7 +345,7 @@
       (ctype
        (let ((index (ensure-hash (lambda-var-ctype-constraints x)))
              (vec   (ensure-vec  (lambda-var-inheritable-constraints x))))
-         (push con (gethash (sb!kernel::type-class-info y) index))
+         (push con (gethash (sb-kernel::type-class-info y) index))
          (vector-push-extend con vec)))
       (lvar
        (let ((index (ensure-hash (lambda-var-eq-constraints x))))
@@ -354,7 +361,8 @@
           (let ((vec (ensure-vec (lambda-var-private-constraints x))))
             (vector-push-extend con vec)))
          (lambda-var
-          (let ((vec (if (constraint-not-p con)
+          (let ((vec (if (or (constraint-not-p con)
+                             (eq (constraint-kind con) 'array-in-bounds-p))
                          (ensure-vec (lambda-var-inheritable-constraints x))
                          (ensure-vec (lambda-var-eql-var-constraints x)))))
             (vector-push-extend con vec)))))))
@@ -510,11 +518,14 @@
     (let ((eq-x (eq from-var (constraint-x con)))
           (eq-y (eq from-var (constraint-y con))))
       (dolist (var vars)
-        (conset-add-constraint target
-                               (constraint-kind con)
-                               (if eq-x var (constraint-x con))
-                               (if eq-y var (constraint-y con))
-                               (constraint-not-p con))))))
+        (let ((x (if eq-x var (constraint-x con)))
+              (y (if eq-y var (constraint-y con))))
+          (unless (eq x y)
+            (conset-add-constraint target
+                                   (constraint-kind con)
+                                   x
+                                   y
+                                   (constraint-not-p con))))))))
 
 ;; Add an (EQL LAMBDA-VAR LAMBDA-VAR) constraint on VAR1 and VAR2 and
 ;; inherit each other's constraints.
@@ -643,6 +654,30 @@
                                         constraints)
              ptype nil)))))
 
+(defun array-in-bounds-p-constraints (constraints index-lvar index-var
+                                      length-lvar)
+  (let ((index-constant
+          (and (not index-var)
+               (let ((use (principal-lvar-use index-lvar)))
+                 (and (ref-p use)
+                      (constant-p (ref-leaf use))
+                      (ref-leaf use)))))
+        (array-lvar
+          (let ((use (principal-lvar-ref-use length-lvar)))
+            (and (combination-p use)
+                 (lvar-fun-is (combination-fun use)
+                              '(vector-length))
+                 (car (combination-args use))))))
+    (when (and (or index-var index-constant)
+               array-lvar)
+      (let ((array-var (ok-lvar-lambda-var array-lvar constraints)))
+        (when array-var
+          (if index-constant
+              ;; Attach the constaraint to the array if
+              ;; the index is constant
+              (values 'array-in-bounds-p array-var index-constant)
+              (values 'array-in-bounds-p index-var array-var)))))))
+
 ;;; Add test constraints to the consequent and alternative blocks of
 ;;; the test represented by USE.
 (defun add-test-constraints (use if constraints)
@@ -713,14 +748,29 @@
                                                 nil constraints
                                                 consequent-constraints)))))
                  ((< >)
-                  (let* ((arg1 (first args))
-                         (var1 (ok-lvar-lambda-var arg1 constraints))
-                         (arg2 (second args))
-                         (var2 (ok-lvar-lambda-var arg2 constraints)))
-                    (when var1
-                      (add name var1 (lvar-type arg2) nil))
-                    (when var2
-                      (add (if (eq name '<) '> '<) var2 (lvar-type arg1) nil))))
+                  (when (= (length args) 2)
+                    (flet ((handle-array-in-bounds-p (index-arg index-var length-arg)
+                             (multiple-value-bind (kind x y)
+                                 (array-in-bounds-p-constraints constraints index-arg index-var
+                                                                length-arg)
+                               (when kind
+                                 (add-test-constraint quick-p
+                                                      kind x y
+                                                      nil constraints
+                                                      consequent-constraints)))))
+                      (let* ((arg1 (first args))
+                             (var1 (ok-lvar-lambda-var arg1 constraints))
+                             (arg2 (second args))
+                             (var2 (ok-lvar-lambda-var arg2 constraints)))
+                        (case name
+                          (<
+                           (handle-array-in-bounds-p arg1 var1 arg2))
+                          (>
+                           (handle-array-in-bounds-p arg2 var2 arg1)))
+                        (when var1
+                          (add name var1 (lvar-type arg2) nil))
+                        (when var2
+                          (add (if (eq name '<) '> '<) var2 (lvar-type arg1) nil))))))
                  (t
                   (add-combination-test-constraints use constraints
                                                     consequent-constraints
@@ -877,6 +927,10 @@
                      (mapc-member-type-members #'note-not other)
                      (setq not-res (type-union not-res other)))
                  (setq res (type-approx-intersection2 res other))))
+            (array-in-bounds-p
+             (unless (eq (ref-constraints ref)
+                         (pushnew con (ref-constraints ref)))
+               (reoptimize-lvar (node-lvar ref))))
             (eql
              (let ((other-type (leaf-type other)))
                (if not-p
@@ -915,13 +969,26 @@
            (setf (node-derived-type ref) *wild-type*)
            (change-ref-leaf ref (find-constant t)))
           (t
-           (setf not-res
-                 (type-union not-res (make-member-type not-set not-fpz)))
-           (derive-node-type ref
-                             (make-single-value-type
-                              (or (type-difference res not-res)
-                                  res)))
-           (maybe-terminate-block ref nil))))
+           (let ((type (type-difference res
+                                        (type-union not-res
+                                                    (make-member-type not-set not-fpz)))))
+             ;; CHANGE-CLASS can change the type, lower down to standard-object,
+             ;; type propagation for classes is not as important anyway.
+             (cond #-sb-xc-host
+                   ((and
+                     (eq sb-pcl::**boot-state** 'sb-pcl::complete)
+                     (block nil
+                       (let ((standard-object (find-classoid 'standard-object)))
+                         (sb-kernel::map-type
+                          (lambda (type)
+                            (when (and (classoid-p type)
+                                       (csubtypep type standard-object))
+                              (return t)))
+                          type)))))
+                   (t
+                    (derive-node-type ref
+                                      (make-single-value-type type))
+                    (maybe-terminate-block ref nil)))))))
   (values))
 
 ;;;; Flow analysis
@@ -969,12 +1036,24 @@
          (when preprocess-refs-p
            (constrain-ref-type node gen))))
       (cast
-       (let ((lvar (cast-value node)))
-         (let ((var (ok-lvar-lambda-var lvar gen)))
-           (when var
-             (let ((atype (single-value-type (cast-derived-type node)))) ;FIXME
-               (unless (eq atype *universal-type*)
-                 (conset-add-constraint-to-eql gen 'typep var atype nil)))))))
+
+       (let* ((lvar (cast-value node))
+              (var (ok-lvar-lambda-var lvar gen)))
+         (when var
+           (let ((atype (single-value-type (cast-derived-type node)))) ;FIXME
+             (unless (eq atype *universal-type*)
+               (conset-add-constraint-to-eql gen 'typep var atype nil))))
+         (when (and (bound-cast-p node)
+                    (bound-cast-check node)
+                    (not (node-deleted (bound-cast-check node))))
+           (let ((check-bound (bound-cast-check node)))
+             (destructuring-bind (array dim index)
+                 (combination-args check-bound)
+               (declare (ignore array))
+               (multiple-value-bind (kind x y)
+                   (array-in-bounds-p-constraints gen index var dim)
+                 (when kind
+                   (conset-add-constraint-to-eql gen kind x y nil))))))))
       (cset
        (binding* ((var (set-var node))
                   (nil (lambda-var-p var) :exit-if-null)
@@ -1153,11 +1232,12 @@
           (rest-of-blocks ())
           (seen-loop-p ()))
       (do-blocks (block component)
-        (when (and (not seen-loop-p) (loopy-p block))
-          (setq seen-loop-p t))
-        (if seen-loop-p
-            (push block rest-of-blocks)
-            (push block leading-blocks)))
+        (when (block-type-check block)
+          (when (and (not seen-loop-p) (loopy-p block))
+            (setq seen-loop-p t))
+          (if seen-loop-p
+              (push block rest-of-blocks)
+              (push block leading-blocks))))
       (values (nreverse leading-blocks) (nreverse rest-of-blocks)))))
 
 ;;; Append OBJ to the end of LIST as if by NCONC but only if it is not
@@ -1177,7 +1257,8 @@
   (let ((blocks-to-process ()))
     (flet ((enqueue (blocks)
              (dolist (block blocks)
-               (setq blocks-to-process (nconc-new block blocks-to-process)))))
+               (when (block-type-check block)
+                 (setq blocks-to-process (nconc-new block blocks-to-process))))))
       (multiple-value-bind (leading-blocks rest-of-blocks)
           (leading-component-blocks component)
         ;; Update every block once to account for changes in the
@@ -1206,7 +1287,11 @@
   (init-var-constraints component)
   ;; Previous results can confuse propagation and may loop forever
   (do-blocks (block component)
-    (setf (block-out block) nil))
+    (setf (block-out block) nil)
+    (let ((last (block-last block)))
+      (when (if-p last)
+        (setf (if-alternative-constraints last) nil)
+        (setf (if-consequent-constraints last) nil))))
   (setf (block-out (component-head component)) (make-conset))
   (dolist (block (find-and-propagate-constraints component))
     (unless (block-delete-p block)

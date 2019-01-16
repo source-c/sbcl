@@ -173,11 +173,20 @@
 ;;; here, the values are read by an automatically generated reader method.
 (defmethod add-direct-subclass ((class class) (subclass class))
   (with-slots (direct-subclasses) class
-    (pushnew subclass direct-subclasses :test #'eq)
+    (with-world-lock ()
+      (pushnew subclass direct-subclasses :test #'eq))
     subclass))
 (defmethod remove-direct-subclass ((class class) (subclass class))
   (with-slots (direct-subclasses) class
-    (setq direct-subclasses (remove subclass direct-subclasses))
+    (with-world-lock ()
+      (setq direct-subclasses (remove subclass direct-subclasses))
+      ;; Remove from classoid subclasses as well.
+      (let ((classoid (class-classoid subclass)))
+        (dovector (super-layout (layout-inherits (classoid-layout classoid)))
+          (let* ((super (layout-classoid super-layout))
+                 (subclasses (classoid-subclasses super)))
+            (when subclasses
+              (remhash classoid subclasses))))))
     subclass))
 
 ;;; Maintaining the direct-methods and direct-generic-functions backpointers.
@@ -334,7 +343,7 @@
      (apply #'ensure-class name :metaclass metaclass-name
             :direct-superclasses supers
             :direct-slots slots
-            :definition-source source-location
+            'source source-location
             'safe-p safe-p
             other))))
 
@@ -450,11 +459,8 @@
                   (mapcar (lambda (pl) (make-direct-slotd class pl))
                           direct-slots))
             (slot-value class 'direct-slots)))
-  (if direct-default-initargs-p
-      (setf (plist-value class 'direct-default-initargs)
-            direct-default-initargs)
-      (setq direct-default-initargs
-            (plist-value class 'direct-default-initargs)))
+  (when direct-default-initargs-p
+    (setf (plist-value class 'direct-default-initargs) direct-default-initargs))
   (setf (plist-value class 'class-slot-cells)
         (let ((old-class-slot-cells (plist-value class 'class-slot-cells))
               (safe (safe-p class))
@@ -564,7 +570,7 @@
   (let* ((name (class-name class))
          (classoid (find-classoid name))
          (slots (condition-classoid-slots classoid))
-         (source (sb-kernel::layout-source-location (classoid-layout classoid))))
+         (source (sb-kernel::classoid-source-location classoid)))
     ;; to balance the REMOVE-SLOT-ACCESSORS call in
     ;; REINITIALIZE-INSTANCE :BEFORE (SLOT-CLASS).
     (flet ((add-source-location (method)
@@ -1306,7 +1312,7 @@
                              :slot-name slot-name
                              :object-class class
                              :method-class-function #'reader-method-class
-                             :definition-source source-location)))
+                             'source source-location)))
 
 (defmethod writer-method-class ((class slot-class) direct-slot &rest initargs)
   (declare (ignore direct-slot initargs))
@@ -1323,7 +1329,7 @@
                              :slot-name slot-name
                              :object-class class
                              :method-class-function #'writer-method-class
-                             :definition-source source-location)))
+                             'source source-location)))
 
 (defmethod add-boundp-method ((class slot-class) generic-function slot-name slot-documentation source-location)
   (add-method generic-function
@@ -1335,7 +1341,7 @@
                              (make-boundp-method-function class slot-name)
                              (or slot-documentation "automatically generated boundp method")
                              :slot-name slot-name
-                             :definition-source source-location)))
+                             'source source-location)))
 
 (defmethod remove-reader-method ((class slot-class) generic-function)
   (let ((method (get-method generic-function () (list class) nil)))
@@ -1487,12 +1493,17 @@
                                 old-class new-class)
   (do () ((typep value slot-type))
     (restart-case
-        (bad-type value slot-type
+        (error 'simple-type-error
+               :datum value
+               :expected-type slot-type
+               :format-control
+                  (sb-format:tokens
                   "~@<Error during ~A. Current value in slot ~
                    ~/sb-ext:print-symbol-with-prefix/ of an instance ~
                    of ~S is ~S, which does not match the new slot type ~
-                   ~S in class ~S.~:@>"
-                  context slot-name old-class value slot-type new-class)
+                   ~S in class ~S.~:@>")
+               :format-arguments
+               (list context slot-name old-class value slot-type new-class))
       (use-value (new-value)
         :interactive read-evaluated-form
         :report (lambda (stream)

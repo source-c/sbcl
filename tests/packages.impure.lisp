@@ -320,7 +320,7 @@ if a restart was invoked."
     (assert (null (iter)))))
 
 ;;; MAKE-PACKAGE error in another thread blocking FIND-PACKAGE & FIND-SYMBOL
-(with-test (:name :bug-511072 :skipped-on '(not :sb-thread))
+(with-test (:name :bug-511072 :skipped-on (not :sb-thread))
   (let* ((p (make-package :bug-511072))
          (sem1 (sb-thread:make-semaphore))
          (sem2 (sb-thread:make-semaphore))
@@ -671,11 +671,14 @@ if a restart was invoked."
 ;; WITH-PACKAGE-ITERATOR isn't well-exercised by tests (though LOOP uses it)
 ;; so here's a basic correctness test with some complications involving
 ;; shadowing symbols.
-(make-package "P1" :use '("SB-FORMAT"))
+(make-package "FOOFORMAT" :use '("CL"))
+(export 'fooformat::format-error 'fooformat)
+(export 'fooformat::%compiler-walk-format-string 'fooformat)
+(make-package "P1" :use '("FOOFORMAT"))
 (make-package "P2")
 (export 'p1::foo 'p1)
 (shadow "FORMAT-ERROR" 'p1)
-(make-package "A" :use '("SB-FORMAT" "P1" "P2"))
+(make-package "A" :use '("FOOFORMAT" "P1" "P2"))
 (shadow '("PROG2" "FOO") 'a)
 (intern "BLAH" "P2")
 (export 'p2::(foo bar baz) 'p2)
@@ -694,12 +697,12 @@ if a restart was invoked."
            (a:goodfun :external "A")
            (p2:bar :inherited "A")
            (p2:baz :inherited "A")
-           (sb-format:%compiler-walk-format-string :inherited "A")
-           (sb-format:format-error :inherited "A")
+           (fooformat:%compiler-walk-format-string :inherited "A")
+           (fooformat:format-error :inherited "A")
            ;; ... P1
            (p1:foo :external "P1")
            (p1::format-error :internal "P1")
-           (sb-format:%compiler-walk-format-string :inherited "P1")
+           (fooformat:%compiler-walk-format-string :inherited "P1")
            ;; ... P2
            (p2::blah :internal "P2")
            (p2:foo :external "P2")
@@ -784,7 +787,7 @@ if a restart was invoked."
 ;; Concurrent FIND-SYMBOL was adversely affected by package rehash.
 ;; It's slightly difficult to show that this is fixed, because this
 ;; test only sometimes failed prior to the fix. Now it never fails though.
-(with-test (:name :concurrent-find-symbol :skipped-on '(not :sb-thread))
+(with-test (:name :concurrent-find-symbol :skipped-on (not :sb-thread))
  (let ((pkg (make-package (gensym)))
        (threads)
        (names)
@@ -873,7 +876,7 @@ if a restart was invoked."
 
 ;; This test would consistently fail when GENTEMP first called FIND-SYMBOL
 ;; and then INTERN when FIND-SYMBOL said that it found no symbol.
-(with-test (:name (gentemp :threadsafety) :skipped-on '(not :sb-thread))
+(with-test (:name (gentemp :threadsafety) :skipped-on (not :sb-thread))
   (let ((n-threads 5)
         (n-iter 1000)
         (threads))
@@ -889,7 +892,7 @@ if a restart was invoked."
 ;;; Nonetheless it did sometimes fail, and now should never fail.
 (with-test (:name :concurrent-intern-bad-published-symbol-package
                   ;; No point in wasting time on concurrency bugs otherwise
-                  :skipped-on '(not :sb-thread))
+                  :skipped-on (not :sb-thread))
   ;; Confirm that the compiler does not know that KEYWORDICATE
   ;; returns a KEYWORD (so the answer isn't constant-folded)
   (assert (sb-kernel:type= (sb-int:info :function :type 'sb-int:keywordicate)

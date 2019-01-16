@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; reading variable length integers
 ;;;;
@@ -122,11 +122,6 @@
 ;;; (typically a bignum, but a fixnum will do),
 ;;; and each value represents the difference from the preceding value.
 
-;;; Somebody should try changing the x86 code to use this representation
-;;; and profile that to see if it makes performance worse.
-;;; x86-64 does not care about speed here, because GC is unaffected
-;;; except when saving a core.
-
 (defun integer-from-octets (octets)
   (declare (type (array (unsigned-byte 8) (*)) octets))
   (let ((result 0) (shift 0))
@@ -134,32 +129,43 @@
       (setf result (logior result (ash byte shift))
             shift (+ shift 8)))))
 
-;;; XXX: Maybe rename this if we use it to pack debug-fun-ish things.
-(defun pack-code-fixup-locs (list)
-  ;; Estimate the length
-  (let ((bytes (make-array (* 2 (length list)) :fill-pointer 0 :adjustable t
-                           :element-type '(unsigned-byte 8)))
-        (prev 0))
-    (dolist (x list)
-      (aver (> x prev)) ; the incoming list must be sorted
-      (write-var-integer (- x prev) bytes)
-      (setq prev x))
-    ;; Pack into a single integer
+(defun pack-code-fixup-locs (abs-fixups rel-fixups)
+  (let ((bytes (make-array (* 2 (+ (length abs-fixups) ; guess at final length
+                                   (length rel-fixups)))
+                           :fill-pointer 0 :adjustable t
+                           :element-type '(unsigned-byte 8))))
+    (flet ((pack (list &aux (prev 0))
+             (dolist (x list)
+               (write-var-integer (- x prev) bytes)
+               (setq prev x))))
+      (pack (setq abs-fixups (sort abs-fixups #'<)))
+      (when rel-fixups
+        (write-var-integer 0 bytes)
+        (pack (setq rel-fixups (sort rel-fixups #'<)))))
+    ;; Stuff octets into an integer
     (let ((result (integer-from-octets bytes)))
-      (aver (equal (unpack-code-fixup-locs result) list))
+      (multiple-value-bind (abs rel) (unpack-code-fixup-locs result)
+        (aver (and (equal abs-fixups abs) (equal rel-fixups rel))))
       result)))
 
-(defmacro do-packed-varints ((loc locs) &body body)
-  (with-unique-names (integer byte bytepos shift acc prev)
+(defmacro do-packed-varints ((loc locs &optional (bytepos nil bytepos-sup-p))
+                             &body body)
+  (with-unique-names (integer byte shift acc prev)
+    (unless bytepos-sup-p
+      (setq bytepos (make-symbol "BYTEPOS")))
     `(let ((,integer ,locs)
-           (,bytepos 0)
+           ,@(unless bytepos-sup-p `((,bytepos 0)))
            (,shift 0)
            (,acc 0)
            (,prev 0))
+       #-sb-xc-host (declare (notinline sb-kernel:%ldb)) ; lp#1573398
+       (declare (type (mod ,sb-vm:n-word-bits) ,shift)
+                (type word ,acc ,prev))
        (loop
         (let ((,byte (ldb (byte 8 ,bytepos) ,integer)))
           (incf ,bytepos 8)
-          (setf ,acc (logior ,acc (ash (logand ,byte #x7f) ,shift)))
+          (setf ,acc (logior ,acc (logand (ash (logand ,byte #x7f) ,shift)
+                                          most-positive-word)))
           (cond ((logtest ,byte #x80) (incf ,shift 7))
                 ;; No offset can be zero, so this is the delimiter
                 ((zerop ,acc) (return))
@@ -168,9 +174,11 @@
                  (setq ,acc 0 ,shift 0))))))))
 
 (defun unpack-code-fixup-locs (packed-integer)
-  (collect ((locs))
-    (do-packed-varints (loc packed-integer) (locs loc))
-    (locs)))
+  (collect ((abs-locs) (rel-locs))
+    (let ((pos 0))
+      (do-packed-varints (loc packed-integer pos) (abs-locs loc))
+      (do-packed-varints (loc packed-integer pos) (rel-locs loc)))
+    (values (abs-locs) (rel-locs))))
 
 (define-symbol-macro lz-symbol-1 210) ; arbitrary value that isn't frequent in the input
 (define-symbol-macro lz-symbol-2 218) ; ditto
@@ -178,7 +186,6 @@
 ;;; A somewhat bad (slow and not-very-squishy) compressor
 ;;; that gets between 15% and 20% space savings in debug blocks.
 ;;; Lengthy input may be compressible by as much as 3:1.
-#-sb-xc-host
 (declaim (ftype (sfunction ((simple-array (unsigned-byte 8) 1)) (simple-array (unsigned-byte 8) 1))
                 lz-compress))
 (defun lz-compress (input)
@@ -236,10 +243,10 @@
            (coerce output '(simple-array (unsigned-byte 8) (*)))
            #-sb-xc-host
            (%shrink-vector (%array-data output) (fill-pointer output))))
+      #+(or)
       (aver (equalp input (lz-decompress result)))
       result)))
 
-#-sb-xc-host
 (declaim (ftype (sfunction ((simple-array (unsigned-byte 8) 1)) (simple-array (unsigned-byte 8) 1))
                 lz-decompress))
 (defun lz-decompress (input)

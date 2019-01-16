@@ -19,13 +19,12 @@
 (defstruct (room-info (:constructor make-room-info (mask name kind))
                       (:copier nil))
     ;; the mask applied to HeaderValue to compute object size
-    (mask 0 :type (and fixnum unsigned-byte))
+    (mask 0 :type (and fixnum unsigned-byte) :read-only t)
     ;; the name of this type
     (name nil :type symbol :read-only t)
     ;; kind of type (how to reconstitute an object)
-    (kind (missing-arg)
-          :type (member :other :closure :instance :list
-                        :code :vector-nil :weak-pointer)
+    (kind nil
+          :type (member :other :closure :instance :list :code)
           :read-only t))
 
 (defun room-info-type-name (info)
@@ -33,6 +32,7 @@
         (saetp-primitive-type-name info)
         (room-info-name info)))
 
+(defconstant tiny-boxed-size-mask #xFF)
 (defun !compute-room-infos ()
   (let ((infos (make-array 256 :initial-element nil))
         (default-size-mask (mask-field (byte 23 0) -1)))
@@ -41,27 +41,28 @@
             (lowtag (primitive-object-lowtag obj))
             (name (primitive-object-name obj)))
         (when (and (eq lowtag 'other-pointer-lowtag)
-                   (not (member widetag '(t nil)))
-                   (not (eq name 'weak-pointer)))
+                   (not (member widetag '(t nil))))
           (setf (svref infos (symbol-value widetag))
                 (make-room-info (if (member name '(fdefn symbol))
-                                    #xFF
+                                    tiny-boxed-size-mask
                                     default-size-mask)
                                 name :other)))))
 
-    (dolist (code (list #+sb-unicode complex-character-string-widetag
-                        complex-base-string-widetag simple-array-widetag
-                        complex-bit-vector-widetag complex-vector-widetag
-                        complex-array-widetag complex-vector-nil-widetag))
-      (setf (svref infos code)
-            (make-room-info default-size-mask 'array-header :other)))
+    (let ((info (make-room-info default-size-mask 'array-header :other)))
+      (dolist (code (list #+sb-unicode complex-character-string-widetag
+                          complex-base-string-widetag simple-array-widetag
+                          complex-bit-vector-widetag complex-vector-widetag
+                          complex-array-widetag complex-vector-nil-widetag))
+        (setf (svref infos code) info)))
 
     (setf (svref infos bignum-widetag)
-          (make-room-info (ash most-positive-word (- n-widetag-bits))
+          ;; Lose 1 more bit than n-widetag-bits because fullcgc robs 1 bit,
+          ;; not that this is expected to work concurrently with gc.
+          (make-room-info (ash most-positive-word (- (1+ n-widetag-bits)))
                           'bignum :other))
 
     (setf (svref infos closure-widetag)
-          (make-room-info 0 'closure :closure))
+          (make-room-info short-header-max-words 'closure :closure))
 
     (dotimes (i (length *specialized-array-element-type-properties*))
       (let ((saetp (aref *specialized-array-element-type-properties* i)))
@@ -69,7 +70,7 @@
           (setf (svref infos (saetp-typecode saetp)) saetp))))
 
     (setf (svref infos simple-array-nil-widetag)
-          (make-room-info 0 'simple-array-nil :vector-nil))
+          (make-room-info 0 'simple-array-nil :other))
 
     (setf (svref infos code-header-widetag)
           (make-room-info 0 'code :code))
@@ -78,10 +79,7 @@
           (make-room-info 0 'instance :instance))
 
     (setf (svref infos funcallable-instance-widetag)
-          (make-room-info 0 'funcallable-instance :closure))
-
-    (setf (svref infos weak-pointer-widetag)
-          (make-room-info 0 'weak-pointer :weak-pointer))
+          (make-room-info short-header-max-words 'funcallable-instance :closure))
 
     (let ((cons-info (make-room-info 0 'cons :list)))
       ;; A cons consists of two words, both of which may be either a
@@ -142,26 +140,33 @@
 ;;; use an address width that is narrower than 64 bits.
 ;;; This function is private because of the wacky representation.
 (defun %space-bounds (space)
-  (declare (type spaces space))
-  (ecase space
-    (:static
-     (values (%make-lisp-obj static-space-start)
-             (%make-lisp-obj (sap-int *static-space-free-pointer*))))
-    (:read-only
-     (values (%make-lisp-obj read-only-space-start)
-             (%make-lisp-obj (sap-int *read-only-space-free-pointer*))))
-    #+immobile-space
-    (:immobile
-     (values (%make-lisp-obj immobile-space-start)
-             (%make-lisp-obj (sap-int *immobile-space-free-pointer*))))
-    (:dynamic
-     (values (%make-lisp-obj (current-dynamic-space-start))
-             (%make-lisp-obj (sap-int (dynamic-space-free-pointer)))))))
+  (macrolet ((bounds (a b) `(values (%make-lisp-obj ,a) (%make-lisp-obj ,b))))
+    (ecase space
+      (:static
+       (bounds static-space-start
+               (sap-int *static-space-free-pointer*)))
+      (:read-only
+       (bounds read-only-space-start
+               (sap-int *read-only-space-free-pointer*)))
+      #+immobile-space
+      (:fixed
+       (bounds fixedobj-space-start
+               (sap-int *fixedobj-space-free-pointer*)))
+      #+immobile-space
+      (:variable
+       (bounds varyobj-space-start
+               (sap-int *varyobj-space-free-pointer*)))
+      (:dynamic
+       (bounds (current-dynamic-space-start)
+               (sap-int (dynamic-space-free-pointer)))))))
 
 ;;; Return the total number of bytes used in SPACE.
 (defun space-bytes (space)
-  (multiple-value-bind (start end) (%space-bounds space)
-    (ash (- end start) n-fixnum-tag-bits)))
+  (if (eq space :immobile)
+      (+ (space-bytes :immobile-fixed)
+         (space-bytes :immobile-variable))
+      (multiple-value-bind (start end) (%space-bounds space)
+        (ash (- end start) n-fixnum-tag-bits))))
 
 ;;; Round SIZE (in bytes) up to the next dualword boundary. A dualword
 ;;; is eight bytes on platforms with 32-bit word size and 16 bytes on
@@ -189,12 +194,55 @@
             (round-to-dualword (+ (* vector-data-offset n-word-bytes)
                                   n-data-octets)))))
 
+(defun primitive-object-size (object)
+  "Return number of bytes of heap or stack directly consumed by OBJECT"
+  (if (is-lisp-pointer (get-lisp-obj-address object))
+      (let ((words
+              (typecase object
+                (cons 2)
+                (instance (1+ (%instance-length object)))
+                (function
+                 (when (= (fun-subtype object) simple-fun-widetag)
+                   (return-from primitive-object-size
+                     (primitive-object-size (fun-code-header object))))
+                 (1+ (get-closure-length object)))
+                ;; NIL is larger than a symbol. I don't care to think about
+                ;; why these fudge factors are right, but they make the result
+                ;; equal to what MAP-ALLOCATED-OBJECTS reports.
+                (null (+ symbol-size 1 #+64-bit 1))
+                ;; Anything else is an OTHER pointer.
+                ;; Use a sizing function when we have one,
+                ;; otherwise the general case is correct.
+                (t
+                 (let ((room-info
+                         (aref *room-info* (%other-pointer-widetag object))))
+                   (typecase object
+                     (array
+                      (cond ((array-header-p object)
+                             (+ array-dimensions-offset (array-rank object)))
+                            ((simple-array-nil-p object) 2)
+                            (t
+                             (return-from primitive-object-size
+                               (nth-value 2 (reconstitute-vector
+                                             object room-info))))))
+                     (code-component
+                      (return-from primitive-object-size (code-object-size object)))
+                     (t
+                      ;; Other things (symbol, fdefn, value-cell, etc)
+                      ;; don't have a sizer, so use GET-HEADER-DATA
+                      (1+ (logand (get-header-data object)
+                                  (logand (get-header-data object)
+                                          (room-info-mask room-info)))))))))))
+        (* (align-up words 2) n-word-bytes))
+      0))
+
 ;;; Given the address (untagged, aligned, and interpreted as a FIXNUM)
 ;;; of a lisp object, return the object, its "type code" (either
 ;;; LIST-POINTER-LOWTAG or a header widetag), and the number of octets
 ;;; required for its storage (including padding and alignment).  Note
 ;;; that this function is designed to NOT CONS, even if called
 ;;; out-of-line.
+;;; FIXME: size calculation should be via PRIMITIVE-OBJECT-SIZE, not reinvented
 (defun reconstitute-object (address)
   (let* ((object-sap (int-sap (get-lisp-obj-address address)))
          (header (sap-ref-word object-sap 0))
@@ -211,7 +259,8 @@
           ;; a non-nil, non-ROOM-INFO object as INFO.
         ((specialized-array-element-type-properties-p info)
          (reconstitute-vector (tagged-object other-pointer-lowtag) info))
-
+        ((= widetag filler-widetag)
+         (values nil filler-widetag (boxed-size header-value)))
         ((null info)
          (error "Unrecognized widetag #x~2,'0X in reconstitute-object"
                 widetag))
@@ -223,41 +272,26 @@
                    list-pointer-lowtag
                    (* 2 n-word-bytes)))
 
-          (:closure ; also funcallable-instance
-           (values (tagged-object fun-pointer-lowtag)
-                   widetag
-                   (boxed-size (logand header-value short-header-max-words))))
-
           (:instance
            (values (tagged-object instance-pointer-lowtag)
                    widetag
                    (boxed-size (logand header-value short-header-max-words))))
 
-          (:other
-           (values (tagged-object other-pointer-lowtag)
+          (:closure ; also funcallable-instance
+           (values (tagged-object fun-pointer-lowtag)
                    widetag
-                   (boxed-size (logand header-value (room-info-mask info)))))
-
-          (:vector-nil
-           (values (tagged-object other-pointer-lowtag)
-                   simple-array-nil-widetag
-                   (* 2 n-word-bytes)))
-
-          (:weak-pointer ; FIXME: why??? It's just a boxed object, isn't it?
-           (values (tagged-object other-pointer-lowtag)
-                   weak-pointer-widetag
-                   (round-to-dualword
-                    (* weak-pointer-size
-                       n-word-bytes))))
+                   (boxed-size (logand header-value short-header-max-words))))
 
           (:code
            (let ((c (tagged-object other-pointer-lowtag)))
              (values c
                      code-header-widetag
-                     (round-to-dualword
-                      (+ (* (logand header-value short-header-max-words)
-                            n-word-bytes)
-                         (%code-code-size (truly-the code-component c)))))))))))))
+                     (code-object-size c))))
+
+          (:other
+           (values (tagged-object other-pointer-lowtag)
+                   widetag
+                   (boxed-size (logand header-value (room-info-mask info)))))))))))
 
 ;;; Iterate over all the objects in the contiguous block of memory
 ;;; with the low address at START and the high address just before
@@ -265,29 +299,29 @@
 ;;; object's total size in bytes, including any header and padding.
 ;;; START and END are untagged, aligned memory addresses interpreted
 ;;; as FIXNUMs (unlike SAPs or tagged addresses, these will not cons).
-(defun map-objects-in-range (fun start end)
+(defun map-objects-in-range (fun start end &optional (strict-bound t))
   (declare (type function fun))
-  ;; If START is (unsigned) greater than END, then we have somehow
-  ;; blown past our endpoint.
-  (aver (<= (get-lisp-obj-address start)
-            (get-lisp-obj-address end)))
-  (unless (eq start end) ; avoid GENERIC=
-    (multiple-value-bind (obj typecode size) (reconstitute-object start)
+  (declare (dynamic-extent fun))
+  (named-let iter ((start start))
+  (cond
+    ((< (get-lisp-obj-address start) (get-lisp-obj-address end))
+     (multiple-value-bind (obj typecode size) (reconstitute-object start)
       ;; SIZE is almost surely a fixnum. Non-fixnum would mean at least
       ;; a 512MB object if 32-bit words, and is inconceivable if 64-bit.
-      (aver (not (logtest (the word size) lowtag-mask)))
-      (funcall fun obj typecode size)
-      (map-objects-in-range
-             fun
+       (aver (not (logtest (the word size) lowtag-mask)))
+       (unless (= typecode filler-widetag)
+         (funcall fun obj typecode size))
              ;; This special little dance is to add a number of octets
              ;; (and it had best be a number evenly divisible by our
              ;; allocation granularity) to an unboxed, aligned address
              ;; masquerading as a fixnum.  Without consing.
-             (%make-lisp-obj
+      (iter (%make-lisp-obj
               (mask-field (byte #.n-word-bits 0)
                           (+ (get-lisp-obj-address start)
-                             size)))
-             end))))
+                             size))))))
+    (strict-bound
+     ;; If START is not eq to END, then we have blown past our endpoint.
+     (aver (eq start end))))))
 
 ;;; Access to the GENCGC page table for better precision in
 ;;; MAP-ALLOCATED-OBJECTS
@@ -327,35 +361,69 @@
     (define-alien-variable "fixedobj_pages" (* (struct immobile-page))))
   (declaim (inline find-page-index))
   (define-alien-routine ("ext_find_page_index" find-page-index)
-    long (index signed))
-  (define-alien-variable "last_free_page" sb-kernel::page-index-t)
+    long (index unsigned))
+  (define-alien-variable "next_free_page" sb-kernel::page-index-t)
   (define-alien-variable "page_table" (* (struct page))))
 
 #+immobile-space
 (progn
-(declaim (inline immobile-subspace-bounds))
-;;; Return fixnums in the same fashion as %SPACE-BOUNDS.
-(defun immobile-subspace-bounds (subspace)
-  (case subspace
-    (:fixed (values (%make-lisp-obj immobile-space-start)
-                    (%make-lisp-obj (sap-int *immobile-fixedobj-free-pointer*))))
-    (:variable (values (%make-lisp-obj (+ immobile-space-start
-                                          immobile-fixedobj-subspace-size))
-                       (%make-lisp-obj (sap-int *immobile-space-free-pointer*))))))
-
+(deftype immobile-subspaces () '(member :fixed :variable))
 (declaim (ftype (sfunction (function &rest immobile-subspaces) null)
                 map-immobile-objects))
 (defun map-immobile-objects (function &rest subspaces) ; Perform no filtering
+  (declare (dynamic-extent function))
   (do-rest-arg ((subspace) subspaces)
-    (multiple-value-bind (start end) (immobile-subspace-bounds subspace)
+    (multiple-value-bind (start end) (%space-bounds subspace)
       (map-objects-in-range function start end)))))
+
+#|
+MAP-ALLOCATED-OBJECTS is fundamentally unsafe to use if the user-supplied
+function allocates anything. Consider what can happens when NEXT-FREE-PAGE
+points to a partially filled page, and one more object is created extending
+an allocation region that began on the formerly "last" page:
+
+   0x10027cfff0: 0x00000000000000d9     <-- this was Lisp's view of
+   0x10027cfff8: 0x0000000000000006         the last page (page 1273)
+   ---- page boundary ----
+   0x10027d0000: 0x0000001000005ecf     <-- next_free_page moves here (page 1274)
+   0x10027d0008: 0x00000000000000ba
+   0x10027d0010: 0x0000000000000040
+   0x10027d0018: 0x0000000000000000
+
+Lisp did not think that the page starting at 0x10027d0000 was allocated,
+so it believes the stopping point is page 1273.  When we read the bytes-used
+on that page, we see a totally full page, but do not consider adjoining any
+additional pages into the contiguous block.
+However the object, a vector, that started on page 1273 ends on page 1274,
+causing MAP-OBJECTS-IN-RANGE to assert that it overran 0x10027d0000.
+
+We could try a few things to mitigate this:
+* Try to "chase" the value of next-free-page.  This is literally impossible -
+  it's a moving target, and it's extremely likely to exhaust memory doing so,
+  especially if the supplied lambda is an interpreted function.
+  (Each object scanned causes consing of more bytes, and we never
+  "catch up" to the moving next-free-page)
+
+* If the page that we're looking at is full but the FINALLY clause is hit,
+  don't stop looking for more pages in that one case. Instead keep looking
+  for the end of the contiguous block, but stop as soon as any potential
+  stopping point is found; don't chase next-free-page.  This is tricky
+  as well and just about as infeasible.
+
+* Pass a flag to MAP-OBJECTS-IN-RANGE specifying that it's OK to
+  surpass the expected bound - silently accept our fate.
+  This is what we do since it's simple, and seems to work.
+|#
 
 ;;; Iterate over all the objects allocated in each of the SPACES, calling FUN
 ;;; with the object, the object's type code, and the object's total size in
 ;;; bytes, including any header and padding. As a special case, if exactly one
 ;;; space named :ALL is requested, then map over the known spaces.
 (defun map-allocated-objects (fun &rest spaces)
-  (declare (type function fun))
+  (declare (type function fun)
+           ;; KLUDGE: rest-arg and self calls do not play nice and it'll get consed
+           (optimize (sb-c::recognize-self-calls 0)))
+  (declare (dynamic-extent fun))
   (when (and (= (length spaces) 1) (eq (first spaces) :all))
     (return-from map-allocated-objects
      (map-allocated-objects fun
@@ -388,14 +456,14 @@
       (:immobile
        ;; Filter out filler objects. These either look like cons cells
        ;; in fixedobj subspace, or code without enough header words
-       ;; in varyobj subspace. (cf 'immobile_filler_p' in gc-internal.h)
+       ;; in varyobj subspace. (cf 'filler_obj_p' in gc-internal.h)
        (dx-flet ((filter (obj type size)
-                   (unless (consp obj)
+                   (unless (= type list-pointer-lowtag)
                      (funcall fun obj type size))))
          (map-immobile-objects #'filter :fixed))
        (dx-flet ((filter (obj type size)
                    (unless (and (code-component-p obj)
-                                (eql (code-header-words obj) 2))
+                                (code-obj-is-filler-p obj))
                      (funcall fun obj type size))))
          (map-immobile-objects #'filter :variable)))
 
@@ -414,9 +482,9 @@
        ;; Our procedure is to scan forward through the page table,
        ;; maintaining an "end pointer" until we reach a page where
        ;; BYTES-USED is not GENCGC-CARD-BYTES or we reach
-       ;; LAST-FREE-PAGE.  We then MAP-OBJECTS-IN-RANGE if the range
+       ;; NEXT-FREE-PAGE.  We then MAP-OBJECTS-IN-RANGE if the range
        ;; is not empty, and proceed to the next page (unless we've hit
-       ;; LAST-FREE-PAGE).  We happily take advantage of the fact that
+       ;; NEXT-FREE-PAGE).  We happily take advantage of the fact that
        ;; MAP-OBJECTS-IN-RANGE will simply return if passed two
        ;; coincident pointers for the range.
 
@@ -425,58 +493,116 @@
        ;; prove to be an issue with concurrent systems, or with
        ;; spectacularly poor timing for closing an allocation region
        ;; in a single-threaded system.
+       #+sb-thread
+       (close-current-gc-region)
+       (do ((initial-next-free-page next-free-page)
+            ;; This is a "funny" fixnum - essentially the bit cast of a pointer
+            (start (the fixnum (%make-lisp-obj (current-dynamic-space-start))))
+            (page-index 0 (1+ page-index))
+            ;; SPAN is a page count, for which an unsigned fixnum is adequate.
+            (span 0))
+           ;; We can safely iterate up to and including next_free_page
+           ;; even if next_free_page is the total number of pages in the space,
+           ;; because there is one extra page table entry as a sentinel.
+           ;; The extra page always has 0 bytes used, so we'll observe the end
+           ;; of a contiguous block without needing a termination clause to
+           ;; handle a final sequence of totally full pages that exactly abut
+           ;; the heap end. [Also note that for our purposes, contiguous blocks
+           ;; can span different GC generations and page types, whereas within
+           ;; GC, a page ends a block if the next differs in those aspects]
+           ((> page-index initial-next-free-page))
+         ;; The type constraint on PAGE-INDEX is probably too generous,
+         ;; but it does its job of producing efficient code.
+         (declare (type (integer 0 (#.(/ (ash 1 n-machine-word-bits) gencgc-card-bytes)))
+                        page-index)
+                  (type (and fixnum unsigned-byte) span))
+         (let ((page-bytes-used ; The low bit of bytes-used is the need-to-zero flag.
+                (logandc1 1 (slot (deref page-table page-index) 'bytes-used))))
+           (if (= page-bytes-used gencgc-card-bytes)
+               (incf span)
+               ;; RANGE-END forces funny increment of START by the extent in bytes,
+               ;; returning a negative fixum when the word's high bit flips.
+               ;; The proper way to add "funny" fixnums is via +-MODFX which for
+               ;; reasons unknown isn't defined on all backends.
+               (macrolet
+                   ((range-end (extra)
+                      `(truly-the fixnum
+                        (%make-lisp-obj
+                         (logand most-positive-word
+                                 ;; The first and third addends are known good
+                                 ;; The second needs help to avoid an expensive ASH
+                                 (+ (get-lisp-obj-address start)
+                                    (logand (* span gencgc-card-bytes) most-positive-word)
+                                    ,extra))))))
+                 (map-objects-in-range fun start (range-end page-bytes-used)
+                                       (< page-index initial-next-free-page))
+                 ;; In a certain rare situation, we must restart the next loop iteration
+                 ;; at exactly PAGE-INDEX instead of 1+ PAGE-INDEX.
+                 ;; Normally the contents of PAGE-INDEX are always included in the
+                 ;; current range. But what if it contributed 0 bytes to the range?
+                 ;;
+                 ;;     N : #x8000 bytes used
+                 ;;   N+1 : #x8000 bytes used
+                 ;;   N+2 : 0 bytes used        <- PAGE-INDEX now points here
+                 ;;   N+3 : initially 0 bytes, then gets some bytes
+                 ;;
+                 ;; We invoked the map function with page_address(N) for #x10000 bytes.
+                 ;; Suppose that function consed a partly unboxed object starting on
+                 ;; page N+2 extending to page N+3, and that NEXT-FREE-PAGE was greater
+                 ;; than both to begin with, so the termination condition isn't in play.
+                 ;; In the best case scenario, resuming the scan at page N+3 (mid-object)
+                 ;; would read valid widetags, but in the worst case scenario, we get
+                 ;; random bits. Page N+2 needs a fighting chance to be the start of
+                 ;; a range, so go back 1 page if the current page had zero bytes used
+                 ;; and the span exceeded 1. That is, always make forward progress.
+                 (setq start (range-end (cond ((and (zerop page-bytes-used) (plusp span))
+                                               (decf page-index)
+                                               0)
+                                              (t
+                                               gencgc-card-bytes)))
+                       span 0)))))))))
 
-       (loop
-          with page-size = (ash gencgc-card-bytes (- n-fixnum-tag-bits))
-          ;; This magic dance gets us an unboxed aligned pointer as a
-          ;; FIXNUM.
-          with start = (%make-lisp-obj (current-dynamic-space-start))
-          with end = start
-
-          ;; This is our page range. The type constraint is far too generous,
-          ;; but it does its job of producing efficient code.
-          for page-index
-          of-type (integer -1 (#.(/ (ash 1 n-machine-word-bits) gencgc-card-bytes)))
-          from 0 below last-free-page
-          for next-page-addr from (+ start page-size) by page-size
-          for page-bytes-used
-              ;; The low bits of bytes-used is the need-to-zero flag.
-              = (logandc1 1 (slot (deref page-table page-index) 'bytes-used))
-
-          when (< page-bytes-used gencgc-card-bytes)
-          do (progn
-               (incf end (ash page-bytes-used (- n-fixnum-tag-bits)))
-               (map-objects-in-range fun start end)
-               (setf start next-page-addr)
-               (setf end next-page-addr))
-          else do (incf end page-size)
-
-          finally (map-objects-in-range fun start end))))))
   (do-rest-arg ((space) spaces)
     (if (eq space :dynamic)
         (without-gcing (do-1-space space))
         (do-1-space space)))))
+
+#+(and sb-thread gencgc)
+;; Start with a Lisp rendition of ensure_region_closed() on the active
+;; thread's region, since users are often surprised to learn that a
+;; just-consed object can't necessarily be seen by MAP-ALLOCATED-OBJECTS.
+;; Since we're in WITHOUT-GCING, there can be no interrupts.
+;; This is probably better than calling MAP-OBJECTS-IN-RANGE on the
+;; thread's region, because then we might visit some page twice
+;; by doing that.
+;; (And seeing small consing by other threads is hopeless either way)
+(defun close-current-gc-region ()
+  (unless (eql (sap-int (current-thread-offset-sap
+                         (+ thread-alloc-region-slot 3)))
+               0)                       ; start_addr
+    (alien-funcall
+     (extern-alien "gc_close_region" (function void unsigned int))
+     (truly-the word
+                (+ (sb-thread::thread-primitive-thread sb-thread:*current-thread*)
+                   (ash thread-alloc-region-slot word-shift)))
+     1)))
 
 ;;;; MEMORY-USAGE
 
 #+immobile-space
 (progn
-(deftype immobile-subspaces ()
-  '(member :fixed :variable))
-
 (declaim (ftype (function (immobile-subspaces) (values t t t &optional))
                 immobile-fragmentation-information))
 (defun immobile-fragmentation-information (subspace)
-  (binding* (((start free-pointer) (immobile-subspace-bounds subspace))
+  (binding* (((start free-pointer) (%space-bounds subspace))
              (used-bytes (ash (- free-pointer start) n-fixnum-tag-bits))
              (holes '())
              (hole-bytes 0))
     (map-immobile-objects
      (lambda (obj type size)
-       (declare (ignore type))
        (let ((address (logandc2 (get-lisp-obj-address obj) lowtag-mask)))
          (when (case subspace
-                 (:fixed (consp obj))
+                 (:fixed (= type list-pointer-lowtag))
                  (:variable (hole-p address)))
            (push (cons address size) holes)
            (incf hole-bytes size))))
@@ -509,7 +635,7 @@
 ;;; Return a list of 3-lists (bytes object type-name) for the objects
 ;;; allocated in Space.
 (defun type-breakdown (space)
-  (declare (muffle-conditions t))
+  (declare (muffle-conditions compiler-note))
   (let ((sizes (make-array 256 :initial-element 0 :element-type '(unsigned-byte #.n-word-bits)))
         (counts (make-array 256 :initial-element 0 :element-type '(unsigned-byte #.n-word-bits))))
     (map-allocated-objects
@@ -656,9 +782,13 @@
     (map-allocated-objects
      (lambda (obj type size)
        (declare (optimize (speed 3)))
-       (when (eql type instance-widetag)
+       (when (or (eql type instance-widetag)
+                 (eql type funcallable-instance-widetag))
          (incf total-objects)
-         (let* ((classoid (layout-classoid (%instance-layout obj)))
+         (let* ((layout (if (eql type funcallable-instance-widetag)
+                            (%funcallable-instance-layout obj)
+                            (%instance-layout obj)))
+                (classoid (layout-classoid layout))
                 (found (ensure-gethash classoid totals (cons 0 0)))
                 (size size))
            (declare (fixnum size))
@@ -672,9 +802,11 @@
                             sorted))
            (bytes-width (decimal-with-grouped-digits-width total-bytes))
            (objects-width (decimal-with-grouped-digits-width total-objects))
+           (totals-label (format nil "~:(~A~) instance total" space))
            (types-width (reduce #'max interesting
-                                :key (lambda (x) (length (symbol-name (classoid-name (first x)))))
-                                :initial-value 0))
+                                :key (lambda (x)
+                                       (length (symbol-name (classoid-name (first x)))))
+                                :initial-value (length totals-label)))
            (printed-bytes 0)
            (printed-objects 0))
       (declare (unsigned-byte printed-bytes printed-objects))
@@ -689,12 +821,12 @@
              (incf printed-bytes bytes)
              (incf printed-objects objects)
              (type-usage type objects bytes))
+        (terpri)
         (let ((residual-objects (- total-objects printed-objects))
               (residual-bytes (- total-bytes printed-bytes)))
           (unless (zerop residual-objects)
-            (type-usage "Other types" residual-bytes residual-objects)))
-        (type-usage (format nil "~:(~A~) instance total" space)
-                    total-bytes total-objects))))
+            (type-usage "Other types" residual-objects residual-bytes)))
+        (type-usage totals-label total-objects total-bytes))))
   (values))
 
 ;;;; PRINT-ALLOCATED-OBJECTS
@@ -704,6 +836,9 @@
 ;;; (2) sb-sprof deciding how many regions [sic] were made if #+cheneygc
 (defun get-page-size () sb-c:+backend-page-bytes+)
 
+;;; This function is sheer madness.  You're better off using
+;;; LIST-ALLOCATED-OBJECTS and then iterating over that, to avoid
+;;; seeing all the junk created while doing this thing.
 (defun print-allocated-objects (space &key (percent 0) (pages 5)
                                       type larger smaller count
                                       (stream *standard-output*))
@@ -799,125 +934,257 @@
 
 (defun list-allocated-objects (space &key type larger smaller count
                                      test)
-  (declare (type spaces space)
-           (type (or index null) larger smaller type count)
+  (declare (type (or (eql :all) spaces) space)
+           (type (or (unsigned-byte 8) null) type)
+           (type (or index null) larger smaller count)
            (type (or function null) test))
-  (unless *ignore-after*
-    (setq *ignore-after* (cons 1 2)))
-  (collect ((counted 0 1+))
-    (let ((res ()))
-      (map-allocated-objects
-       (lambda (obj obj-type size)
-         (when (and (or (not type) (eql obj-type type))
-                    (or (not smaller) (<= size smaller))
-                    (or (not larger) (>= size larger))
-                    (or (not test) (funcall test obj)))
-           (setq res (maybe-cons space obj res))
-           (when (and count (>= (counted) count))
-             (return-from list-allocated-objects res))))
-       space)
-      res)))
+  (declare (dynamic-extent test))
+  (when (eql count 0)
+    (return-from list-allocated-objects nil))
+  ;; This function was pretty much random as to what subset of the heap it
+  ;; visited- it might see half the heap, 1/10th of the heap, who knows, because
+  ;; it stopped based on hitting a sentinel cons cell made just prior to the loop.
+  ;; That stopping condition was totally wrong because allocation does not occur
+  ;; linearly.  Taking 2 passes (first count, then store) stands a chance of
+  ;; getting a reasonable point-in-time view as long as other threads are not consing
+  ;; like crazy. If the user-supplied TEST function conses at all, then the result is
+  ;; still very arbitrary - including possible duplication of objects if we visit
+  ;; something and then see it again after GC transports it higher. The only way to
+  ;; allow consing in the predicate would be to use dedicated "arenas" for new
+  ;; allocations, that being a concept which we do not now - and may never - support.
+  (sb-int:dx-flet ((wantp (obj widetag size)
+                     (and (or (not type) (eql widetag type))
+                          (or (not smaller) (<= size smaller))
+                          (or (not larger) (>= size larger))
+                          (or (not test) (funcall test obj)))))
+    ;; Unless COUNT is smallish, always start by counting. Don't just trust the user
+    ;; because s/he might specify :COUNT huge-num which is acceptable provided that
+    ;; huge-num is an INDEX which could either exhaust the heap, or at least be
+    ;; wasteful if but a tiny handful of objects would actually satisfy WANTP.
+    (let* ((output (make-array
+                    (if (typep count '(integer 0 100000))
+                        count
+                        (let ((n 0))
+                          (map-allocated-objects
+                           (lambda (obj widetag size)
+                             (when (wantp obj widetag size) (incf n)))
+                           space)
+                          n))))
+           (index 0))
+      (block done
+       (map-allocated-objects
+        (lambda (obj widetag size)
+          (when (wantp obj widetag size)
+            (setf (aref output index) obj)
+            (when (= (incf index) (length output))
+              (return-from done))))
+        space))
+      (let ((list
+             (cond ((= index (length output)) ; easy case
+                    (coerce output 'list))
+                   (t ; didn't fill the array
+                    (collect ((res))
+                      (dotimes (i index (res))
+                        (res (svref output i))))))))
+        (fill output 0) ; assist GC a bit
+        list))))
 
 ;;; Calls FUNCTION with all objects that have (possibly conservative)
 ;;; references to them on current stack.
+;;; This is for use by SB-INTROSPECT. (Other consumers, at your own risk)
+;;; Note that we do not call MAKE-LISP-OBJ in the errorp=nil mode, as it
+;;; potentially uses FORMAT and MAKE-UNPRINTABLE-OBJECT with each invocation.
+;;; And see the cautionary remarks above that function regarding its dangerous
+;;; nature (more so on precise GC).  On conservative GC we should be OK here
+;;; because we know that there's a stack reference.
 (defun map-stack-references (function)
-  (let ((end
-         (descriptor-sap
-          #+stack-grows-downward-not-upward *control-stack-end*
-          #-stack-grows-downward-not-upward *control-stack-start*))
-        (sp (current-sp))
-        (seen nil))
-    (loop until #+stack-grows-downward-not-upward (sap> sp end)
-                #-stack-grows-downward-not-upward (sap< sp end)
-          do (multiple-value-bind (obj ok) (make-lisp-obj (sap-ref-word sp 0) nil)
-               (when (and ok (typep obj '(not (or fixnum character))))
-                 (unless (member obj seen :test #'eq)
-                   (funcall function obj)
-                   (push obj seen))))
-             (setf sp
-                   #+stack-grows-downward-not-upward (sap+ sp n-word-bytes)
-                   #-stack-grows-downward-not-upward (sap+ sp (- n-word-bytes))))))
+  (declare (type function function))
+  (declare (dynamic-extent function))
+  (macrolet ((iter (step limit test)
+               `(do ((sp (current-sp) (sap+ sp (,step n-word-bytes)))
+                     (limit (sb-di::descriptor-sap ,limit))
+                     (seen nil))
+                    ((,test sp limit))
+                  (let ((word (sap-ref-word sp 0)))
+                    ;; Explicitly skip non-pointer words. The callable that
+                    ;; SB-INTROSPECT provides ignores immediate values anyway.
+                    (when (and (is-lisp-pointer word)
+                               (not (zerop (sb-di::valid-lisp-pointer-p (int-sap word)))))
+                      (let ((obj (%make-lisp-obj word)))
+                        (unless (memq obj seen)
+                          (push obj seen)
+                          (funcall function obj))))))))
+    #+stack-grows-downward-not-upward (iter + *control-stack-end* sap>)
+    #-stack-grows-downward-not-upward (iter - *control-stack-start* sap<)))
+
+(declaim (inline symbol-extra-slot-p))
+(defun symbol-extra-slot-p (x)
+  (> (logand (get-header-data x) tiny-boxed-size-mask)
+     (1- symbol-size)))
+
+;;; Invoke FUNCTOID (a macro or function) on OBJ and any values in MORE.
+;;; Note that neither OBJ nor items in MORE undergo ONCE-ONLY treatment.
+;;; The fact that FUNCTOID can be a macro allows treatment of its first argument
+;;; as a generalized place in the manner of SETF, allowing read/write access.
+;;; CLAUSES are used to modify the output of this macro. See example uses
+;;; for more detail.
+;;; HIGH EXPERIMENTAL: PROCEED AT YOUR OWN RISK.
+(defmacro do-referenced-object ((obj functoid &rest more) &rest alterations
+                                &aux (n-matched-alterations 0))
+  (labels ((make-case (type &rest actions)
+             (apply #'make-case* type
+                    (mapcar (lambda (action) `(,functoid ,action ,@more))
+                            actions)))
+           (make-case* (type &rest actions)
+             (let* ((found (assoc type alterations :test 'equal))
+                    (alteration (or (cdr found) '(:extend))))
+               (when found
+                 (incf n-matched-alterations))
+               (ecase (car alteration)
+                 (:override (list `(,type ,@(cdr alteration))))
+                 (:extend   (list `(,type ,@actions ,@(cdr alteration))))
+                 (:delete))))) ; no clause
+    (prog1
+      `(typecase ,obj
+         ;; Until the compiler can learn how to efficiently compile jump tables
+         ;; by widetag, test in descending order of popularity.
+         ;; These two are in fact generally the most frequently occurring type.
+         ,.(make-case 'cons `(car ,obj) `(cdr ,obj))
+         ,.(make-case* 'instance
+            `(let ((.l. (%instance-layout ,obj)))
+               ;; Though we've bound %INSTANCE-LAYOUT to a variable,
+               ;; pass the form %INSTANCE-LAYOUT to functoid
+               ;; in case it wants to examine the form
+               (,functoid (%instance-layout ,obj) ,@more)
+               (do-instance-tagged-slot (.i. ,obj :layout .l. :pad nil)
+                 (,functoid (%instance-ref ,obj .i.) ,@more))))
+         (function
+          (typecase ,obj
+            ,.(make-case* 'closure
+               `(,functoid (%closure-fun ,obj) ,@more)
+               `(do-closure-values (.o. ,obj :include-extra-values t)
+                  ;; FIXME: doesn't allow setf, but of course there is
+                  ;; no closure-index-set anyway, so .O. might be unused
+                  ;; if functoid is a macro that does nothing.
+                  (,functoid .o. ,@more)))
+            ,.(make-case* 'funcallable-instance
+               `(let ((.l. (%funcallable-instance-layout ,obj)))
+                  ;; As for INSTANCE, allow the functoid to see the access form
+                  (,functoid (%funcallable-instance-layout ,obj) ,@more)
+                  (,functoid (%funcallable-instance-fun ,obj) ,@more)
+                  (ecase (layout-bitmap .l.)
+                    (#.sb-kernel::+layout-all-tagged+
+                     (loop for .i. from instance-data-start ; exclude layout
+                           to (- (get-closure-length ,obj) funcallable-instance-info-offset)
+                           do (,functoid (%funcallable-instance-info ,obj .i.) ,@more)))
+                    (#b0110
+                     ;; A pedantically correct kludge which shall remain unless need arises
+                     ;; for more general partially unboxed FINs.
+                     ;;  payload word 0 is raw (but looks like a fixnum, by design)
+                     ;;  word 1 is the fin-fun which we already accounted for above
+                     ;;  word 2 (info slot 0) is the only one that hasn't been processed.
+                     ;;  words 3 and 4 are raw but looks like fixnums by accident.
+                     (,functoid (%funcallable-instance-info ,obj 0) ,@more)))))
+            .,(make-case 'function))) ; in case there was code provided for it
+         (t
+          ;; TODO: the generated code is pretty horrible. OTHER-POINTER-LOWTAG
+          ;; is known at this point, but tested N times.
+          (typecase ,obj
+            ,.(make-case* 'simple-vector
+               `(dotimes (.i. (length ,obj))
+                  (,functoid (data-vector-ref ,obj .i.) ,@more)))
+            ;; Fancy arrays aren't highly popular, but this case must precede ARRAY
+            ;; because ARRAY weeds out all other arrays, namely the ones that
+            ;; hold no pointers: simple-string, simple-bit-vector, etc.
+            ,.(make-case '(satisfies array-header-p)
+               `(%array-data ,obj)
+               `(%array-displaced-p ,obj)
+               `(%array-displaced-from ,obj))
+            ,.(make-case 'array)
+            ,.(make-case* 'symbol
+               `(,functoid (%primitive sb-c:fast-symbol-global-value ,obj) ,@more)
+               `(,functoid (symbol-info ,obj) ,@more)
+               `(,functoid (symbol-name ,obj) ,@more)
+               `(,functoid (symbol-package ,obj) ,@more)
+               `(when (symbol-extra-slot-p ,obj)
+                  (,functoid (symbol-extra ,obj) ,@more)))
+            ,.(make-case 'fdefn
+               `(fdefn-name ,obj)
+               `(fdefn-fun ,obj)
+               #+immobile-code
+               `(%make-lisp-obj
+                 (alien-funcall (extern-alien "fdefn_callee_lispobj" (function unsigned unsigned))
+                                (logandc2 (get-lisp-obj-address ,obj) lowtag-mask))))
+            ,.(make-case* 'code-component
+               `(,functoid (%code-debug-info ,obj) ,@more)
+               #+(or x86 immobile-code) `(,functoid (%code-fixups ,obj) ,@more)
+               `(loop for .i. from code-constants-offset below (code-header-words ,obj)
+                      do (,functoid (code-header-ref ,obj .i.) ,@more))
+               ;; Caller should extend behavior for embedded objects, like:
+               ;; `(loop for .i. below (code-n-entries ,obj)
+               ;;        do (,functoid (%code-entry-point ,obj .i.) ,@more)))
+               ;; and/or visit the slots of each simple-fun but not the fun per se.
+               )
+            ,.(make-case '(or float (complex float) bignum
+                           #+sb-simd-pack simd-pack
+                           #+sb-simd-pack-256 simd-pack-256
+                           system-area-pointer)) ; nothing to do
+            ,.(make-case 'weak-pointer `(weak-pointer-value ,obj))
+            ,.(make-case 'ratio `(%numerator ,obj) `(%denominator ,obj))
+            ;; Visitor won't be invoked on (COMPLEX float)
+            ,.(make-case '(complex rational) `(%realpart ,obj) `(%imagpart ,obj))
+            ;; Caller can do anything in the fallback case.
+            ,.(make-case 't))))
+      (when (> (length alterations) n-matched-alterations)
+        (error "DO-REFERENCED-OBJECT usage error")))))
+
+;;; Return T if and only if THIS references THAT.
+;;; code-components are considered to reference their embedded
+;;; simple-funs for this purpose; if THIS is a simple-fun, it is ignored.
+(defun references-p (this that)
+  (macrolet ((test (x) `(when (eq ,x that) (go win))))
+    (tagbody
+       (do-referenced-object (this test)
+         (code-component
+          :extend
+          (dotimes (i (code-n-entries this))
+            (let ((f (%code-entry-point this i)))
+              (when (or (eq f that)
+                        (eq (%simple-fun-name f) that)
+                        (eq (%simple-fun-arglist f) that)
+                        (eq (%%simple-fun-type f) that)
+                        (eq (%simple-fun-info f) that))
+                (go win)))))
+         (t
+          :extend
+          (case (widetag-of this)
+            (#.value-cell-widetag
+             (test (value-cell-ref this)))
+            (#.filler-widetag)
+            (t
+             (bug "Unknown object type #x~x addr=~x"
+                  (widetag-of this)
+                  (get-lisp-obj-address this))))))
+       (return-from references-p nil)
+     win
+       (return-from references-p t))))
 
 ;;; This interface allows one either to be agnostic of the referencing space,
 ;;; or specify exactly one space, but not specify a list of spaces.
 ;;; An upward-compatible change would be to assume a list, and call ENSURE-LIST.
 (defun map-referencing-objects (fun space object)
   (declare (type (or (eql :all) spaces) space))
+  (declare (dynamic-extent fun))
   (unless *ignore-after*
     (setq *ignore-after* (cons 1 2)))
-  (flet ((ref-p (this widetag nwords) ; return T if 'this' references object
-           (when (listp this)
-             (return-from ref-p
-               (or (eq (car this) object) (eq (cdr this) object))))
-           (case widetag
-             ;; purely boxed objects
-             ((#.ratio-widetag #.complex-widetag #.value-cell-widetag
-               #.symbol-widetag #.weak-pointer-widetag
-               #.simple-array-widetag #.simple-vector-widetag
-               #.complex-array-widetag #.complex-vector-widetag
-               #.complex-bit-vector-widetag #.complex-vector-nil-widetag
-               #.complex-base-string-widetag
-               #+sb-unicode #.complex-character-string-widetag))
-             ;; mixed boxed/unboxed objects
-             (#.code-header-widetag
-              (dotimes (i (code-n-entries this))
-                (let ((f (%code-entry-point this i)))
-                  (when (or (eq f object)
-                            (eq (%simple-fun-name f) object)
-                            (eq (%simple-fun-arglist f) object)
-                            (eq (%simple-fun-type f) object)
-                            (eq (%simple-fun-info f) object))
-                    (return-from ref-p t))))
-              (setq nwords (code-header-words this)))
-             (#.instance-widetag
-              (return-from ref-p
-                (or (eq (%instance-layout this) object)
-                    (do-instance-tagged-slot (i this)
-                      (when (eq (%instance-ref this i) object)
-                        (return t))))))
-             (#.funcallable-instance-widetag
-              (let ((l (%funcallable-instance-layout this)))
-                (when (eq l object)
-                  (return-from ref-p t))
-                (let ((bitmap (layout-bitmap l)))
-                  (unless (eql bitmap -1)
-                    ;; tagged slots precede untagged slots,
-                    ;; so integer-length is the count of tagged slots.
-                    (setq nwords (1+ (integer-length bitmap)))))))
-             (#.closure-widetag
-              (when (eq (%closure-fun this) object)
-                (return-from ref-p t)))
-             (#.fdefn-widetag
-              #+immobile-code
-              (when (eq (make-lisp-obj
-                         (alien-funcall
-                          (extern-alien "fdefn_callee_lispobj" (function unsigned unsigned))
-                          (logandc2 (get-lisp-obj-address this) lowtag-mask)))
-                        object)
-                (return-from ref-p t))
-              ;; Without immobile-code the 'raw-addr' slot either holds the same thing
-              ;; as the 'fun' slot, or holds a trampoline address. We'll overlook the
-              ;; minor issue that due to concurrent writes, two representations of the
-              ;; allegedly same referent may diverge; thus the last slot is skipped
-              ;; even if it refers to a different simple-fun.
-              (decf nwords))
-             (t
-              (return-from ref-p nil)))
-           ;; gencgc has WITHOUT-GCING in map-allocated-objects over dynamic space,
-           ;; so we don't have to pin each object inside REF-P.
-           (#+cheneygc with-pinned-objects #+cheneygc (this)
-            #-cheneygc progn
-            (do ((sap (int-sap (logandc2 (get-lisp-obj-address this) lowtag-mask)))
-                 (i (* (1- nwords) n-word-bytes) (- i n-word-bytes)))
-                ((<= i 0) nil)
-              (when (eq (sap-ref-lispobj sap i) object)
-                (return t))))))
-    (let ((fun (%coerce-callable-to-fun fun)))
-      (dx-flet ((mapfun (obj widetag size)
-                  (when (and (ref-p obj widetag (/ size n-word-bytes))
-                             (valid-obj space obj))
-                    (funcall fun obj))))
-        (map-allocated-objects #'mapfun space)))))
+  (let ((fun (%coerce-callable-to-fun fun)))
+    (map-allocated-objects
+     (lambda (referer widetag size)
+       (declare (ignore widetag size))
+       (when (and (valid-obj space referer) ; semi-bogus!
+                  (references-p referer object))
+         (funcall fun referer)))
+     space)))
 
 (defun list-referencing-objects (space object)
   (collect ((res))
@@ -989,10 +1256,12 @@
   (values))
 
 #+nil ; for debugging
-(defun dump-dynamic-space-code (&optional (stream *standard-output*)
-                                &aux (n-pages 0) (n-code-bytes 0))
+(defun show-dynamic-space-code (&optional (stream *standard-output*)
+                                &aux (n-code-bytes 0)
+                                     (total-pages next-free-page)
+                                     (pages
+                                      (make-array total-pages :element-type 'bit)))
   (flet ((dump-page (page-num)
-           (incf n-pages)
            (format stream "~&Page ~D~%" page-num)
            (let ((where (+ dynamic-space-start (* page-num gencgc-card-bytes)))
                  (seen-filler nil))
@@ -1008,23 +1277,130 @@
                            (progn (setq seen-filler nil) t))
                    (let ((*print-pretty* nil))
                      (format stream "~&  ~X ~4X ~S " where size obj)))
-                 (incf where size))
+                 (incf where size)
+                 (loop for index from page-num to (find-page-index (1- where))
+                       do (setf (sbit pages index) 1)))
                (let ((next-page (find-page-index where)))
                  (cond ((= (logand where (1- gencgc-card-bytes)) 0)
                         (format stream "~&-- END OF PAGE --~%")
                         (return next-page))
                        ((eq next-page page-num))
                        (t
-                        (incf n-pages)
                         (setq page-num next-page seen-filler nil))))))))
     (let ((i 0))
-      (loop while (< i last-free-page)
-            do (let ((allocation (ldb (byte 2 0)
-                                      (slot (deref page-table i) 'flags))))
-                 (if (= allocation 3)
+      (loop while (< i total-pages)
+            do (let ((type (ldb (byte 2 0) (slot (deref page-table i) 'flags))))
+                 (if (= type 3)
                      (setq i (dump-page i))
                      (incf i)))))
-    (let* ((tot (* n-pages gencgc-card-bytes))
+    (let* ((n-pages (count 1 pages))
+           (tot (* n-pages gencgc-card-bytes))
            (waste (- tot n-code-bytes)))
-      (format t "~&Used=~D Waste=~D (~F%)~%" n-code-bytes waste
+      (format t "~&Used-bytes=~D Pages=~D Waste=~D (~F%)~%"
+              n-code-bytes n-pages waste
               (* 100 (/ waste tot))))))
+
+#+nil ; for debugging
+(defun show-immobile-spaces (which)
+  (flet ((show (obj type size)
+           (declare (ignore type size))
+           (let ((*print-pretty* nil))
+             (format t "~x: ~s~%" (get-lisp-obj-address obj) obj))))
+    (when (or (eq which :fixed) (eq which :both))
+      (format t "Fixedobj space~%==============~%")
+      (map-objects-in-range #'show
+        (%make-lisp-obj fixedobj-space-start)
+        (%make-lisp-obj (sap-int *fixedobj-space-free-pointer*))))
+    (when (or (eq which :variable) (eq which :both))
+      (format t "Varyobj space~%=============~%")
+      (map-objects-in-range #'show
+        (%make-lisp-obj varyobj-space-start)
+        (%make-lisp-obj (sap-int *varyobj-space-free-pointer*))))))
+
+#+gencgc
+(defun generation-of (object)
+  (let* ((addr (get-lisp-obj-address object))
+         (page (find-page-index addr)))
+    (cond ((>= page 0) (slot (deref page-table page) 'gen))
+          #+immobile-space
+          ((immobile-space-addr-p addr)
+           ;; SIMPLE-FUNs don't contain a generation byte
+           (when (simple-fun-p object)
+             (setq addr (get-lisp-obj-address (fun-code-header object))))
+           (logand #xF (sap-ref-8 (int-sap (logandc2 addr lowtag-mask)) 3))))))
+
+;;; Unfortunately this is a near total copy of the test in gc.impure.lisp
+(defun !ensure-genesis-code/data-separation ()
+  #+gencgc
+  (let* ((n-bits (+ next-free-page 10))
+         (code-bits (make-array n-bits :element-type 'bit))
+         (data-bits (make-array n-bits :element-type 'bit))
+         (total-code-size 0))
+    (map-allocated-objects
+     (lambda (obj type size)
+       (declare ((and fixnum (integer 1)) size))
+       ;; M-A-O disables GC, therefore GET-LISP-OBJ-ADDRESS is safe
+       (let ((obj-addr (get-lisp-obj-address obj))
+             (array (cond ((= type code-header-widetag)
+                           (incf total-code-size size)
+                           code-bits)
+                          (t
+                           data-bits)))
+             (other-array (cond ((= type code-header-widetag)
+                                 data-bits)
+                                (t
+                                 code-bits))))
+         ;; This is not the most efficient way to update the bit arrays,
+         ;; but the simplest and clearest for sure. (The loop could avoided
+         ;; if the current page is the same as the previously seen page)
+         (loop for index from (find-page-index obj-addr)
+               to (find-page-index (truly-the word
+                                              (+ (logandc2 obj-addr lowtag-mask)
+                                                 (1- size))))
+               do (cond ((= (sbit other-array index) 1)
+                         (format t "~&broken on page index ~d base ~x~%"
+                                 index
+                                 (+ dynamic-space-start (* index gencgc-card-bytes)))
+                         (alien-funcall (extern-alien "ldb_monitor" (function void))))
+                        (t
+                         (setf (sbit array index) 1))))))
+     :dynamic)))
+;;; Because pseudo-static objects can not move nor be freed,
+;;; this is a valid test that genesis separated code and data.
+(!ensure-genesis-code/data-separation)
+
+(defun hexdump (obj &optional (n-words
+                               (if (and (typep obj 'code-component)
+                                        (plusp (code-n-entries obj)))
+                                   ;; Display up through the first fun header
+                                   (+ (code-header-words obj)
+                                      (ash (%code-fun-offset obj 0) (- word-shift))
+                                      simple-fun-code-offset)
+                                   ;; at most 16 words
+                                   (min 16 (ash (primitive-object-size obj)
+                                                (- word-shift)))))
+                              ;; pass NIL explicitly if T crashes on you
+                              (decode t))
+  (with-pinned-objects (obj)
+    (let ((a (logandc2 (get-lisp-obj-address obj) lowtag-mask)))
+      (dotimes (i n-words)
+        (let ((word (sap-ref-word (int-sap a) (ash i word-shift))))
+          (multiple-value-bind (lispobj ok) (if decode (make-lisp-obj word nil))
+            (let ((*print-lines* 1)
+                  (*print-pretty* t))
+              (format t "~x: ~v,'0x~:[~; = ~S~]~%"
+                      (+ a (ash i word-shift))
+                      (* 2 n-word-bytes)
+                      word ok lispobj))))))))
+
+(in-package "SB-C")
+;;; As soon as practical in warm build it makes sense to add
+;;; cold-allocation-point-fixups into the weak hash-table.
+(defvar *!cold-allocation-point-fixups*)
+(let ((hash-table (make-hash-table :test 'eq)))
+  ;; Group by code component
+  (loop for (code . offset) across *!cold-allocation-point-fixups*
+        do (push offset (gethash code hash-table)))
+  (dohash ((code list) hash-table)
+    (setf (gethash code *allocation-point-fixups*)
+          (convert-alloc-point-fixups code list))))

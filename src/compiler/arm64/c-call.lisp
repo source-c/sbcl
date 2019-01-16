@@ -9,16 +9,11 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (defconstant +number-stack-alignment-mask+ (1- (* n-word-bytes 2)))
 
 (defconstant +max-register-args+ 8)
-
-(defun my-make-wired-tn (prim-type-name sc-name offset)
-  (make-wired-tn (primitive-type-or-lose prim-type-name)
-                 (sc-number-or-lose sc-name)
-                 offset))
 
 (defstruct arg-state
   (num-register-args 0)
@@ -42,38 +37,38 @@
   (let ((reg-args (arg-state-num-register-args state)))
     (cond ((< reg-args +max-register-args+)
            (setf (arg-state-num-register-args state) (1+ reg-args))
-           (my-make-wired-tn prim-type reg-sc (register-args-offset reg-args)))
+           (make-wired-tn* prim-type reg-sc (register-args-offset reg-args)))
           (t
            (let ((frame-size (arg-state-stack-frame-size state)))
              (setf (arg-state-stack-frame-size state) (1+ frame-size))
-             (my-make-wired-tn prim-type stack-sc frame-size))))))
+             (make-wired-tn* prim-type stack-sc frame-size))))))
 
 (defun float-arg (state prim-type reg-sc stack-sc)
   (let ((reg-args (arg-state-fp-registers state)))
     (cond ((< reg-args +max-register-args+)
            (setf (arg-state-fp-registers state) (1+ reg-args))
-           (my-make-wired-tn prim-type reg-sc reg-args))
+           (make-wired-tn* prim-type reg-sc reg-args))
           (t
            (let ((frame-size (arg-state-stack-frame-size state)))
              (setf (arg-state-stack-frame-size state) (1+ frame-size))
-             (my-make-wired-tn prim-type stack-sc frame-size))))))
+             (make-wired-tn* prim-type stack-sc frame-size))))))
 
 (define-alien-type-method (integer :arg-tn) (type state)
   (if (alien-integer-type-signed type)
-      (int-arg state 'signed-byte-64 'signed-reg 'signed-stack)
-      (int-arg state 'unsigned-byte-64 'unsigned-reg 'unsigned-stack)))
+      (int-arg state 'signed-byte-64 signed-reg-sc-number signed-stack-sc-number)
+      (int-arg state 'unsigned-byte-64 unsigned-reg-sc-number unsigned-stack-sc-number)))
 
 (define-alien-type-method (system-area-pointer :arg-tn) (type state)
   (declare (ignore type))
-  (int-arg state 'system-area-pointer 'sap-reg 'sap-stack))
+  (int-arg state 'system-area-pointer sap-reg-sc-number sap-stack-sc-number))
 
 (define-alien-type-method (single-float :arg-tn) (type state)
   (declare (ignore type))
-  (float-arg state 'single-float 'single-reg 'single-stack))
+  (float-arg state 'single-float single-reg-sc-number single-stack-sc-number))
 
 (define-alien-type-method (double-float :arg-tn) (type state)
   (declare (ignore type))
-  (float-arg state 'double-float 'double-reg 'double-stack))
+  (float-arg state 'double-float double-reg-sc-number double-stack-sc-number))
 ;;;
 
 (defknown sign-extend ((signed-byte 64) t) fixnum
@@ -117,23 +112,23 @@
     (setf (result-state-num-results state) (1+ num-results))
     (multiple-value-bind (ptype reg-sc)
         (if (alien-integer-type-signed type)
-            (values 'signed-byte-64 'signed-reg)
-            (values 'unsigned-byte-64 'unsigned-reg))
-      (my-make-wired-tn ptype reg-sc
+            (values 'signed-byte-64 signed-reg-sc-number)
+            (values 'unsigned-byte-64 unsigned-reg-sc-number))
+      (make-wired-tn* ptype reg-sc
                         (result-reg-offset num-results)))))
 
 (define-alien-type-method (system-area-pointer :result-tn) (type state)
   (declare (ignore type state))
-  (my-make-wired-tn 'system-area-pointer 'sap-reg (result-reg-offset 0)))
+  (make-wired-tn* 'system-area-pointer sap-reg-sc-number (result-reg-offset 0)))
 
 
 (define-alien-type-method (single-float :result-tn) (type state)
   (declare (ignore type state))
-  (my-make-wired-tn 'single-float 'single-reg 0))
+  (make-wired-tn* 'single-float single-reg-sc-number 0))
 
 (define-alien-type-method (double-float :result-tn) (type state)
   (declare (ignore type state))
-  (my-make-wired-tn 'double-float 'double-reg 0))
+  (make-wired-tn* 'double-float double-reg-sc-number 0))
 
 (define-alien-type-method (values :result-tn) (type state)
   (let ((values (alien-values-type-values type)))
@@ -228,18 +223,18 @@
 
 ;;; long-long support
 ;; (deftransform %alien-funcall ((function type &rest args) * * :node node)
-;;   (aver (sb!c::constant-lvar-p type))
-;;   (let* ((type (sb!c::lvar-value type))
-;;          (env (sb!c::node-lexenv node))
+;;   (aver (sb-c::constant-lvar-p type))
+;;   (let* ((type (sb-c::lvar-value type))
+;;          (env (sb-c::node-lexenv node))
 ;;          (arg-types (alien-fun-type-arg-types type))
 ;;          (result-type (alien-fun-type-result-type type)))
 ;;     (aver (= (length arg-types) (length args)))
 ;;     (if (or (some (lambda (type)
 ;;                     (and (alien-integer-type-p type)
-;;                          (> (sb!alien::alien-integer-type-bits type) 64)))
+;;                          (> (sb-alien::alien-integer-type-bits type) 64)))
 ;;                   arg-types)
 ;;             (and (alien-integer-type-p result-type)
-;;                  (> (sb!alien::alien-integer-type-bits result-type) 64)))
+;;                  (> (sb-alien::alien-integer-type-bits result-type) 64)))
 ;;         (collect ((new-args) (lambda-vars) (new-arg-types))
 ;;                  (loop with i = 0
 ;;                        for type in arg-types
@@ -247,7 +242,7 @@
 ;;                        do
 ;;                        (lambda-vars arg)
 ;;                        (cond ((and (alien-integer-type-p type)
-;;                                    (> (sb!alien::alien-integer-type-bits type) 64))
+;;                                    (> (sb-alien::alien-integer-type-bits type) 64))
 ;;                               (when (oddp i)
 ;;                                 ;; long-long is only passed in pairs of r0-r1 and r2-r3,
 ;;                                 ;; and the stack is double-word aligned
@@ -269,9 +264,9 @@
 ;;                               (new-args arg)
 ;;                               (new-arg-types type))))
 ;;                  (cond ((and (alien-integer-type-p result-type)
-;;                              (> (sb!alien::alien-integer-type-bits result-type) 64))
+;;                              (> (sb-alien::alien-integer-type-bits result-type) 64))
 ;;                         (let ((new-result-type
-;;                                 (let ((sb!alien::*values-type-okay* t))
+;;                                 (let ((sb-alien::*values-type-okay* t))
 ;;                                   (parse-alien-type
 ;;                                    (if (alien-integer-type-signed result-type)
 ;;                                        '(values (unsigned 64) (signed 64))
@@ -294,14 +289,14 @@
 ;;                                               :arg-types (new-arg-types)
 ;;                                               :result-type result-type)
 ;;                                            ,@(new-args))))))
-;;         (sb!c::give-up-ir1-transform))))
+;;         (sb-c::give-up-ir1-transform))))
 
 ;;; Callback
 #-sb-xc-host
 (defun alien-callback-accessor-form (type sap offset)
   (let ((parsed-type type))
     (if (alien-integer-type-p parsed-type)
-        (let ((bits (sb!alien::alien-integer-type-bits parsed-type)))
+        (let ((bits (sb-alien::alien-integer-type-bits parsed-type)))
                (let ((byte-offset
                       (cond ((< bits n-word-bits)
                              (- n-word-bytes
@@ -336,7 +331,7 @@
            (frame-size (* (length argument-types) n-word-bytes)))
       (setf frame-size (logandc2 (+ frame-size +number-stack-alignment-mask+)
                                  +number-stack-alignment-mask+))
-      (assemble (segment)
+      (assemble (segment 'nil)
         (inst mov-sp nsp-save-tn nsp-tn)
         (inst str lr-tn (@ nsp-tn -16 :pre-index))
         ;; Make room on the stack for arguments.
@@ -415,7 +410,7 @@
       (finalize-segment segment)
       ;; Now that the segment is done, convert it to a static
       ;; vector we can point foreign code to.
-      (let* ((buffer (sb!assem::segment-buffer segment))
+      (let* ((buffer (sb-assem::segment-buffer segment))
              (vector (make-static-vector (length buffer)
                                          :element-type '(unsigned-byte 8)
                                          :initial-contents buffer))

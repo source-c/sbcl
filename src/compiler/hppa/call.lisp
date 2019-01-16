@@ -9,10 +9,10 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
-(defconstant arg-count-sc (make-sc-offset immediate-arg-scn nargs-offset))
-(defconstant closure-sc (make-sc-offset descriptor-reg-sc-number lexenv-offset))
+(defconstant arg-count-sc (make-sc+offset immediate-arg-scn nargs-offset))
+(defconstant closure-sc (make-sc+offset descriptor-reg-sc-number lexenv-offset))
 
 ;;; Make a passing location TN for a local call return PC.  If standard is
 ;;; true, then use the standard (full call) location, otherwise use any legal
@@ -28,10 +28,11 @@
 ;;; standard convention, but is totally unrestricted in non-standard
 ;;; conventions, since we can always fetch it off of the stack using
 ;;; the arg pointer.
-(defun make-old-fp-passing-location (standard)
-  (if standard
-      (make-wired-tn *fixnum-primitive-type* immediate-arg-scn ocfp-offset)
-      (make-normal-tn *fixnum-primitive-type*)))
+(defun make-old-fp-passing-location ()
+  (make-wired-tn *fixnum-primitive-type* immediate-arg-scn ocfp-offset))
+
+(defconstant old-fp-passing-offset
+  (make-sc+offset descriptor-reg-sc-number ocfp-offset))
 
 ;;; Make the TNs used to hold OLD-FP and RETURN-PC within the current
 ;;; function. We treat these specially so that the debugger can find
@@ -117,8 +118,7 @@
     (emit-label start-lab)
     ;; Allocate function header.
     (inst simple-fun-header-word)
-    (dotimes (i (1- simple-fun-code-offset))
-      (inst word 0))
+    (inst .skip (* (1- simple-fun-code-offset) n-word-bytes))
     ;; The start of the actual code.
     ;; Fix CODE, cause the function object was passed in.
     (let ((entry-point (gen-label)))
@@ -296,7 +296,7 @@ default-value-8
 
             (let ((defaults (defaults)))
               (aver defaults)
-              (assemble (*elsewhere*)
+              (assemble (:elsewhere)
                 (emit-label default-stack-vals)
                 (do ((remaining defaults (cdr remaining)))
                     ((null remaining))
@@ -345,7 +345,7 @@ default-value-8
 
     (emit-label done)
 
-    (assemble (*elsewhere*)
+    (assemble (:elsewhere)
       (emit-label variable-values)
       (when lra-label
         (inst compute-code-from-lra code-tn lra-label temp code-tn))
@@ -750,7 +750,7 @@ default-value-8
                 (insert-step-instrumenting (callable-tn)
                   ;; Conditionally insert a conditional trap:
                   (when step-instrumenting
-                    (load-symbol-value stepping sb!impl::*stepping*)
+                    (load-symbol-value stepping sb-impl::*stepping*)
                     ;; If it's not zero, trap.
                     (inst comb := stepping zero-tn step-done-label :nullify t)
                     ;; CONTEXT-PC will be pointing here when the
@@ -1087,7 +1087,28 @@ default-value-8
 ;;; More args are stored consequtively on the stack, starting immediately at
 ;;; the context pointer.  The context pointer is not typed, so the lowtag is 0.
 ;;;
-(define-full-reffer more-arg * 0 0 (descriptor-reg any-reg) * %more-arg)
+(define-vop (more-arg)
+  (:translate %more-arg)
+  (:policy :fast-safe)
+  (:args (context :scs (descriptor-reg))
+         (index :scs (any-reg)))
+  (:arg-types * tagged-num)
+  (:temporary (:scs (any-reg)) temp)
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:result-types *)
+  (:generator 5
+    (inst add context index temp)
+    (loadw value temp)))
+(define-vop (more-arg-c)
+  (:translate %more-arg)
+  (:policy :fast-safe)
+  (:args (context :scs (descriptor-reg)))
+  (:info index)
+  (:arg-types * (:constant (load/store-index 8 0 0)))
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:result-types *)
+  (:generator 4
+    (loadw value context index)))
 
 ;;; Turn more arg (context, count) into a list.
 (define-vop (listify-rest-args)
@@ -1153,7 +1174,7 @@ default-value-8
 ;;;
 (define-vop (more-arg-context)
   (:policy :fast-safe)
-  (:translate sb!c::%more-arg-context)
+  (:translate sb-c::%more-arg-context)
   (:args (supplied :scs (any-reg)))
   (:arg-types tagged-num (:constant fixnum))
   (:info fixed)
@@ -1165,25 +1186,6 @@ default-value-8
     (inst addi (fixnumize (- fixed)) supplied count)
     (inst sub csp-tn count context)))
 
-;;; Signal wrong argument count error if Nargs isn't = to Count.
-#!-precise-arg-count-error
-(define-vop (verify-arg-count)
-  (:policy :fast-safe)
-  (:translate sb!c::%verify-arg-count)
-  (:args (nargs :scs (any-reg)))
-  (:arg-types positive-fixnum (:constant t))
-  (:info count)
-  (:vop-var vop)
-  (:save-p :compute-only)
-  (:generator 3
-    (let ((err-lab
-           (generate-error-code vop 'invalid-arg-count-error nargs)))
-      (cond ((zerop count)
-             (inst bc :<> nil nargs zero-tn err-lab))
-            (t
-             (inst bci :<> nil (fixnumize count) nargs err-lab))))))
-
-#!+precise-arg-count-error
 (define-vop (verify-arg-count)
   (:policy :fast-safe)
   (:args (nargs :scs (any-reg)))
@@ -1212,7 +1214,7 @@ default-value-8
   (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
-    (load-symbol-value stepping sb!impl::*stepping*)
+    (load-symbol-value stepping sb-impl::*stepping*)
     ;; If it's not zero, trap.
     (inst comb := stepping zero-tn DONE :nullify t)
     ;; CONTEXT-PC will be pointing here when the interrupt is handled,
@@ -1222,4 +1224,3 @@ default-value-8
     ;; can just use a bare SINGLE-STEP-BEFORE-TRAP as the code.
     (inst break 0 single-step-before-trap)
     DONE))
-

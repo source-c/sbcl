@@ -11,8 +11,6 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(cl:in-package :cl-user)
-
 (with-test (:name (:infinities :comparison))
   (dolist (ifnis (list (cons single-float-positive-infinity
                              single-float-negative-infinity)
@@ -100,7 +98,7 @@
   (assert (= 0.0d0 (scale-float 1.0d0 (1- most-negative-fixnum)))))
 
 (with-test (:name (:scale-float-overflow :bug-372)
-            :fails-on '(or :arm64 (and :darwin :ppc)))
+            :fails-on (or :arm64 (and :darwin :ppc)))
   (flet ((test (form)
            (assert-error (funcall (checked-compile `(lambda () ,form)
                                                    :allow-style-warnings t))
@@ -135,7 +133,7 @@
     (mapc #'test '(sin cos tan))))
 
 (with-test (:name (:addition-overflow :bug-372)
-            :fails-on '(or :arm64
+            :fails-on (or :arm64
                         (and :ppc :openbsd)
                         (and :ppc :darwin)
                         (and :x86 :netbsd)))
@@ -156,7 +154,7 @@
 ;; the preceeding "pure" test files aren't as free of side effects as
 ;; we might like.
 (with-test (:name (:addition-overflow :bug-372 :take-2)
-            :fails-on '(or :arm64
+            :fails-on (or :arm64
                         (and :ppc :openbsd)
                         (and :ppc :darwin)
                         (and :x86 :netbsd)))
@@ -191,7 +189,7 @@
                              (+ x0 x1 x6 x7) (+ x2 x3 x4 x5)))))))
 
 (with-test (:name (:nan :comparison)
-            :fails-on '(or :sparc))
+            :fails-on (or :sparc))
   (sb-int:with-float-traps-masked (:invalid)
     (macrolet ((test (form)
                  (let ((nform (subst '(/ 0.0 0.0) 'nan form)))
@@ -327,7 +325,7 @@
                         (locally ,@body))
                     ,@(loop for var in dummy
                             collect `(sb-vm::touch-object ,var)))))))
-  (with-test (:name :clear-sqrtsd :skipped-on '(not (or :x86 :x86-64)))
+  (with-test (:name :clear-sqrtsd :skipped-on (not (or :x86 :x86-64)))
     (flet ((test-sqrtsd (float)
              (declare (optimize speed (safety 1))
                       (type (double-float (0d0)) float))
@@ -337,7 +335,7 @@
       (declare (notinline test-sqrtsd))
       (assert (zerop (imagpart (test-sqrtsd 4d0))))))
 
-  (with-test (:name :clear-sqrtsd-single :skipped-on '(not (or :x86 :x86-64)))
+  (with-test (:name :clear-sqrtsd-single :skipped-on (not (or :x86 :x86-64)))
     (flet ((test-sqrtsd-float (float)
              (declare (optimize speed (safety 1))
                       (type (single-float (0f0)) float))
@@ -347,7 +345,7 @@
       (declare (notinline test-sqrtsd-float))
       (assert (zerop (imagpart (test-sqrtsd-float 4f0))))))
 
-  (with-test (:name :clear-cvtss2sd :skipped-on '(not (or :x86 :x86-64)))
+  (with-test (:name :clear-cvtss2sd :skipped-on (not (or :x86 :x86-64)))
     (flet ((test-cvtss2sd (float)
              (declare (optimize speed (safety 1))
                       (type single-float float))
@@ -357,7 +355,7 @@
       (declare (notinline test-cvtss2sd))
       (assert (zerop (imagpart (test-cvtss2sd 1f0))))))
 
-  (with-test (:name :clear-cvtsd2ss :skipped-on '(not (or :x86 :x86-64)))
+  (with-test (:name :clear-cvtsd2ss :skipped-on (not (or :x86 :x86-64)))
     (flet ((test-cvtsd2ss (float)
              (declare (optimize speed (safety 1))
                       (type double-float float))
@@ -367,7 +365,7 @@
       (declare (notinline test-cvtsd2ss))
       (assert (zerop (imagpart (test-cvtsd2ss 4d0))))))
 
-  (with-test (:name :clear-cvtsi2sd :skipped-on '(not (or :x86 :x86-64)))
+  (with-test (:name :clear-cvtsi2sd :skipped-on (not (or :x86 :x86-64)))
     (flet ((test-cvtsi2sd (int)
              (declare (optimize speed (safety 0))
                       (type (unsigned-byte 10) int))
@@ -376,7 +374,7 @@
       (declare (notinline test-cvtsi2sd))
       (assert (zerop (imagpart (test-cvtsi2sd 4))))))
 
-  (with-test (:name :clear-cvtsi2ss :skipped-on '(not (or :x86 :x86-64)))
+  (with-test (:name :clear-cvtsi2ss :skipped-on (not (or :x86 :x86-64)))
     (flet ((test-cvtsi2ss (int)
              (declare (optimize speed (safety 0))
                       (type (unsigned-byte 10) int))
@@ -430,3 +428,99 @@
                     '(lambda ()
                       (declare (optimize (debug 2)))
                       (typep #c(1.0 1.0) '(member #c(1.0 1.0))))))))
+
+(with-test (:name (truncate float :no-consing)
+                  :skipped-on :interpreter)
+  (let ((f (checked-compile
+            '(lambda (x)
+              (values (truncate (the double-float x)))))))
+    (ctu:assert-no-consing (funcall f 1d0))
+    (ctu:assert-no-consing (funcall f (float most-negative-fixnum 1d0))))
+  (let ((f (checked-compile
+            '(lambda (x)
+              (values (truncate (the single-float x)))))))
+    (ctu:assert-no-consing (funcall f 1f0))
+    (ctu:assert-no-consing (funcall f (float most-negative-fixnum 1f0)))))
+
+(with-test (:name :trig-derive-type-complex-rational)
+  (macrolet ((test (fun type)
+               `(checked-compile-and-assert
+                 ()
+                 '(lambda (a)
+                   (declare ((complex ,type) a))
+                   (,fun a))
+                 ((#C(1 2)) (eval '(,fun #C(1 2)))))))
+    (test sin integer)
+    (test cos integer)
+    (test tan integer)
+    (test sin rational)
+    (test cos rational)
+    (test tan rational)))
+
+(defun exercise-float-decoder (type exponent-bits mantissa-bits &optional print)
+  (let* ((exp-max (1- (ash 1 (1- exponent-bits))))
+         (exp-min (- (1- exp-max)))
+         (exp-bias exp-max)
+         ;; mantissa-bits excludes the hidden bit
+         (total-bits (+ mantissa-bits exponent-bits 1)))
+    (labels ((try (sign-bit exponent mantissa)
+               (let* ((bit-pattern
+                       (logior (ash sign-bit (+ exponent-bits mantissa-bits))
+                               (ash (+ exp-bias exponent) mantissa-bits)
+                               mantissa))
+                      (signed-bits
+                       (sb-disassem:sign-extend bit-pattern total-bits))
+                      (x (ecase type
+                          (single-float
+                           (sb-kernel:make-single-float signed-bits))
+                          (double-float
+                           (sb-kernel:make-double-float (ash signed-bits -32)
+                                                        (ldb (byte 32 0) signed-bits))))))
+                 (when print
+                   (format t "~v,'0b -> ~f~%" total-bits bit-pattern x))
+                 (multiple-value-bind (significand exponent sign) (decode-float x)
+                   (let ((reconstructed (* significand (expt 2 exponent) sign)))
+                     (unless (= reconstructed x)
+                       (error "DF -> ~s ~s ~s -> ~f~%" significand exponent sign
+                              reconstructed))))
+                 (multiple-value-bind (significand exponent sign) (integer-decode-float x)
+                   (let ((reconstructed (* significand (expt 2 exponent) sign)))
+                     (unless (= reconstructed x)
+                       (error "IDF -> ~s ~s ~s -> ~f~%" significand exponent sign
+                              reconstructed)))))))
+      ;; walking 1 bit
+      (loop for exp from exp-min to (1- exp-max)
+            do (let ((bit (ash 1 mantissa-bits)))
+                 (loop while (/= bit 0)
+                       do (try 0 exp (ldb (byte mantissa-bits 0) bit))
+                          (setq bit (ash bit -1))))))))
+
+(with-test (:name :test-float-decoders)
+  (flet ((test-df (input expect-sig expect-exp expect-sign)
+           (multiple-value-bind (significand exponent sign)
+               (decode-float input)
+             (assert (and (= significand expect-sig)
+                          (= exponent expect-exp)
+                          (= sign expect-sign)))))
+         (test-idf (input expect-sig expect-exp expect-sign)
+           (multiple-value-bind (significand exponent sign)
+               (integer-decode-float input)
+             (assert (and (= significand expect-sig)
+                          (= exponent expect-exp)
+                          (= sign expect-sign))))))
+    (test-df +0s0 0.0s0 0 1.0)
+    (test-df -0s0 0.0s0 0 -1.0)
+    (test-df +0d0 0.0d0 0 1.0d0)
+    (test-df -0d0 0.0d0 0 -1.0d0)
+    (test-idf +0s0 0 0 1)
+    (test-idf -0s0 0 0 -1)
+    (test-idf +0d0 0 0 1)
+    (test-idf -0d0 0 0 -1)
+    (test-idf least-positive-normalized-single-float 8388608 -149 1)
+    (test-idf least-negative-normalized-single-float 8388608 -149 -1)
+    (test-idf least-positive-normalized-double-float 4503599627370496 -1074 1)
+    (test-idf least-negative-normalized-double-float 4503599627370496 -1074 -1))
+  (exercise-float-decoder 'single-float  8 23)
+  (exercise-float-decoder 'double-float 11 52)
+  ;; TODO: test denormals
+  )

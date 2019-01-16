@@ -7,7 +7,14 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
+
+(defconstant sb-assem:assem-scheduler-p nil)
+(defconstant sb-assem:+inst-alignment-bytes+ 4)
+
+(defconstant +backend-fasl-file-implementation+ :alpha)
+
+(defconstant +backend-page-bytes+ 8192)
 
 (eval-when  (:compile-toplevel :load-toplevel :execute)
 
@@ -109,20 +116,11 @@
   (defconstant read-only-space-start #x20000000)
   (defconstant read-only-space-end   #x24000000))
 
-#!+osf1
-(progn
-  (defconstant read-only-space-start #x10000000)
-  (defconstant read-only-space-end   #x25000000))
-
-
 (defconstant static-space-start    #x28000000)
 (defconstant static-space-end      #x2c000000)
 
-(defconstant dynamic-0-space-start   #x30000000)
-(defconstant dynamic-0-space-end     #x3fff0000)
-
-(defconstant dynamic-1-space-start   #x40000000)
-(defconstant dynamic-1-space-end     #x4fff0000)
+(defparameter dynamic-0-space-start  #x30000000)
+(defparameter dynamic-0-space-end    #x3fff0000)
 
 ;;; FIXME nothing refers to either of these in alpha or x86 cmucl
 ;;; backend, so they could probably be removed.
@@ -142,7 +140,6 @@
 (defenum (:start 8)
   halt-trap
   pending-interrupt-trap
-  error-trap
   cerror-trap
   breakpoint-trap
   fun-end-breakpoint-trap
@@ -151,7 +148,8 @@
   ;; are still needed to avoid undefined variable warnings during sbcl
   ;; build.
   single-step-around-trap
-  single-step-before-trap)
+  single-step-before-trap
+  error-trap)
 
 ;;;; static symbols
 

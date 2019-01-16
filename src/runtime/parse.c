@@ -204,33 +204,27 @@ char *parse_addr(char **ptr, boolean safely)
 
 static lispobj lookup_symbol(char *name)
 {
-    lispobj *headerptr;
-
-    /* Search static space. */
-    if ((headerptr = search_for_symbol(name,
-                                       STATIC_SPACE_START,
-                                       (uword_t)static_space_free_pointer)))
-        return make_lispobj(headerptr, OTHER_POINTER_LOWTAG);
-
+    uword_t ranges[][2] = {
+      { STATIC_SPACE_START, (uword_t)static_space_free_pointer },
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
-    /* Search immobile space. */
-    if ((headerptr = search_for_symbol(name,
-                                       IMMOBILE_SPACE_START,
-                                       (uword_t)immobile_fixedobj_free_pointer)))
-        return make_lispobj(headerptr, OTHER_POINTER_LOWTAG);
+      { FIXEDOBJ_SPACE_START, (uword_t)fixedobj_free_pointer },
 #endif
-
-    /* Search dynamic space. */
 #if defined(LISP_FEATURE_GENCGC)
-    uword_t start = DYNAMIC_SPACE_START;
-    uword_t end   = (uword_t)get_alloc_pointer();
+      { DYNAMIC_SPACE_START, (uword_t)get_alloc_pointer() }
 #else
-    uword_t start = (uword_t)current_dynamic_space;
-    uword_t end   = (uword_t)dynamic_space_free_pointer;
+      { (uword_t)current_dynamic_space, (uword_t)dynamic_space_free_pointer }
 #endif
-    if ((headerptr = search_for_symbol(name, start, end)))
-        return make_lispobj(headerptr, OTHER_POINTER_LOWTAG);
+    };
 
+    lispobj *headerptr;
+    unsigned i;
+    for (i=0; i<(sizeof ranges/(2*sizeof (uword_t))); ++i)
+        if ((headerptr = search_for_symbol(name, ranges[i][0], ranges[i][1], 0)))
+            return make_lispobj(headerptr, OTHER_POINTER_LOWTAG);
+    // Try again, case-insensitively
+    for (i=0; i<(sizeof ranges/(2*sizeof (uword_t))); ++i)
+        if ((headerptr = search_for_symbol(name, ranges[i][0], ranges[i][1], 1)))
+            return make_lispobj(headerptr, OTHER_POINTER_LOWTAG);
     return 0;
 }
 
@@ -287,7 +281,7 @@ lispobj parse_lispobj(char **ptr)
                 throw_to_monitor();
             }
 
-            context = thread->interrupt_contexts[free_ici - 1];
+            context = nth_interrupt_context(free_ici - 1, thread);
 
             regnum = parse_regnum(token);
             if (regnum < 0) {

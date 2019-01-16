@@ -167,8 +167,6 @@
   (declare (ignore slot-names method-cell))
   (initialize-method-function initargs method))
 
-(define-load-time-global *the-class-generic-function*
-  (find-class 'generic-function))
 (define-load-time-global *the-class-standard-generic-function*
   (find-class 'standard-generic-function))
 
@@ -249,36 +247,37 @@
 
 (defun real-get-method (generic-function qualifiers specializers
                         &optional (errorp t)
-                        always-check-specializers)
-  (let ((specializer-count (length specializers))
-        (methods (generic-function-methods generic-function)))
-    (when (or methods always-check-specializers)
-      (let ((required-parameter-count
-             (length (arg-info-metatypes (gf-arg-info generic-function)))))
-        ;; Since we internally bypass FIND-METHOD by using GET-METHOD
-        ;; instead we need to do this here or users may get hit by a
-        ;; failed AVER instead of a sensible error message.
-        (unless (= specializer-count required-parameter-count)
-          (error
-           'find-method-length-mismatch
-           :format-control   "~@<The generic function ~S takes ~D ~
+                                  always-check-specializers)
+  (sb-thread::with-recursive-system-lock ((gf-lock generic-function))
+    (let ((specializer-count (length specializers))
+          (methods (generic-function-methods generic-function)))
+      (when (or methods always-check-specializers)
+        (let ((required-parameter-count
+                (length (arg-info-metatypes (gf-arg-info generic-function)))))
+          ;; Since we internally bypass FIND-METHOD by using GET-METHOD
+          ;; instead we need to do this here or users may get hit by a
+          ;; failed AVER instead of a sensible error message.
+          (unless (= specializer-count required-parameter-count)
+            (error
+             'find-method-length-mismatch
+             :format-control   "~@<The generic function ~S takes ~D ~
                               required argument~:P; was asked to ~
                               find a method with specializers ~:S~@:>"
-           :format-arguments (list generic-function required-parameter-count
-                                   (unparse-specializers generic-function specializers))))))
-    (flet ((congruentp (other-method)
-             (let ((other-specializers (method-specializers other-method)))
-               (aver (= specializer-count (length other-specializers)))
-               (and (equal qualifiers (safe-method-qualifiers other-method))
-                    (every #'same-specializer-p specializers other-specializers)))))
-      (declare (dynamic-extent #'congruentp))
-      (cond ((find-if #'congruentp methods))
-            ((null errorp) nil)
-            (t
-             (error "~@<There is no method on ~S with ~:[no ~
+             :format-arguments (list generic-function required-parameter-count
+                                     (unparse-specializers generic-function specializers))))))
+      (flet ((congruentp (other-method)
+               (let ((other-specializers (method-specializers other-method)))
+                 (aver (= specializer-count (length other-specializers)))
+                 (and (equal qualifiers (safe-method-qualifiers other-method))
+                      (every #'same-specializer-p specializers other-specializers)))))
+        (declare (dynamic-extent #'congruentp))
+        (cond ((find-if #'congruentp methods))
+              ((null errorp) nil)
+              (t
+               (error "~@<There is no method on ~S with ~:[no ~
                      qualifiers~;~:*qualifiers ~:S~] and specializers ~
                      ~:S.~@:>"
-                    generic-function qualifiers specializers))))))
+                      generic-function qualifiers specializers)))))))
 
 (defmethod find-method ((generic-function standard-generic-function)
                         qualifiers specializers &optional (errorp t))
@@ -404,30 +403,36 @@
                       :lambda-list lambda-list
                       :argument-precedence-order argument-precedence-order)
         (set-arg-info gf))
+    (let ((mc (generic-function-method-combination gf)))
+      (setf (gethash gf (method-combination-%generic-functions mc)) t))
     (when (arg-info-valid-p (slot-value gf 'arg-info))
       (update-dfun gf))))
 
 (defmethod reinitialize-instance :around
     ((gf standard-generic-function) &rest args &key
      (lambda-list nil lambda-list-p) (argument-precedence-order nil apo-p))
-  (let ((old-mc (generic-function-method-combination gf)))
+  (let* ((old-mc (generic-function-method-combination gf))
+         (mc (getf args :method-combination old-mc)))
+    (unless (eq mc old-mc)
+      (aver (gethash gf (method-combination-%generic-functions old-mc)))
+      (aver (not (gethash gf (method-combination-%generic-functions mc)))))
     (prog1 (call-next-method)
-      ;; KLUDGE: EQ is too strong a test.
-      (unless (eq old-mc (generic-function-method-combination gf))
+      (unless (eq mc old-mc)
+        (remhash gf (method-combination-%generic-functions old-mc))
+        (setf (gethash gf (method-combination-%generic-functions mc)) t)
         (flush-effective-method-cache gf))
-      (cond
-        ((and lambda-list-p apo-p)
-         (set-arg-info gf
-                       :lambda-list lambda-list
-                       :argument-precedence-order argument-precedence-order))
-        (lambda-list-p (set-arg-info gf :lambda-list lambda-list))
-        (t (set-arg-info gf)))
-      (when (arg-info-valid-p (gf-arg-info gf))
-        (update-dfun gf))
-      (map-dependents gf (lambda (dependent)
-                           (apply #'update-dependent gf dependent args))))))
-
-(declaim (special *lazy-dfun-compute-p*))
+      (sb-thread::with-recursive-system-lock ((gf-lock gf))
+        (cond
+          ((and lambda-list-p apo-p)
+           (set-arg-info gf
+                         :lambda-list lambda-list
+                         :argument-precedence-order argument-precedence-order))
+          (lambda-list-p (set-arg-info gf :lambda-list lambda-list))
+          (t (set-arg-info gf)))
+        (when (arg-info-valid-p (gf-arg-info gf))
+          (update-dfun gf))
+        (map-dependents gf (lambda (dependent)
+                             (apply #'update-dependent gf dependent args)))))))
 
 (defun set-methods (gf methods)
   (setf (generic-function-methods gf) nil)
@@ -731,10 +736,9 @@
        (specializer-class specializer)))
 
 (defun error-need-at-least-n-args (function n)
-  (error 'simple-program-error
-         :format-control "~@<The function ~2I~_~S ~I~_requires ~
-                          at least ~W argument~:P.~:>"
-         :format-arguments (list function n)))
+  (%program-error "~@<The function ~2I~_~S ~I~_requires at least ~W ~
+                   argument~:P.~:>"
+                  function n))
 
 (defun types-from-args (generic-function arguments &optional type-modifier)
   (multiple-value-bind (nreq applyp metatypes nkeys arg-info)
@@ -768,7 +772,7 @@
         (compute-applicable-methods-using-types gf types)
       (let ((generator (get-secondary-dispatch-function1
                         gf methods types nil t all-applicable-and-sorted-p)))
-        (make-callable gf methods generator
+        (make-callable generator
                        nil (mapcar #'class-wrapper classes))))))
 
 (defun value-for-caching (gf classes)

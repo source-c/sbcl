@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!BIGNUM")
+(in-package "SB-BIGNUM")
 
 ;;;; notes
 
@@ -105,9 +105,9 @@
 
 ;;;; What's a bignum?
 
-(defconstant digit-size sb!vm:n-word-bits)
+(defconstant digit-size sb-vm:n-word-bits)
 
-(defconstant all-ones-digit (1- (ash 1 sb!vm:n-word-bits)))
+(defconstant all-ones-digit (1- (ash 1 sb-vm:n-word-bits)))
 
 ;;;; internal inline routines
 
@@ -205,7 +205,6 @@
   (declare (fixnum x))
   (logand x (1- (ash 1 digit-size))))
 
-#!-32x16-divide
 ;;; This takes three digits and returns the FLOOR'ed result of
 ;;; dividing the first two as a 2*digit-size integer by the third.
 ;;;
@@ -229,20 +228,20 @@
 ;;; unsigned.
 (defun %ashr (data count)
   (declare (type bignum-element-type data)
-           (type (mod #.sb!vm:n-word-bits) count))
+           (type (mod #.sb-vm:n-word-bits) count))
   (%ashr data count))
 
 ;;; This takes a digit-size quantity and shifts it to the left,
 ;;; returning a digit-size quantity.
 (defun %ashl (data count)
   (declare (type bignum-element-type data)
-           (type (mod #.sb!vm:n-word-bits) count))
+           (type (mod #.sb-vm:n-word-bits) count))
   (%ashl data count))
 
 ;;; Do an unsigned (logical) right shift of a digit by Count.
 (defun %digit-logical-shift-right (data count)
   (declare (type bignum-element-type data)
-           (type (mod #.sb!vm:n-word-bits) count))
+           (type (mod #.sb-vm:n-word-bits) count))
   (%digit-logical-shift-right data count))
 
 ;;; Change the length of bignum to be newlen. Newlen must be the same or
@@ -325,12 +324,10 @@
 
 ;;;; subtraction
 
-(eval-when (:compile-toplevel :execute)
-
 ;;; This subtracts b from a plugging result into res. Return-fun is the
 ;;; function to call that fixes up the result returning any useful values, such
 ;;; as the result. This macro may evaluate its arguments more than once.
-(sb!xc:defmacro subtract-bignum-loop (a len-a b len-b res len-res return-fun)
+(defmacro subtract-bignum-loop (a len-a b len-b res len-res return-fun)
   (with-unique-names (borrow a-digit a-sign b-digit b-sign i v k)
     `(let* ((,borrow 1)
             (,a-sign (%sign-digit ,a ,len-a))
@@ -346,8 +343,6 @@
              (setf (%bignum-ref ,res ,i) ,v)
              (setf ,borrow ,k))))
        (,return-fun ,res ,len-res))))
-
-) ;EVAL-WHEN
 
 (defun subtract-bignum (a b)
   (declare (type bignum a b))
@@ -442,7 +437,7 @@
       (declare (type bignum-element-type high low))
       (if (and (zerop high)
                (%digit-0-or-plusp low))
-          (let ((low (truly-the (unsigned-byte #.(1- sb!vm:n-word-bits))
+          (let ((low (truly-the (unsigned-byte #.(1- sb-vm:n-word-bits))
                                 (%fixnum-digit-with-correct-sign low))))
             (if (eq a-minusp b-minusp)
                 low
@@ -455,18 +450,15 @@
 
 ;;;; BIGNUM-REPLACE and WITH-BIGNUM-BUFFERS
 
-(eval-when (:compile-toplevel :execute)
-
-(sb!xc:defmacro bignum-replace (dest
-                                src
+(defmacro bignum-replace (dest src
                                 &key
                                 (start1 '0)
                                 end1
                                 (start2 '0)
                                 end2
                                 from-end)
-  (sb!int:once-only ((n-dest dest)
-                     (n-src src))
+  (once-only ((n-dest dest)
+              (n-src src))
     (with-unique-names (n-start1 n-end1 n-start2 n-end2 i1 i2)
       (let ((end1 (or end1 `(%bignum-length ,n-dest)))
             (end2 (or end2 `(%bignum-length ,n-src))))
@@ -492,10 +484,9 @@
                     (declare (type bignum-index ,i1 ,i2))
                     (%bignum-set ,n-dest ,i1 (%bignum-ref ,n-src ,i2))))))))))
 
-(sb!xc:defmacro with-bignum-buffers (specs &body body)
+(defmacro with-bignum-buffers (specs &body body)
   "WITH-BIGNUM-BUFFERS ({(var size [init])}*) Form*"
-  (sb!int:collect ((binds)
-                   (inits))
+  (collect ((binds) (inits))
     (dolist (spec specs)
       (let ((name (first spec))
             (size (second spec)))
@@ -506,20 +497,17 @@
     `(let* ,(binds)
        ,@(inits)
        ,@body)))
-
-) ;EVAL-WHEN
 
 ;;;; GCD
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
   ;; The asserts in the GCD implementation are way too expensive to
   ;; check in normal use, and are disabled here.
-  (sb!xc:defmacro gcd-assert (&rest args)
-    (declare (ignore args))
-    #+sb-bignum-assertions `(assert ,@args))
+(defmacro gcd-assert (&rest args)
+  (declare (ignore args))
+  #+sb-bignum-assertions `(assert ,@args))
   ;; We'll be doing a lot of modular arithmetic.
-  (sb!xc:defmacro modularly (form)
-    `(logand all-ones-digit ,form)))
+(defmacro modularly (form)
+  `(logand all-ones-digit ,form))
 
 ;;; I'm not sure why I need this FTYPE declaration.  Compiled by the
 ;;; target compiler, it can deduce the return type fine, but without
@@ -540,7 +528,7 @@
         (return (do ((j 0 (1+ j))
                      (or-digits or-digits (%ashr or-digits 1)))
                     ((oddp or-digits) (+ (* i digit-size) j))
-                  (declare (type (mod #.sb!vm:n-word-bits) j))))))))
+                  (declare (type (mod #.sb-vm:n-word-bits) j))))))))
 
 ;;; Multiply a bignum buffer with a fixnum or a digit, storing the
 ;;; result in another bignum buffer, and without using any
@@ -587,7 +575,7 @@
         (umask 0)
         (imask 1)
         (m 0))
-    (declare (type (unsigned-byte #.sb!vm:n-word-bits) ud vd umask imask m))
+    (declare (type (unsigned-byte #.sb-vm:n-word-bits) ud vd umask imask m))
     (dotimes (i digit-size)
       (setf umask (logior umask imask))
       (when (logtest ud umask)
@@ -616,8 +604,8 @@
   (let* ((d (+ 1 (- (bignum-buffer-integer-length u u-len)
                     (bignum-buffer-integer-length v v-len))))
          (n (1- (ash 1 d))))
-    (declare (type (unsigned-byte #.(integer-length #.sb!vm:n-word-bits)) d)
-             (type (unsigned-byte #.sb!vm:n-word-bits) n))
+    (declare (type (unsigned-byte #.(integer-length #.sb-vm:n-word-bits)) d)
+             (type (unsigned-byte #.sb-vm:n-word-bits) n))
     (gcd-assert (>= d 0))
     (when (logtest (%bignum-ref u 0) n)
       (let ((tmp1-len
@@ -631,7 +619,7 @@
         (bignum-abs-buffer u u-len)))
     u-len))
 
-(defconstant lower-ones-digit (1- (ash 1 (truncate sb!vm:n-word-bits 2))))
+(defconstant lower-ones-digit (1- (ash 1 (truncate sb-vm:n-word-bits 2))))
 
 ;;; Find D and N such that (LOGAND ALL-ONES-DIGIT (- (* D X) (* N Y))) is 0,
 ;;; (< 0 N LOWER-ONES-DIGIT) and (< 0 (ABS D) LOWER-ONES-DIGIT).
@@ -641,9 +629,9 @@
          (d1 1)
          (n2 (modularly (1+ (modularly (lognot n1)))))
          (d2 (modularly -1)))
-    (declare (type (unsigned-byte #.sb!vm:n-word-bits) n1 d1 n2 d2))
+    (declare (type (unsigned-byte #.sb-vm:n-word-bits) n1 d1 n2 d2))
     (loop while (> n2 (expt 2 (truncate digit-size 2))) do
-          (loop for i of-type (mod #.sb!vm:n-word-bits)
+          (loop for i of-type (mod #.sb-vm:n-word-bits)
                 downfrom (- (integer-length n1) (integer-length n2))
                 while (>= n1 n2) do
                 (when (>= n1 (modularly (ash n2 i)))
@@ -674,7 +662,7 @@
 
 ;; When the larger number is less than this many bignum digits long, revert
 ;; to old algorithm.
-(defparameter *accelerated-gcd-cutoff* 3)
+(define-load-time-global *accelerated-gcd-cutoff* 3)
 
 ;;; Alternate between k-ary reduction with the help of
 ;;; REDUCED-RATIO-MOD and digit modulus reduction via DMOD. Once the
@@ -738,7 +726,7 @@
                        (%bignum-length tmp1)
                        (%bignum-length tmp2)))
         (if (> (bignum-buffer-integer-length u u-len)
-               (+ #.(truncate sb!vm:n-word-bits 4)
+               (+ #.(truncate sb-vm:n-word-bits 4)
                   (bignum-buffer-integer-length v v-len)))
             (setf u-len (dmod u u-len
                               v v-len
@@ -872,7 +860,7 @@
     (do ((digit (%bignum-ref a index) (%ashr digit 1))
          (increment 0 (1+ increment)))
         ((zerop digit))
-      (declare (type (mod #.sb!vm:n-word-bits) increment))
+      (declare (type (mod #.sb-vm:n-word-bits) increment))
       (when (oddp digit)
         (return-from make-gcd-bignum-odd
                      (bignum-buffer-ashift-right a len-a
@@ -882,11 +870,9 @@
 
 ;;;; negation
 
-(eval-when (:compile-toplevel :execute)
-
 ;;; This negates bignum-len digits of bignum, storing the resulting digits into
 ;;; result (possibly EQ to bignum) and returning whatever end-carry there is.
-(sb!xc:defmacro bignum-negate-loop
+(defmacro bignum-negate-loop
     (bignum bignum-len &optional (result nil resultp))
   (with-unique-names (carry end value last)
     `(let* (,@(if (not resultp) `(,last))
@@ -912,8 +898,6 @@
            (setf ,carry temp))
          (incf i))
        ,(if resultp carry `(values ,carry ,last)))))
-
-) ; EVAL-WHEN
 
 ;;; Fully-normalize is an internal optional. It cause this to always return
 ;;; a bignum, without any extraneous digits, and it never returns a fixnum.
@@ -947,8 +931,6 @@
 
 ;;;; shifting
 
-(eval-when (:compile-toplevel :execute)
-
 ;;; This macro is used by BIGNUM-ASHIFT-RIGHT, BIGNUM-BUFFER-ASHIFT-RIGHT, and
 ;;; BIGNUM-LDB-BIGNUM-RES. They supply a termination form that references
 ;;; locals established by this form. Source is the source bignum. Start-digit
@@ -961,7 +943,7 @@
 ;;; Given start-pos, 1-31 inclusively, of shift, we form the j'th resulting
 ;;; digit from high bits of the i'th source digit and the start-pos number of
 ;;; bits from the i+1'th source digit.
-(sb!xc:defmacro shift-right-unaligned (source
+(defmacro shift-right-unaligned (source
                                        start-digit
                                        start-pos
                                        res-len-form
@@ -981,8 +963,6 @@
                                                   ,start-pos)
                       (%ashl (%bignum-ref ,source (1+ i))
                              high-bits-in-first-digit))))))
-
-) ; EVAL-WHEN
 
 ;;; First compute the number of whole digits to shift, shifting them by
 ;;; skipping them when we start to pick up bits, and the number of bits to
@@ -1068,7 +1048,7 @@
     (multiple-value-bind (digits n-bits) (truncate x digit-size)
       (let* ((bignum-len (or bignum-len (%bignum-length bignum)))
              (res-len (+ digits bignum-len 1)))
-        (when (> res-len sb!kernel::maximum-bignum-length)
+        (when (> res-len sb-kernel:maximum-bignum-length)
           (error "can't represent result of left shift"))
         (if (zerop n-bits)
           (bignum-ashift-left-digits bignum bignum-len digits)
@@ -1182,34 +1162,35 @@
 ;;; exponent and sign.
 (defun single-float-from-bits (bits exp plusp)
   (declare (fixnum exp))
-  (declare (optimize #-sb-xc-host (inhibit-warnings 3)))
+  ;; "float to pointer coercion -> return value"
+  (declare (muffle-conditions compiler-note))
   (let ((res (dpb exp
-                  sb!vm:single-float-exponent-byte
+                  sb-vm:single-float-exponent-byte
                   (logandc2 (logand #xffffffff
                                     (%bignum-ref bits 1))
-                            sb!vm:single-float-hidden-bit))))
+                            sb-vm:single-float-hidden-bit))))
     (make-single-float
      (if plusp
          res
-         (logior res (ash -1 sb!vm:float-sign-shift))))))
+         (logior res (ash -1 sb-vm:float-sign-shift))))))
 (defun double-float-from-bits (bits exp plusp)
   (declare (fixnum exp))
-  (declare (optimize #-sb-xc-host (inhibit-warnings 3)))
+  ;; "float to pointer coercion -> return value"
+  (declare (muffle-conditions compiler-note))
   (let ((hi (dpb exp
-                 sb!vm:double-float-exponent-byte
-                 (logandc2 (ecase sb!vm::n-word-bits
+                 sb-vm:double-float-exponent-byte
+                 (logandc2 (ecase sb-vm::n-word-bits
                              (32 (%bignum-ref bits 2))
                              (64 (ash (%bignum-ref bits 1) -32)))
-                           sb!vm:double-float-hidden-bit)))
+                           sb-vm:double-float-hidden-bit)))
         (lo (logand #xffffffff (%bignum-ref bits 1))))
     (make-double-float (if plusp
                            hi
-                           (logior hi (ash -1 sb!vm:float-sign-shift)))
+                           (logior hi (ash -1 sb-vm:float-sign-shift)))
                        lo)))
 #!+(and long-float x86)
 (defun long-float-from-bits (bits exp plusp)
   (declare (fixnum exp))
-  (declare (optimize #-sb-xc-host (inhibit-warnings 3)))
   (make-long-float
    (if plusp
        exp
@@ -1244,36 +1225,29 @@
                  (single-float
                   (single-float-from-bits
                    bits
-                   (check-exponent len sb!vm:single-float-bias
-                                   sb!vm:single-float-normal-exponent-max)
+                   (check-exponent len sb-vm:single-float-bias
+                                   sb-vm:single-float-normal-exponent-max)
                    plusp))
                  (double-float
                   (double-float-from-bits
                    bits
-                   (check-exponent len sb!vm:double-float-bias
-                                   sb!vm:double-float-normal-exponent-max)
+                   (check-exponent len sb-vm:double-float-bias
+                                   sb-vm:double-float-normal-exponent-max)
                    plusp))
                  #!+long-float
                  (long-float
                   (long-float-from-bits
                    bits
-                   (check-exponent len sb!vm:long-float-bias
-                                   sb!vm:long-float-normal-exponent-max)
+                   (check-exponent len sb-vm:long-float-bias
+                                   sb-vm:long-float-normal-exponent-max)
                    plusp))))
              (check-exponent (exp bias max)
                (declare (type bignum-length len))
                (let ((exp (+ exp bias)))
                  (when (> exp max)
-                   ;; Why a SIMPLE-TYPE-ERROR? Well, this is mainly
-                   ;; called by COERCE, which requires an error of
-                   ;; TYPE-ERROR if the conversion can't happen
-                   ;; (except in certain circumstances when we are
-                   ;; coercing to a FUNCTION) -- CSR, 2002-09-18
-                   (error 'simple-type-error
-                          :format-control "Too large to be represented as a ~S:~%  ~S"
-                          :format-arguments (list format x)
-                          :expected-type format
-                          :datum x))
+                   (error 'floating-point-overflow
+                          :operation 'float
+                          :operands (list x format)))
                  exp)))
 
     (cond
@@ -1485,7 +1459,7 @@
 ;; This could be used by way of a transform, though for now it's specifically
 ;; a helper for %LDB in the limited case that it recognizes as non-consing.
 (defun ldb-bignum=>fixnum (byte-size byte-pos bignum)
-  (declare (type (integer 0 #.sb!vm:n-positive-fixnum-bits) byte-size)
+  (declare (type (integer 0 #.sb-vm:n-positive-fixnum-bits) byte-size)
            (type bit-index byte-pos))
   (multiple-value-bind (word-index bit-index) (floor byte-pos digit-size)
     (let ((n-digits (%bignum-length bignum)))
@@ -1498,10 +1472,10 @@
              ;; At least one bit is obtained from each of two words,
              ;; and not more than two words.
              (let* ((low-part-size
-                     (truly-the (integer 1 #.(1- sb!vm:n-positive-fixnum-bits))
+                     (truly-the (integer 1 #.(1- sb-vm:n-positive-fixnum-bits))
                                 (- digit-size bit-index)))
                     (high-part-size
-                     (truly-the (integer 1 #.(1- sb!vm:n-positive-fixnum-bits))
+                     (truly-the (integer 1 #.(1- sb-vm:n-positive-fixnum-bits))
                                 (- byte-size low-part-size))))
                (logior (truly-the (and fixnum unsigned-byte) ; high part
                          (let ((word-index (1+ word-index)))
@@ -1907,13 +1881,6 @@
                     (if (typep rem 'fixnum)
                         rem
                         (%normalize-bignum rem (%bignum-length rem))))))))))
-
-
-;;;; There used to be a pile of code for implementing division for bignum digits
-;;;; for machines that don't have a 2*digit-size by digit-size divide instruction.
-;;;; This happens to be most machines, but all the SBCL ports seem to be content
-;;;; to implement SB-BIGNUM:%BIGFLOOR as a VOP rather than using the code here.
-;;;; So it's been deleted.  --njf, 2007-02-04
 
 ;;;; general utilities
 
@@ -1954,7 +1921,7 @@
       (%bignum-set-length result newlen))
     (if (= newlen 1)
         (let ((digit (%bignum-ref result 0)))
-          (if (= (%ashr digit sb!vm:n-positive-fixnum-bits)
+          (if (= (%ashr digit sb-vm:n-positive-fixnum-bits)
                  (%ashr digit (1- digit-size)))
               (%fixnum-digit-with-correct-sign digit)
               result))
@@ -1987,3 +1954,12 @@
                       (logxor xi
                               (ash xi -7))))))
     result))
+
+;;; NEGATE-BIGNUM-BUFFER-IN-PLACE has an inline expansion that is not expected
+;;; to be used post-build. It references the BIGNUM-NEGATE-LOOP macro,
+;;; which had been deliberately excluded from the target due to a surrounding
+;;; (EVAL-WHEN (:COMPILE-TOPLEVEL :EXECUTE) ...) form.
+(let ((s 'negate-bignum-buffer-in-place))
+  (clear-info :function :inlining-data s)
+  (clear-info :function :inlinep s)
+  (clear-info :source-location :declaration s))

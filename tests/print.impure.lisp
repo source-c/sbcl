@@ -11,9 +11,6 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(load "assertoid.lisp")
-(use-package "ASSERTOID")
-
 ;;; We should be able to output X readably (at least when *READ-EVAL*).
 (defun assert-readable-output (x)
   (assert (eql x
@@ -65,7 +62,7 @@
           (assert (string= "#*101" (format nil "~S" #*101))))))
 
 ;;; bug in sbcl-0.7.1.25, reported by DB sbcl-devel 2002-02-25
-(with-test (:name (:format :decimal-directive :type-mismatch))
+(with-test (:name (format :decimal-directive :type-mismatch))
   (assert (string= "0.5" (format nil "~2D" 0.5))))
 
 ;;; we want malformed format strings to cause errors rather than have
@@ -482,10 +479,10 @@
       (ignore-errors
         (delete-file file)))))
 
-(with-test (:name (:print-readable :character :utf-8) :skipped-on '(not :sb-unicode))
+(with-test (:name (:print-readable :character :utf-8) :skipped-on (not :sb-unicode))
   (test-readable-character (code-char #xfffe) :utf-8))
 
-(with-test (:name (:print-readable :character :iso-8859-1) :skipped-on '(not :sb-unicode))
+(with-test (:name (:print-readable :character :iso-8859-1) :skipped-on (not :sb-unicode))
   (test-readable-character (code-char #xfffe) :iso-8859-1))
 
 (with-test (:name (format :character-directive :colon))
@@ -544,32 +541,30 @@
 (defclass a-class-name () ())
 
 (with-test (:name :print-unreadable-no-conditional-newline)
-  (assert (not (find #\Newline
-                     (let ((*print-pretty* t)
-                           (*print-right-margin* 10))
-                       (format nil "~A" (make-instance 'a-class-name)))
-                     :test #'char=)))
-
-  (assert (not (find #\Newline
-                     (let ((*print-pretty* nil)
-                           (*print-right-margin* 10))
-                       (format nil "~A" (make-instance 'a-class-name)))
-                     :test #'char=))))
+  (flet ((test (pretty)
+           (assert (not (find #\Newline
+                              (let ((*print-pretty* pretty)
+                                    (*print-right-margin* 10))
+                                (format nil "~A" (make-instance 'a-class-name)))
+                              :test #'char=)))))
+    (test t)
+    (test nil)))
 
 ;;; The PRINT-OBJECT method for RANDOM-STATE used to have a bogus
 ;;; dimension argument for MAKE-ARRAY.
-(with-test (:name :print-random-state)
+(with-test (:name (print random-state))
   (assert (equalp *random-state*
                   (read-from-string
                    (write-to-string *random-state*)))))
 
-(with-test (:name :write-return-value)
+(with-test (:name (write :return-value))
   ;; COMPILE is called explicitly because there was a bug in the
   ;; compiler-macro for WRITE, which isn't expanded by the evaluator.
-  (assert (= 123 (funcall (checked-compile '(lambda (s) (write 123 :stream s)))
-                          (make-broadcast-stream)))))
+  (checked-compile-and-assert ()
+      '(lambda (s) (write 123 :stream s))
+    (((make-broadcast-stream)) 123)))
 
-(with-test (:name :write/write-to-string-compiler-macro-lp/598374+581564)
+(with-test (:name (write write-to-string compiler-macro :lp598374 :lp581564))
   (let ((test (checked-compile
                `(lambda (object &optional output-stream)
                   (write object :stream output-stream)))))
@@ -580,11 +575,11 @@
     (assert (equal "12"
                    (with-output-to-string (*standard-output*)
                      (assert (eql 12 (funcall test 12)))))))
-  (let ((test (checked-compile
-               `(lambda ()
-                  (let ((*print-length* 42))
-                    (write-to-string *print-length* :length nil))))))
-    (assert (equal "42" (funcall test)))))
+  (checked-compile-and-assert  ()
+      `(lambda ()
+         (let ((*print-length* 42))
+           (write-to-string *print-length* :length nil)))
+    (() "42")))
 
 (with-test (:name (format :compile-literal-dest-string))
   (multiple-value-bind (fun failure-p warnings)
@@ -594,7 +589,7 @@
     (assert failure-p)
     (assert (= (length warnings) 1))))
 
-(with-test (:name :bug-308961)
+(with-test (:name (format :bug-308961))
   (assert (string= (format nil "~4,1F" 0.001) " 0.0"))
   (assert (string= (format nil "~4,1@F" 0.001) "+0.0"))
   (assert (string= (format nil "~E" 0.01) "1.e-2"))
@@ -649,7 +644,7 @@
                        (list f (read-from-string (prin1-to-string f))))
                      oops)))))
 
-(with-test (:name :bug-811386)
+(with-test (:name (format :bug-811386))
   (assert (equal "   0.00" (format nil "~7,2,-2f" 0)))
   (assert (equal "   0.00" (format nil "~7,2,2f" 0)))
   (assert (equal "   0.01" (format nil "~7,2,-2f" 1)))
@@ -658,7 +653,7 @@
   (assert (equal "  10.00" (format nil "~7,2,2f" 0.1)))
   (assert (equal "   0.01" (format nil "~7,2,-2f" 0.5))))
 
-(with-test (:name :bug-867684)
+(with-test (:name (format :bug-867684))
   (assert (equal "ab" (format nil "a~0&b"))))
 
 (with-test (:name :print-unreadably-function)
@@ -732,7 +727,7 @@
     (timeout ()
       (error "Endless loop in FORMAT"))))
 
-(with-test (:name :format-type-check)
+(with-test (:name (format :type-check))
   (assert (equal "1/10" (format nil "~2r" 1/2)))
   (assert-error (format nil "~r" 1.32) sb-format:format-error)
   (assert-error (format nil "~c" 1.32) sb-format:format-error)
@@ -766,7 +761,7 @@
                            (with-output-to-string (stream)
                              (print-object instance stream)))))))
 
-(with-test (:name :format-readably)
+(with-test (:name (format :readably))
   (let ((*print-readably* t))
     (assert (format nil "~$" #'format))
     (assert (format nil "~d" #'format))
@@ -795,10 +790,9 @@
       (assert (equal (format nil "~$" '(123)) "(123)")))))
 
 (with-test (:name (format :concatenate))
-  (assert (equal
-           (funcall (checked-compile `(lambda (x) (format nil "~s" (the string x))))
-                    "\\")
-           (prin1-to-string "\\"))))
+  (checked-compile-and-assert ()
+      `(lambda (x) (format nil "~s" (the string x)))
+    (("\\") (prin1-to-string "\\"))))
 
 (with-test (:name (write :stream nil))
   (assert
@@ -816,12 +810,12 @@
 (with-test (:name (format :no-overeager-compile-time-processing))
   (checked-compile '(lambda (x) (format t "~/nopackage:nofun/" x))))
 
-(with-test (:name :print-case-capitalize)
+(with-test (:name (write :case :capitalize))
   (assert (string= (write-to-string 'fluffy-bunny-count :case :capitalize)
                    "Fluffy-Bunny-Count")))
 
 (defclass foo2 () ())
-(with-test (:name :print-random-standard-object) ; lp# 1654550
+(with-test (:name (print :random standard-object :lp1654550))
   (assert (search "#<FOO2 {" (write-to-string (make-instance 'foo2) :pretty nil)))
   (assert (search "#<FOO2 {" (write-to-string (make-instance 'foo2) :pretty t))))
 
@@ -844,3 +838,10 @@
         (y (make-array 1 :element-type 'base-char :initial-contents "y")))
     (assert (equal (read-from-string (write-to-string (list x y) :readably t :circle t))
                    '("x" "y")))))
+
+(with-test (:name :format-tilde-at-newline)
+  (let ((control "hi.~@
+  there"))
+    (declare (notinline format))
+    (assert (string= (format nil control) "hi.
+there"))))

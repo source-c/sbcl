@@ -90,7 +90,7 @@
                     (endp actual))
                    ((or (eq '? (car want)) (equal (car want) (car actual)))
                     (args-equal (cdr want) (cdr actual)))
-                   ((typep (car want) 'sb-impl::unprintable-object)
+                   ((typep (car want) 'sb-debug::unprintable-object)
                     (equalp (car want) (car actual)))
                    (t
                     nil)))
@@ -141,8 +141,9 @@
                                       (caar expected-frames)))
               (frames (or (find-frame test-function-name backtrace)
                           (fail "~@<~S (expected name ~S) not found in ~
-                                backtrace:~@:_~S~@:>"
-                                test-function test-function-name backtrace))))
+                                backtrace:~@:_~a~@:>"
+                                test-function test-function-name
+                                (princ-to-string backtrace)))))
          ;; Check that we have all the frames we wanted.
          (multiple-value-bind (successp condition)
              (check-backtrace frames expected-frames :details details)
@@ -151,7 +152,7 @@
          ;; (Depends on running in the main thread.) FIXME: On Windows
          ;; we get two extra foreign frames below regular frames.
          (unless (find-frame 'sb-impl::toplevel-init frames)
-           (fail "~@<Backtrace stunted:~@:_~S~@:>" backtrace)))
+           (fail "~@<Backtrace stunted:~@:_~a~@:>" (princ-to-string backtrace))))
        (return-from verify-backtrace t))
      test-function :details details)))
 
@@ -185,12 +186,12 @@
          (funcall fun)))
 
   (with-test (:name (:backtrace :undefined-function :bug-346)
-                    :skipped-on :interpreter
-                    ;; Failures on SPARC, and probably HPPA are due to
-                    ;; not having a full and valid stack frame for the
-                    ;; undefined function frame.  See PPC
-                    ;; undefined_tramp for details.
-                    :fails-on '(or :sparc))
+              :skipped-on :interpreter
+              ;; Failures on SPARC, and probably HPPA are due to
+              ;; not having a full and valid stack frame for the
+              ;; undefined function frame.  See PPC
+              ;; undefined_tramp for details.
+              :fails-on :sparc)
     (assert-backtrace
      (lambda () (test #'optimized))
      (list (append *undefined-function-frame* '(42))
@@ -207,7 +208,7 @@
            (list `(flet test :in ,*p*) #'not-optimized)))))
 
 (with-test (:name (:backtrace :interrupted-condition-wait)
-                  :skipped-on '(not :sb-thread))
+                  :skipped-on (not :sb-thread))
   (let ((m (sb-thread:make-mutex))
         (q (sb-thread:make-waitqueue)))
     (assert-backtrace
@@ -260,7 +261,7 @@
 (defun throw-test ()
   (throw 'no-such-tag t))
 (with-test (:name (:backtrace :throw :no-such-tag)
-                  :fails-on '(and :sparc :linux))
+                  :fails-on (and :sparc :linux))
   (assert-backtrace #'throw-test '((throw-test))))
 
 (funcall (checked-compile
@@ -535,7 +536,7 @@
                         ((lambda (a b &rest rest) :in ,*p*) 10 11 0)))))
 
 (defgeneric gf-dispatch-test/gf (x y)
-  (:method (x y)
+  (:method ((x integer) (y integer))
     (+ x y)))
 (defun gf-dispatch-test/f (z)
   (declare (muffle-conditions style-warning))
@@ -546,6 +547,16 @@
   ;; Wrong argument count
   (assert-backtrace (lambda () (gf-dispatch-test/f 42))
                     '(((sb-pcl::gf-dispatch gf-dispatch-test/gf) 42))))
+
+(defgeneric gf-default-only-test/gf (x y)
+  (:method (x y) (+ x y)))
+(defun gf-default-only-test/f (z)
+  (declare (muffle-conditions style-warning))
+  (gf-default-only-test/gf z))
+(with-test (:name (:backtrace :default-only))
+  (gf-default-only-test/gf 1 1)
+  (assert-backtrace (lambda () (gf-default-only-test/f 42))
+                    '(((sb-pcl::default-only gf-default-only-test/gf) 42))))
 
 (with-test (:name (:backtrace :local-tail-call))
   (assert-backtrace
@@ -560,7 +571,7 @@
 
 #+sb-fasteval
 (with-test (:name (:backtrace :interpreted-factorial)
-            :skipped-on '(not :interpreter))
+            :skipped-on (not :interpreter))
   (assert-backtrace
    (lambda () (fact 5))
    '((fact 0)
@@ -602,9 +613,9 @@
 (with-test (:name :long-string-abbreviation)
   (let ((backtrace (mega-string-replace-fail '(#\- 1))))
     (assert (search (concatenate 'string
-                                 "\"-"
-                                 (make-string 49 :initial-element #\z)
-                                 "...\"")
+                                 "-"
+                                 (make-string 199 :initial-element #\z)
+                                 "...")
                     backtrace))))
 
 (defclass cannot-print-this () ())

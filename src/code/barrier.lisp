@@ -9,31 +9,27 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!THREAD")
+(in-package "SB-THREAD")
 
 
 ;;;; Interpreter stubs for the various barrier functions
 
-#!-memory-barrier-vops
-(declaim (inline sb!vm:%compiler-barrier sb!vm:%memory-barrier
-                 sb!vm:%read-barrier sb!vm:%write-barrier
-                 sb!vm:%data-dependency-barrier))
-(defun sb!vm:%compiler-barrier ()
-  #!+memory-barrier-vops (sb!vm:%compiler-barrier)
-  (values))
-(defun sb!vm:%memory-barrier ()
-  #!+memory-barrier-vops (sb!vm:%memory-barrier)
-  (values))
-(defun sb!vm:%read-barrier ()
-  #!+memory-barrier-vops (sb!vm:%read-barrier)
-  (values))
-(defun sb!vm:%write-barrier ()
-  #!+memory-barrier-vops (sb!vm:%write-barrier)
-  (values))
-(defun sb!vm:%data-dependency-barrier ()
-  #!+memory-barrier-vops (sb!vm:%data-dependency-barrier)
-  (values))
-
+#!-(vop-named sb-vm:%memory-barrier)
+(progn
+;;; Assert correctness of build order. (Need not be exhaustive)
+(eval-when (:compile-toplevel) #!+x86-64 (error "Expected %memory-barrier vop"))
+(declaim (inline sb-vm:%compiler-barrier sb-vm:%memory-barrier
+                 sb-vm:%read-barrier sb-vm:%write-barrier
+                 sb-vm:%data-dependency-barrier)))
+(macrolet ((def (name)
+             `(defun ,name ()
+                #!+(vop-named sb-vm:%memory-barrier) (,name)
+                (values))))
+  (def sb-vm:%compiler-barrier)
+  (def sb-vm:%memory-barrier)
+  (def sb-vm:%read-barrier)
+  (def sb-vm:%write-barrier)
+  (def sb-vm:%data-dependency-barrier))
 
 ;;;; The actual barrier macro and support
 (defmacro barrier ((kind) &body forms)
@@ -67,10 +63,10 @@ The file \"memory-barriers.txt\" in the Linux kernel documentation is
 highly recommended reading for anyone programming at this level."
   `(multiple-value-prog1
     (progn ,@forms)
-    (,(or (getf '(:compiler        sb!vm:%compiler-barrier
-                  :memory          sb!vm:%memory-barrier
-                  :read            sb!vm:%read-barrier
-                  :write           sb!vm:%write-barrier
-                  :data-dependency sb!vm:%data-dependency-barrier)
+    (,(or (getf '(:compiler        sb-vm:%compiler-barrier
+                  :memory          sb-vm:%memory-barrier
+                  :read            sb-vm:%read-barrier
+                  :write           sb-vm:%write-barrier
+                  :data-dependency sb-vm:%data-dependency-barrier)
                 kind)
           (error "Unknown barrier kind ~S" kind)))))

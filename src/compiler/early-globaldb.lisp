@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;; Similar to FUNCTION, but the result type is "exactly" specified:
 ;;; if it is an object type, then the function returns exactly one
@@ -21,7 +21,7 @@
                       ((or (atom result)
                            (not (eq (car result) 'values)))
                        `(values ,result &optional))
-                      ((intersection (cdr result) sb!xc:lambda-list-keywords)
+                      ((intersection (cdr result) sb-xc:lambda-list-keywords)
                        result)
                       (t `(values ,@(cdr result) &optional)))))
     `(function ,args ,result)))
@@ -33,7 +33,9 @@
 ;;; (:FUNCTION :TYPE) information is extracted through a wrapper.
 ;;; The globaldb representation is not necessarily literally a CTYPE.
 #-sb-xc-host
-(declaim (ftype (sfunction (t) (values ctype boolean)) proclaimed-ftype))
+(declaim (ftype (sfunction (t &optional boolean)
+                           (values (or ctype defstruct-description) boolean))
+                proclaimed-ftype))
 
 ;;; At run time, we represent the type of a piece of INFO in the globaldb
 ;;; by a small integer between 1 and 63.  [0 is reserved for internal use.]
@@ -46,7 +48,7 @@
 ;;; A map from info-number to its META-INFO object.
 ;;; The reverse mapping is obtained by reading the META-INFO.
 (declaim (type (simple-vector #.(ash 1 info-number-bits)) *info-types*))
-(!defglobal *info-types*
+(!define-load-time-global *info-types*
             ;; Must be dumped as a literal for cold-load.
             #.(make-array (ash 1 info-number-bits) :initial-element nil))
 
@@ -83,24 +85,34 @@
 ;; Refer to info-vector.lisp for the meaning of this constant.
 (defconstant +no-auxilliary-key+ 0)
 
-;; Return the globaldb info for SYMBOL. With respect to the state diagram
-;; presented at the definition of SYMBOL-PLIST, if the object in SYMBOL's
-;; info slot is LISTP, it is in state 1 or 3. Either way, take the CDR.
-;; Otherwise, it is in state 2 so return the value as-is.
-;; In terms of this function being named "-vector", implying always a vector,
-;; it is understood that NIL is a proxy for +NIL-PACKED-INFOS+, a vector.
-;;
+;;; Return the globaldb info for SYMBOL. With respect to the state diagram
+;;; presented at the definition of SYMBOL-PLIST, if the object in SYMBOL's
+;;; info slot is LISTP, it is in state 1 or 3. Either way, take the CDR.
+;;; Otherwise, it is in state 2 so return the value as-is.
+;;; In terms of this function being named "-vector", implying always a vector,
+;;; it is understood that NIL is a proxy for +NIL-PACKED-INFOS+, a vector.
+;;;
+;;; Declaim SYMBOL-INFO-VECTOR inline unless a vop translates it.
+;;; (Inlining occurs first, which would cause the vop not to be used.)
+;;; Also note that we have to guard the appearance of VOP-TRANSLATES here
+;;; so that it does not get tested when building the cross-compiler.
+;;; This was the best way I could see to work around a spurious warning
+;;; about a wrongly ordered VM definition in make-host-1.
+;;; The #!+/- reader can't see that a VOP-TRANSLATES term is not for the
+;;; host compiler unless the whole thing is one expression.
+#!-(or (host-feature sb-xc-host)
+       (vop-translates sb-kernel:symbol-info-vector))
+(declaim (inline symbol-info-vector))
 #-sb-xc-host
-(progn
- #!-symbol-info-vops (declaim (inline symbol-info-vector))
- (defun symbol-info-vector (symbol)
+(defun symbol-info-vector (symbol)
   (let ((info-holder (symbol-info symbol)))
     (truly-the (or null simple-vector)
-               (if (listp info-holder) (cdr info-holder) info-holder)))))
+               (if (listp info-holder) (cdr info-holder) info-holder))))
 
 ;;; SYMBOL-INFO is a primitive object accessor defined in 'objdef.lisp'
 ;;; But in the host Lisp, there is no such thing as a symbol-info slot.
 ;;; Instead, symbol-info is kept in the host symbol's plist.
+;;; This must be a SETFable place.
 #+sb-xc-host
 (defmacro symbol-info-vector (symbol) `(get ,symbol :sb-xc-globaldb-info))
 
@@ -186,7 +198,7 @@
                 (get-info-value ,name ,(meta-info-number meta-info))))
 
   (def (setf info) (new-value category kind name)
-    (let* (#+sb-xc-host (sb!xc:*gensym-counter* sb!xc:*gensym-counter*)
+    (let* (#+sb-xc-host (sb-xc:*gensym-counter* sb-xc:*gensym-counter*)
            (tin (meta-info-number meta-info)) ; info-type id number
            (type-spec (meta-info-type-spec meta-info))
            (new (make-symbol "NEW"))
@@ -252,8 +264,8 @@
 ;;;; functions and VOPs. To save space and allow for quick set
 ;;;; operations, we represent the attributes as bits in a fixnum.
 
-(in-package "SB!C")
-(deftype attributes () 'fixnum)
+(in-package "SB-C")
+(def!type attributes () 'fixnum)
 
 ;;; Given a list of attribute names and an alist that translates them
 ;;; to masks, return the OR of the masks.
@@ -301,11 +313,11 @@
  !DEF-BOOLEAN-ATTRIBUTE."
          (multiple-value-bind (temps values stores setter getter)
              (#+sb-xc-host get-setf-expansion
-              #-sb-xc-host sb!xc:get-setf-expansion place env)
+              #-sb-xc-host sb-xc:get-setf-expansion place env)
            (when (cdr stores)
              (error "multiple store variables for ~S" place))
-           (let ((newval (sb!xc:gensym))
-                 (n-place (sb!xc:gensym))
+           (let ((newval (sb-xc:gensym))
+                 (n-place (sb-xc:gensym))
                  (mask (encode-attribute-mask attributes ,vector)))
              (values `(,@temps ,n-place)
                      `(,@values ,getter)

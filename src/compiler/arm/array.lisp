@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 
 ;;;; Allocator for the array header.
@@ -66,14 +66,14 @@
 ;;;; Additional accessors and setters for the array header.
 (define-full-reffer %array-dimension *
   array-dimensions-offset other-pointer-lowtag
-  (any-reg) positive-fixnum sb!kernel:%array-dimension)
+  (any-reg) positive-fixnum sb-kernel:%array-dimension)
 
 (define-full-setter %set-array-dimension *
   array-dimensions-offset other-pointer-lowtag
-  (any-reg) positive-fixnum sb!kernel:%set-array-dimension)
+  (any-reg) positive-fixnum sb-kernel:%set-array-dimension)
 
 (define-vop (array-rank-vop)
-  (:translate sb!kernel:%array-rank)
+  (:translate sb-kernel:%array-rank)
   (:policy :fast-safe)
   (:args (x :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) temp)
@@ -95,7 +95,7 @@
   (:save-p :compute-only)
   (:generator 5
     (let ((error (generate-error-code vop 'invalid-array-index-error array bound index)))
-      (%test-fixnum index error t)
+      (%test-fixnum index nil error t)
       (inst cmp index bound)
       (inst b :hs error))))
 

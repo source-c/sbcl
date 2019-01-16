@@ -9,11 +9,6 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(in-package :cl-user)
-
-(use-package :test-util)
-(use-package :assertoid)
-
 (defstruct foo)
 (defstruct bar x y)
 
@@ -267,7 +262,7 @@
 
 (defvar *cons-here*)
 
-(declaim (notinline args))
+(declaim (notinline take))
 (defun take (&rest args)
   (declare (ignore args)))
 
@@ -275,10 +270,23 @@
   "Execute BODY and try to reduce the chance of leaking a conservative root."
   #-sb-thread
   `(multiple-value-prog1
-       (progn ,@body)
-     (loop repeat 20000 do (setq *cons-here* (cons nil nil)))
-     ;; KLUDGE: Clean the argument passing regs.
-     (apply #'take (loop repeat 36 collect #'cons)))
+       (let ((*s* (make-array 25)))
+         (declare (special *s*)
+                  (dynamic-extent *s*))
+         ;; We can't "just" arrange to run the allocation on a separate
+         ;; thread stack, then deallocate the thread before doing
+         ;; whatever, so start by giving ourselves some headroom via a
+         ;; DX allocation around the actual allocation...
+         (multiple-value-prog1
+             (progn ,@body)
+           (loop repeat 20000 do (setq *cons-here* (cons nil nil)))
+           ;; KLUDGE: Clean the argument passing regs.
+           (apply #'take (loop repeat 36 collect #'cons))))
+     ;; ... and then arrange to have the no-longer-used parts of the
+     ;; control stack cleared.  Note that we still want the headroom
+     ;; above around the actual allocation because of the stack space
+     ;; required for alien call-out.
+     (sb-sys:scrub-control-stack))
   #+sb-thread
   (let ((values (gensym))
         (sem (gensym)))
@@ -291,7 +299,7 @@
        (sb-thread::wait-on-semaphore ,sem)
        (values-list ,values))))
 
-(with-test (:name (:hash-table :weakness :eql :numbers) :skipped-on '(and :c-stack-is-control-stack (not :sb-thread)))
+(with-test (:name (:hash-table :weakness :eql :numbers) :skipped-on (and :c-stack-is-control-stack (not :sb-thread)))
   (flet ((random-number ()
            (random 1000)))
     (loop for weakness in '(nil :key :value :key-and-value :key-or-value) do
@@ -330,7 +338,7 @@
   (format stream "Hash: ~S~%" (sb-impl::hash-table-hash-vector ht))
   (force-output stream))
 
-(with-test (:name (:hash-table :weakness :removal) :skipped-on '(and :c-stack-is-control-stack (not :sb-thread)))
+(with-test (:name (:hash-table :weakness :removal) :skipped-on (and :c-stack-is-control-stack (not :sb-thread)))
   (loop for test in '(eq eql equal equalp) do
         ; (format t "test: ~A~%" test)
         (loop for weakness in '(:key :value :key-and-value :key-or-value)
@@ -357,7 +365,7 @@
                           (return)))
                       (gc :full t))))))
 
-(with-test (:name (:hash-table :weakness :string-interning) :skipped-on '(and :c-stack-is-control-stack (not :sb-thread)))
+(with-test (:name (:hash-table :weakness :string-interning) :skipped-on (and :c-stack-is-control-stack (not :sb-thread)))
   (let ((ht (make-hash-table :test 'equal :weakness :key))
         (s "a"))
     (setf (gethash s ht) s)
@@ -365,7 +373,7 @@
     (assert (eq (gethash (copy-seq s) ht) s))))
 
 ;;; see if hash_vector is not written when there is none ...
-(with-test (:name (:hash-table :weakness :eq) :skipped-on '(and :c-stack-is-control-stack (not :sb-thread)))
+(with-test (:name (:hash-table :weakness :eq) :skipped-on (and :c-stack-is-control-stack (not :sb-thread)))
   (loop repeat 10 do
         (let ((index (random 2000)))
           (let ((first (+ most-positive-fixnum (mod (* index 31) 9)))
@@ -376,7 +384,7 @@
               hash-table)))))
 
 ;; used to crash in gc
-(with-test (:name (:hash-table :weakness :keep) :skipped-on '(and :c-stack-is-control-stack (not :sb-thread)))
+(with-test (:name (:hash-table :weakness :keep) :skipped-on (and :c-stack-is-control-stack (not :sb-thread)))
   (loop repeat 2 do
         (let ((h1 (make-hash-table :weakness :key :test #'equal))
               (keep ()))

@@ -15,7 +15,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; variables initialization and shutdown sequences
 
@@ -25,20 +25,20 @@
 
 (declaim (type list *save-hooks* *init-hooks* *exit-hooks*))
 
-(defvar *save-hooks* nil
+(define-load-time-global *save-hooks* nil
   "A list of function designators which are called in an unspecified
 order before creating a saved core image.
 
 Unused by SBCL itself: reserved for user and applications.")
 
-(defvar *init-hooks* nil
+(define-load-time-global *init-hooks* nil
   "A list of function designators which are called in an unspecified
 order when a saved core image starts up, after the system itself has
 been initialized.
 
 Unused by SBCL itself: reserved for user and applications.")
 
-(defvar *exit-hooks* nil
+(define-load-time-global *exit-hooks* nil
   "A list of function designators which are called in an unspecified
 order when SBCL process exits.
 
@@ -47,10 +47,20 @@ Unused by SBCL itself: reserved for user and applications.
 Using (SB-EXT:EXIT :ABORT T), or calling exit(3) directly circumvents
 these hooks.")
 
+(defun call-hooks (kind hooks &key (on-error :error))
+  (dolist (hook hooks)
+    (handler-case
+        (funcall hook)
+      (serious-condition (c)
+        (if (eq :warn on-error)
+            (warn "Problem running ~A hook ~S:~%  ~A" kind hook c)
+            (with-simple-restart (continue "Skip this ~A hook." kind)
+              (error "Problem running ~A hook ~S:~%  ~A" kind hook c)))))))
 
 ;;; Binary search for simple vectors
-(defun binary-search (value seq &key (key #'identity))
+(defun binary-search* (value seq key)
   (declare (simple-vector seq))
+  (declare (function key))
   (labels ((recurse (start end)
              (when (< start end)
                (let* ((i (+ start (truncate (- end start) 2)))
@@ -61,8 +71,13 @@ these hooks.")
                        ((> value key-value)
                         (recurse (1+ i) end))
                        (t
-                        elt))))))
+                        i))))))
     (recurse 0 (length seq))))
+
+(defun binary-search (value seq &key (key #'identity))
+  (let ((index (binary-search* value seq key)))
+    (if index
+        (svref seq index))))
 
 (defun double-vector-binary-search (value vector)
   (declare (simple-vector vector)
@@ -112,11 +127,11 @@ these hooks.")
     `(let* ((,size ,initial-size)
             (,string (make-array ,size :element-type ',element-type))
             (,pointer 0))
-       (declare (type (integer 0 ,sb!xc:array-dimension-limit) ,size)
-                (type (integer 0 ,(1- sb!xc:array-dimension-limit)) ,pointer)
+       (declare (type (integer 0 ,sb-xc:array-dimension-limit) ,size)
+                (type (integer 0 ,(1- sb-xc:array-dimension-limit)) ,pointer)
                 (type (simple-array ,element-type (*)) ,string))
        (flet ((push-char (char)
-                (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+                (declare (optimize (sb-c::insert-array-bounds-checks 0)))
                 (when (= ,pointer ,size)
                   (let ((old ,string))
                     (setf ,size (* 2 (+ ,size 2))
@@ -134,3 +149,21 @@ these hooks.")
                   (%shrink-vector string size)
                   string)))
          ,@body))))
+
+(defmacro with-locked-hash-table ((hash-table) &body body)
+  "Limits concurrent accesses to HASH-TABLE for the duration of BODY.
+If HASH-TABLE is synchronized, BODY will execute with exclusive
+ownership of the table. If HASH-TABLE is not synchronized, BODY will
+execute with other WITH-LOCKED-HASH-TABLE bodies excluded -- exclusion
+of hash-table accesses not surrounded by WITH-LOCKED-HASH-TABLE is
+unspecified."
+  ;; Needless to say, this also excludes some internal bits, but
+  ;; getting there is too much detail when "unspecified" says what
+  ;; is important -- unpredictable, but harmless.
+  `(sb-thread::with-recursive-lock ((hash-table-lock ,hash-table))
+     ,@body))
+
+(defmacro with-locked-system-table ((hash-table) &body body)
+  `(sb-thread::with-recursive-system-lock
+       ((hash-table-lock ,hash-table))
+     ,@body))

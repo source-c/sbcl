@@ -9,14 +9,14 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; LIST and LIST*
 (define-vop (list-or-list*)
   (:args (things :more t))
-  (:temporary (:scs (descriptor-reg) :type list) ptr)
+  (:temporary (:scs (descriptor-reg)) ptr)
   (:temporary (:scs (descriptor-reg)) temp)
-  (:temporary (:scs (descriptor-reg) :type list :to (:result 0) :target result)
+  (:temporary (:scs (descriptor-reg) :to (:result 0) :target result)
               res)
   (:info num)
   (:results (result :scs (descriptor-reg)))
@@ -127,29 +127,6 @@
         (inst comb :<> temp csp-tn loop :nullify t)
         (inst stwm zero-tn n-word-bytes temp)))))
 
-(define-vop (allocate-code-object)
-  (:args (boxed-arg :scs (any-reg))
-         (unboxed-arg :scs (any-reg)))
-  (:results (result :scs (descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg)) ndescr)
-  (:temporary (:scs (any-reg) :from (:argument 0)) boxed)
-  (:temporary (:scs (non-descriptor-reg)) unboxed)
-  (:generator 100
-    (inst addi (fixnumize (1+ code-constants-offset)) boxed-arg boxed)
-    (inst dep 0 31 n-lowtag-bits boxed)
-    (inst srl unboxed-arg word-shift unboxed)
-    (inst addi lowtag-mask unboxed unboxed)
-    (inst dep 0 31 n-lowtag-bits unboxed)
-    (inst sll boxed (- n-widetag-bits word-shift) ndescr)
-    (inst addi code-header-widetag ndescr ndescr)
-    (pseudo-atomic ()
-      (set-lowtag other-pointer-lowtag alloc-tn result)
-      (inst add alloc-tn boxed alloc-tn)
-      (inst add alloc-tn unboxed alloc-tn)
-      (storew ndescr result 0 other-pointer-lowtag)
-      (storew unboxed-arg result code-code-size-slot other-pointer-lowtag)
-      (storew null-tn result code-debug-info-slot other-pointer-lowtag))))
-
 (define-vop (make-fdefn)
   (:translate make-fdefn)
   (:policy :fast-safe)
@@ -224,8 +201,13 @@
   (:generator 6
     (inst addi (* (1+ words) n-word-bytes) extra bytes)
     (inst sll bytes (- n-widetag-bits 2) header)
-    (inst addi (+ (ash -2 n-widetag-bits) type) header header)
-    (inst dep 0 31 n-lowtag-bits bytes)
+    ;; The specified EXTRA value is the exact value placed in the header
+    ;; as the word count when allocating code.
+    (cond ((= type code-header-widetag)
+           (inst addi type header header))
+          (t
+           (inst addi (+ (ash -2 n-widetag-bits) type) header header)
+           (inst dep 0 31 n-lowtag-bits bytes)))
     (pseudo-atomic ()
       (set-lowtag lowtag alloc-tn result)
       (storew header result 0 lowtag)

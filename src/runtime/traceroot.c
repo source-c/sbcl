@@ -4,14 +4,19 @@
 #include "runtime.h"
 #include "lispregs.h"
 #include "gc-internal.h"
+#include "gc-private.h"
+#include "code.h"
 #include "genesis/closure.h"
 #include "genesis/cons.h"
 #include "genesis/constants.h"
 #include "genesis/gc-tables.h"
+#include "genesis/hash-table.h"
+#include "genesis/instance.h"
 #include "genesis/layout.h"
 #include "genesis/package.h"
 #include "genesis/vector.h"
 #include "pseudo-atomic.h" // for get_alloc_pointer()
+#include "search.h"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -59,17 +64,11 @@ struct scan_state {
     struct scratchpad scratchpad;
 };
 
-static int gen_of(lispobj obj) {
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-    if (immobile_space_p(obj))
-        return immobile_obj_gen_bits(native_pointer(obj));
-#endif
-    int page = find_page_index((void*)obj);
-    if (page >= 0) return page_table[page].gen;
-    return -1;
+static int traceroot_gen_of(lispobj obj) {
+    return gc_gen_of(obj, -1);
 }
 
-const char* classify_obj(lispobj ptr)
+static const char* classify_obj(lispobj ptr)
 {
     extern lispobj* instance_classoid_name(lispobj*);
 
@@ -77,16 +76,16 @@ const char* classify_obj(lispobj ptr)
     switch(lowtag_of(ptr)) {
     case INSTANCE_POINTER_LOWTAG:
         name = instance_classoid_name(native_pointer(ptr));
-        if (widetag_of(*name) == SIMPLE_BASE_STRING_WIDETAG)
+        if (widetag_of(name) == SIMPLE_BASE_STRING_WIDETAG)
           return (char*)(name + 2);
     case LIST_POINTER_LOWTAG:
         return "cons";
     case FUN_POINTER_LOWTAG:
     case OTHER_POINTER_LOWTAG:
-        return widetag_names[widetag_of(*native_pointer(ptr))>>2];
+        return widetag_names[widetag_of(native_pointer(ptr))>>2];
     }
     static char buf[8];
-    sprintf(buf, "#x%x", widetag_of(*native_pointer(ptr)));
+    sprintf(buf, "#x%x", widetag_of(native_pointer(ptr)));
     return buf;
 }
 
@@ -96,7 +95,7 @@ static void add_to_layer(lispobj* obj, int wordindex,
     // Resurrect the containing object's lowtag
     lispobj ptr = compute_lispobj(obj);
     int staticp = ptr <= STATIC_SPACE_END;
-    int gen = staticp ? -1 : gen_of(ptr);
+    int gen = staticp ? -1 : traceroot_gen_of(ptr);
     if (heap_trace_verbose>2)
       // Show the containing object, its type and generation, and pointee
         fprintf(stderr,
@@ -117,8 +116,7 @@ static void add_to_layer(lispobj* obj, int wordindex,
 /// otherwise return obj directly.
 static lispobj canonical_obj(lispobj obj)
 {
-    if (lowtag_of(obj) == FUN_POINTER_LOWTAG &&
-        widetag_of(*native_pointer(obj)) == SIMPLE_FUN_WIDETAG)
+    if (functionp(obj) && widetag_of((lispobj*)(obj-FUN_POINTER_LOWTAG)) == SIMPLE_FUN_WIDETAG)
         return make_lispobj(fun_code_header(obj-FUN_POINTER_LOWTAG),
                             OTHER_POINTER_LOWTAG);
     return obj;
@@ -139,7 +137,7 @@ static int find_ref(lispobj* source, lispobj target)
         check_ptr(1, source[1]);
         return -1;
     }
-    int widetag = widetag_of(header);
+    int widetag = widetag_of(source);
     scan_limit = sizetab[widetag](source);
     switch (widetag) {
     case INSTANCE_WIDETAG:
@@ -155,16 +153,19 @@ static int find_ref(lispobj* source, lispobj target)
         bitmap = layout ? LAYOUT(layout)->bitmap : make_fixnum(-1);
         for(i=1; i<scan_limit; ++i)
             if (layout_bitmap_logbitp(i-1, bitmap)) check_ptr(i, source[i]);
+        // FIXME: check CUSTOM_GC_SCAVENGE in the header
         return -1;
+#if FUN_SELF_FIXNUM_TAGGED
     case CLOSURE_WIDETAG:
         check_ptr(1, ((struct closure*)source)->fun - FUN_RAW_ADDR_OFFSET);
         break;
+#endif
     case CODE_HEADER_WIDETAG:
         for_each_simple_fun(i, function_ptr, (struct code*)source, 0, {
             int wordindex = &function_ptr->name - source;
             for (j=0; j<4; ++j) check_ptr(wordindex+j, source[wordindex+j]);
         })
-        scan_limit = code_header_words(header);
+        scan_limit = code_header_words((struct code*)source);
         break;
     case FDEFN_WIDETAG:
         check_ptr(3, fdefn_callee_lispobj((struct fdefn*)source));
@@ -179,49 +180,23 @@ static int find_ref(lispobj* source, lispobj target)
 enum ref_kind { HEAP, CONTROL_STACK, BINDING_STACK, TLS };
 char *ref_kind_name[4] = {"heap","C stack","bindings","TLS"};
 
-/// This unfortunately entails a heap scan,
-/// but it's quite fast if the symbol is found in immobile space.
-static lispobj* find_sym_by_tls_index(unsigned int tls_index)
-{
-    lispobj* where = 0;
-    lispobj* end = 0;
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-    where = (lispobj*)IMMOBILE_SPACE_START;
-    end = immobile_fixedobj_free_pointer;
-#endif
-    while (1) {
-        while (where < end) {
-            lispobj header = *where;
-            int widetag = widetag_of(header);
-            if (widetag == SYMBOL_WIDETAG &&
-                tls_index_of(((struct symbol*)where)) == tls_index)
-                return where;
-            where += OBJECT_SIZE(header, where);
-        }
-        if (where >= (lispobj*)DYNAMIC_SPACE_START)
-            break;
-        where = (lispobj*)DYNAMIC_SPACE_START;
-        end = (lispobj*)get_alloc_pointer();
-    }
-    return 0;
-}
-
 static inline int interestingp(lispobj ptr, struct hopscotch_table* targets)
 {
     return is_lisp_pointer(ptr) && hopscotch_containsp(targets, ptr);
 }
 
+#ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
 /* Try to find the call frame that contains 'addr', which is the address
  * in which a conservative root was seen.
  * Return the program counter associated with that frame. */
-static char* deduce_thread_pc(struct thread* th, void** addr)
+static char* NO_SANITIZE_MEMORY deduce_thread_pc(struct thread* th, void** addr)
 {
     uword_t* fp = __builtin_frame_address(0);
     char* return_pc = 0;
 
     if (th != arch_os_get_current_thread()) {
         int i = fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX,th));
-        os_context_t *c = th->interrupt_contexts[i-1];
+        os_context_t *c = nth_interrupt_context(i-1, th);
         fp = (uword_t*)*os_context_register_addr(c,reg_FP);
     }
     while (1) {
@@ -243,8 +218,8 @@ static void compare_pointer(void *addr) {
 
 /* Figure out which thread's control stack contains 'pointer'
  * and the PC within the active function in the referencing frame  */
-static struct thread* deduce_thread(void (*context_scanner)(),
-                                    uword_t pointer, char** pc)
+static struct thread* NO_SANITIZE_MEMORY
+deduce_thread(void (*context_scanner)(), uword_t pointer, char** pc)
 {
     struct thread *th;
 
@@ -259,7 +234,7 @@ static struct thread* deduce_thread(void (*context_scanner)(),
             void **esp1;
             free = fixnum_value(read_TLS(FREE_INTERRUPT_CONTEXT_INDEX,th));
             for(i=free-1;i>=0;i--) {
-                os_context_t *c=th->interrupt_contexts[i];
+                os_context_t *c = nth_interrupt_context(i, th);
                 esp1 = (void **) *os_context_register_addr(c,reg_SP);
                 if (esp1>=(void **)th->control_stack_start && esp1<(void **)th->control_stack_end) {
                     if(esp1<esp) esp=esp1;
@@ -271,7 +246,7 @@ static struct thread* deduce_thread(void (*context_scanner)(),
             }
         }
         if (!esp || esp == (void*) -1)
-            lose("deduce_thread: no SP known for thread %x (OS %x)", th, th->os_thread);
+            UNKNOWN_STACK_POINTER_ERROR("deduce_thread", th);
         void** where;
         for (where = ((void **)th->control_stack_end)-1; where >= esp;  where--)
             if ((uword_t)*where == pointer) {
@@ -281,16 +256,18 @@ static struct thread* deduce_thread(void (*context_scanner)(),
     }
     return 0;
 }
+#endif
 
+/* KNOWN BUG: stack reference to pinned large object or immobile object
+ * won't be found in pins hashtable */
 static lispobj examine_stacks(struct hopscotch_table* targets,
                               void (*context_scanner)(),
                               int n_pins, lispobj* pins,
                               enum ref_kind *root_kind,
                               struct thread** root_thread,
                               char** thread_pc,
-                              unsigned int *tls_index)
+                              lispobj *tls_index)
 {
-    boolean world_stopped = context_scanner != 0;
     struct thread *th;
 
     for_each_thread(th) {
@@ -317,7 +294,31 @@ static lispobj examine_stacks(struct hopscotch_table* targets,
                 *tls_index = where[1];
                 return *where;
             }
+#ifndef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
+        *root_kind = CONTROL_STACK;
+        // Examine the control stack
+        where = th->control_stack_start;
+        end = access_control_stack_pointer(th);
+        for ( ; where < end ; ++where)
+            if (interestingp(*where, targets)) {
+                *root_thread = th;
+                *thread_pc = 0;
+                return *where;
+            }
+        // Examine the explicit pin list
+        lispobj pin_list = read_TLS(PINNED_OBJECTS,th);
+        while (pin_list != NIL) {
+            uword_t pin = CONS(pin_list)->car;
+            if (interestingp(pin, targets)) {
+                *root_thread = th;
+                *thread_pc = 0;
+                return *where;
+            }
+            pin_list = CONS(pin_list)->cdr;
+        }
+#endif
     }
+#ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
     // Look in the control stacks
     *root_kind = CONTROL_STACK;
     uword_t pin;
@@ -325,6 +326,7 @@ static lispobj examine_stacks(struct hopscotch_table* targets,
     for (i=n_pins-1; i>=0; --i)
         // Bypass interestingp() to avoid one test - pins are known pointers.
         if (hopscotch_containsp(targets, pin = pins[i])) {
+            boolean world_stopped = context_scanner != 0;
             if (world_stopped) {
                 *root_thread = deduce_thread(context_scanner, pin, thread_pc);
             } else {
@@ -336,19 +338,20 @@ static lispobj examine_stacks(struct hopscotch_table* targets,
                 void **esp = __builtin_frame_address(0);
                 void **where;
                 for (where = ((void **)th->control_stack_end)-1; where >= esp;  --where)
-                  if (*where == (void*)pin) {
-                      *root_thread = th;
-                      *thread_pc = deduce_thread_pc(th, where);
-                      break;
-                  }
+                    if (*where == (void*)pin) {
+                        *root_thread = th;
+                        *thread_pc = deduce_thread_pc(th, where);
+                        break;
+                    }
             }
             return pin;
         }
+#endif
     *root_kind = HEAP;
     return 0;
 }
 
-void free_graph(struct layer* layer)
+static void free_graph(struct layer* layer)
 {
     while (layer) {
         free(layer->nodes);
@@ -358,7 +361,7 @@ void free_graph(struct layer* layer)
     }
 }
 
-struct node* find_node(struct layer* layer, lispobj ptr)
+static struct node* find_node(struct layer* layer, lispobj ptr)
 {
     int i;
     for(i=layer->count-1; i>=0; --i)
@@ -372,34 +375,48 @@ struct node* find_node(struct layer* layer, lispobj ptr)
 static inline uint32_t encode_pointer(lispobj pointer)
 {
     uword_t encoding;
-    if (pointer >= DYNAMIC_SPACE_START) {
+    if (find_page_index((void*)pointer) >= 0) {
         // A dynamic space pointer is stored as a count in doublewords
         // from the heap base address. A 32GB range is representable.
         encoding = (pointer - DYNAMIC_SPACE_START) / (2*N_WORD_BYTES);
         gc_assert(encoding <= 0x7FFFFFFF);
-        return (encoding<<1) | 1; // Low bit signifies compressed ptr.
-    } else {
-        // Non-dynamic-space pointers are stored as-is.
-        gc_assert(pointer <= 0xFFFFFFFF && !(pointer & 1));
-        return pointer; // Low bit 0 signifies literal pointer
+        // Low bit of 1 signifies dynamic space compressed ptr.
+        return (encoding<<1) | 1;
+    } else
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    if (find_varyobj_page_index((void*)pointer) >= 0) {
+        // A varyobj space pointer is stored as a count in doublewords
+        // from the base address.
+        encoding = (pointer - VARYOBJ_SPACE_START) / (2*N_WORD_BYTES);
+        gc_assert(encoding <= 0x3FFFFFFF);
+        // bit pattern #b10 signifies varyobj space compressed ptr.
+        return (encoding<<2) | 2;
+    } else
+#endif
+    {
+        // Everything else is stored as-is.
+        gc_assert(pointer <= 0xFFFFFFFF && !(pointer & 3));
+        return pointer; // bit pattern #b00 signifies uncompressed ptr
     }
 }
 
 static inline lispobj decode_pointer(uint32_t encoding)
 {
-    if (encoding & 1)  // Compressed ptr
+    if (encoding & 1)  // Compressed ptr to dynamic space
         return (encoding>>1)*(2*N_WORD_BYTES) + DYNAMIC_SPACE_START;
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    else if ((encoding & 3) == 2) // Compressed ptr to varyobj space
+        return (encoding>>2)*(2*N_WORD_BYTES) + VARYOBJ_SPACE_START;
+#endif
     else
         return encoding; // Literal pointer
 }
 
-struct simple_fun* simple_fun_from_pc(char* pc)
+static struct simple_fun* simple_fun_from_pc(char* pc)
 {
     struct code* code = (struct code*)component_ptr_from_pc((lispobj*)pc);
     if (!code) return 0;
-    struct simple_fun* prev_fun = (struct simple_fun*)
-        ((char*)code + (code_header_words(code->header)<<WORD_SHIFT)
-         + FIRST_SIMPLE_FUN_OFFSET(code));
+    struct simple_fun* prev_fun = 0;
     for_each_simple_fun(i, fun, code, 1, {
         if (pc < (char*)fun) break;
         prev_fun = fun;
@@ -412,16 +429,19 @@ static void maybe_show_object_name(lispobj obj, FILE* stream)
     extern void safely_show_lstring(lispobj* string, int quotes, FILE *s);
     lispobj package, package_name;
     if (lowtag_of(obj)==OTHER_POINTER_LOWTAG)
-        switch(widetag_of(*native_pointer(obj))) {
+        switch(widetag_of(native_pointer(obj))) {
         case SYMBOL_WIDETAG:
-            package = SYMBOL(obj)->package;
-            package_name = ((struct package*)native_pointer(package))->_name;
             putc(',', stream);
-            safely_show_lstring(native_pointer(package_name), 0, stream);
-            fputs("::", stream);
+            if ((package = SYMBOL(obj)->package) == NIL) {
+                fprintf(stream, "#:");
+            } else {
+                package_name = ((struct package*)native_pointer(package))->_name;
+                safely_show_lstring(native_pointer(package_name), 0, stream);
+                fputs("::", stream);
+            }
             safely_show_lstring(native_pointer(SYMBOL(obj)->name), 0, stream);
             break;
-      }
+        }
 }
 
 static boolean root_p(lispobj ptr, int criterion)
@@ -431,17 +451,18 @@ static boolean root_p(lispobj ptr, int criterion)
     // i.e. criterion 0 implies that that largest number of objects
     // are considered roots.
     return criterion < 2
-        && (gen_of(ptr) > (criterion ? HIGHEST_NORMAL_GENERATION
+        && (traceroot_gen_of(ptr) > (criterion ? HIGHEST_NORMAL_GENERATION
                            : gencgc_oldest_gen_to_gc));
 }
 
 /// Find any shortest path to 'object' starting at a tenured object or a thread stack.
-static void trace1(lispobj object,
-                   struct hopscotch_table* targets,
-                   struct hopscotch_table* visited,
-                   struct hopscotch_table* inverted_heap,
-                   struct scratchpad* scratchpad,
-                   int n_pins, lispobj* pins, void (*context_scanner)(),
+/// Return 1 if a path was found, 0 if not.
+static int trace1(lispobj object,
+                  struct hopscotch_table* targets,
+                  struct hopscotch_table* visited,
+                  struct hopscotch_table* inverted_heap,
+                  struct scratchpad* scratchpad,
+                  int n_pins, lispobj* pins, void (*context_scanner)(),
                    int criterion)
 {
     struct node* anchor = 0;
@@ -449,7 +470,7 @@ static void trace1(lispobj object,
     enum ref_kind root_kind;
     struct thread* root_thread;
     char* thread_pc = 0;
-    unsigned int tls_index;
+    lispobj tls_index = 0;
     lispobj target;
     int i;
 
@@ -512,11 +533,16 @@ static void trace1(lispobj object,
         }
         if (!top_layer->count) {
             fprintf(stderr, "Failure tracing from %p. Current targets:\n", (void*)object);
-            for_each_hopscotch_key(i, target, (*targets))
-                fprintf(stderr, "%p ", (void*)target);
+            for_each_hopscotch_key(i, target, (*targets)) {
+                fprintf(stderr, "%p", (void*)target);
+                fprintf(stderr, "(g%d,", traceroot_gen_of(target));
+                fputs(classify_obj(target), stderr);
+                maybe_show_object_name(target, stderr);
+                fprintf(stderr,") ");
+            }
             putc('\n', stderr);
             free_graph(top_layer);
-            return;
+            return 0;
         }
         if (heap_trace_verbose>1)
             printf("Found %d object(s)\n", top_layer->count);
@@ -561,17 +587,22 @@ static void trace1(lispobj object,
             fprintf(file, "thread=%p", root_thread);
         fprintf(file, ":%s:", ref_kind_name[root_kind]);
         if (root_kind==BINDING_STACK || root_kind==TLS) {
-            lispobj* symbol = find_sym_by_tls_index(tls_index);
+#ifdef LISP_FEATURE_SB_THREAD
+            lispobj* symbol = (lispobj*)
+              lisp_symbol_from_tls_index(tls_index);
+#else
+            lispobj* symbol = native_pointer(tls_index);
+#endif
             if (symbol)
                 show_lstring(symbol_name(symbol), 0, file);
             else
-                fprintf(file, "%x", tls_index);
+                fprintf(file, "%"OBJ_FMTX, tls_index);
         } else {
             struct simple_fun* fun = simple_fun_from_pc(thread_pc);
             if (fun) {
                 fprintf(file, "fun=%p", (void*)make_lispobj(fun, FUN_POINTER_LOWTAG));
                 if (is_lisp_pointer(fun->name) &&
-                    widetag_of(*native_pointer(fun->name)) == SYMBOL_WIDETAG) {
+                    widetag_of(native_pointer(fun->name)) == SYMBOL_WIDETAG) {
                     fprintf(file, "=");
                     show_lstring(VECTOR(SYMBOL(fun->name)->name), 0, file);
                 }
@@ -584,33 +615,33 @@ static void trace1(lispobj object,
                 native_pointer(anchor->object), anchor->wordindex);
     }
 
-    target = 0;
+    target = thread_ref;
     while (top_layer) {
         struct node next = *anchor;
         lispobj ptr = next.object;
         if (ptr <= STATIC_SPACE_END)
             fprintf(file, "(static,");
         else
-            fprintf(file, "(g%d,", gen_of(ptr));
+            fprintf(file, "(g%d,", traceroot_gen_of(ptr));
         fputs(classify_obj(ptr), file);
         maybe_show_object_name(ptr, file);
-        fprintf(file, ")%p[%d]->", (void*)ptr, next.wordindex);
+        fprintf(file, ")#x%"OBJ_FMTX"[%d]->", ptr, next.wordindex);
         target = native_pointer(ptr)[next.wordindex];
         // Special-case a few combinations of <type,wordindex>
         switch (next.wordindex) {
         case 0:
-            if (lowtag_of(ptr) == INSTANCE_POINTER_LOWTAG  ||
-                lowtag_of(ptr) == FUN_POINTER_LOWTAG)
+            if (instancep(ptr) || functionp(ptr))
                 target = instance_layout(native_pointer(ptr));
             break;
+#if FUN_SELF_FIXNUM_TAGGED
         case 1:
-            if (lowtag_of(ptr) == FUN_POINTER_LOWTAG &&
-                widetag_of(*native_pointer(ptr)) == CLOSURE_WIDETAG)
+            if (functionp(ptr) && widetag_of(native_pointer(ptr)) == CLOSURE_WIDETAG)
                 target -= FUN_RAW_ADDR_OFFSET;
             break;
+#endif
         case 3:
             if (lowtag_of(ptr) == OTHER_POINTER_LOWTAG &&
-                widetag_of(FDEFN(ptr)->header) == FDEFN_WIDETAG)
+                widetag_of(&FDEFN(ptr)->header) == FDEFN_WIDETAG)
                 target = fdefn_callee_lispobj((struct fdefn*)native_pointer(ptr));
             break;
         }
@@ -626,8 +657,9 @@ static void trace1(lispobj object,
             gc_assert(object == target);
         }
     }
-    fprintf(file, "%p.\n", (void*)target);
+    fprintf(file, "#x%"OBJ_FMTX".\n", target);
     fflush(file);
+    return 1;
 }
 
 static void record_ptr(lispobj* source, lispobj target,
@@ -648,16 +680,12 @@ static void record_ptr(lispobj* source, lispobj target,
                   (sword_t)((char*)new_cell - ss->scratchpad.base));
 }
 
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-#define relevant_ptr_p(x) find_page_index(x)>=0||find_immobile_page_index(x)>=0
-#else
-#define relevant_ptr_p(x) find_page_index(x)>=0
-#endif
+#define relevant_ptr_p(x) find_page_index(x)>=0||immobile_space_p((lispobj)x)
 
 #define check_ptr(ptr) { \
     ++n_scanned_words; \
     if (!is_lisp_pointer(ptr)) ++n_immediates; \
-    else if (relevant_ptr_p((void*)ptr)) { \
+    else if (relevant_ptr_p((void*)(ptr))) { \
       ++n_pointers; \
       if (record_ptrs) record_ptr(where,ptr,ss); \
     }}
@@ -665,7 +693,7 @@ static void record_ptr(lispobj* source, lispobj target,
 static uword_t build_refs(lispobj* where, lispobj* end,
                           struct scan_state* ss)
 {
-    lispobj layout, bitmap, fun;
+    lispobj layout, bitmap;
     sword_t nwords, scan_limit, i, j;
     uword_t n_objects = 0, n_scanned_words = 0,
             n_immediates = 0, n_pointers = 0;
@@ -680,7 +708,7 @@ static uword_t build_refs(lispobj* where, lispobj* end,
             check_ptr(where[1]);
             continue;
         }
-        int widetag = widetag_of(header);
+        int widetag = widetag_of(where);
         nwords = scan_limit = sizetab[widetag](where);
         switch (widetag) {
         case INSTANCE_WIDETAG:
@@ -692,25 +720,50 @@ static uword_t build_refs(lispobj* where, lispobj* end,
             check_ptr(layout);
             // Partially initialized instance can't have nonzero words yet
             bitmap = layout ? LAYOUT(layout)->bitmap : make_fixnum(-1);
+            // FIXME: check CUSTOM_GC_SCAVENGE in the header
             // If no raw slots, just scan without use of the bitmap.
             if (bitmap == make_fixnum(-1)) break;
             for(i=1; i<scan_limit; ++i)
                 if (layout_bitmap_logbitp(i-1, bitmap)) check_ptr(where[i]);
             continue;
+#if FUN_SELF_FIXNUM_TAGGED
         case CLOSURE_WIDETAG:
-            fun = ((struct closure*)where)->fun - FUN_RAW_ADDR_OFFSET;
-            check_ptr(fun);
+            check_ptr(((struct closure*)where)->fun - FUN_RAW_ADDR_OFFSET);
             break;
+#endif
         case CODE_HEADER_WIDETAG:
             for_each_simple_fun(i, function_ptr, (struct code*)where, 0, {
                 int wordindex = &function_ptr->name - where;
                 for (j=0; j<4; ++j) check_ptr(where[wordindex+j]);
             })
-            scan_limit = code_header_words(header);
+            scan_limit = code_header_words((struct code*)where);
             break;
         case FDEFN_WIDETAG:
             check_ptr(fdefn_callee_lispobj((struct fdefn*)where));
             scan_limit = 3;
+            break;
+        case SIMPLE_VECTOR_WIDETAG:
+            // For weak hash-table vectors, a <k,v> pair may participate in
+            // a path from the root only if it does not involve whichever
+            // object is definitely weak. This fails on weak key-OR-value
+            // tables since we can't decide whether to allow the entry.
+            if (is_vector_subtype(*where, VectorValidHashing)) {
+                lispobj lhash_table = where[2];
+                gc_assert(instancep(lhash_table));
+                struct hash_table* hash_table =
+                  (struct hash_table *)native_pointer(lhash_table);
+                int weakness = hashtable_weakness(hash_table);
+                if (hashtable_weakp(hash_table) &&
+                    (weakness == 1 || weakness == 2)) { // 1=key, 2=value
+                    // Skip the first 4 words which are:
+                    //  header, length, vector->table backpointer, rehash-p
+                    int start = (weakness == 1) ? 5 : 4;
+                    for(i=start; i<scan_limit; i+=2) check_ptr(where[i]);
+                    continue;
+                }
+            }
+            if (is_vector_subtype(*where, VectorWeak))
+                continue;
             break;
         default:
             if (!(other_immediate_lowtag_p(widetag) && lowtag_for_widetag[widetag>>2]))
@@ -739,9 +792,8 @@ static void scan_spaces(struct scan_state* ss)
 {
     build_refs((lispobj*)STATIC_SPACE_START, static_space_free_pointer, ss);
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
-    build_refs((lispobj*)IMMOBILE_SPACE_START, immobile_fixedobj_free_pointer, ss);
-    build_refs((lispobj*)IMMOBILE_VARYOBJ_SUBSPACE_START,
-               immobile_space_free_pointer, ss);
+    build_refs((lispobj*)FIXEDOBJ_SPACE_START, fixedobj_free_pointer, ss);
+    build_refs((lispobj*)VARYOBJ_SPACE_START, varyobj_free_pointer, ss);
 #endif
     walk_generation((uword_t(*)(lispobj*,lispobj*,uword_t))build_refs,
                     -1, (uword_t)ss);
@@ -770,7 +822,7 @@ static void compute_heap_inverse(struct hopscotch_table* inverted_heap,
     // two words of the scratchpad.
     uword_t scratchpad_min_size = (1 + ss.n_pointers) * 2 * sizeof (uint32_t);
     int pagesize = getpagesize();
-    uword_t scratchpad_size = CEILING(scratchpad_min_size, pagesize);
+    uword_t scratchpad_size = ALIGN_UP(scratchpad_min_size, pagesize);
     ss.scratchpad.base = os_allocate(scratchpad_size);
     gc_assert(ss.scratchpad.base);
     ss.scratchpad.free = ss.scratchpad.base + 2 * sizeof(uint32_t);
@@ -802,9 +854,9 @@ static void compute_heap_inverse(struct hopscotch_table* inverted_heap,
 /* Find any shortest path from a thread or tenured object
  * to each of the specified objects.
  */
-static void trace_paths(void (*context_scanner)(),
-                        lispobj weak_pointers, int n_pins, lispobj* pins,
-                        int criterion)
+static int trace_paths(void (*context_scanner)(),
+                       lispobj weak_pointers, int n_pins, lispobj* pins,
+                       int criterion)
 {
     int i;
     struct hopscotch_table inverted_heap;
@@ -813,6 +865,7 @@ static void trace_paths(void (*context_scanner)(),
     struct hopscotch_table visited;  // *Without* lowtag
     // A hashset of objects in the current graph layer
     struct hopscotch_table targets;  // With lowtag
+    int n_found = 0; // how many objects had paths to them
 
     if (heap_trace_verbose) {
         fprintf(stderr, "%d pins:\n", n_pins);
@@ -827,49 +880,58 @@ static void trace_paths(void (*context_scanner)(),
         lispobj car = CONS(weak_pointers)->car;
         lispobj value = ((struct weak_pointer*)native_pointer(car))->value;
         weak_pointers = CONS(weak_pointers)->cdr;
-        if (value != UNBOUND_MARKER_WIDETAG) {
+        if (is_lisp_pointer(value)) {
             if (heap_trace_verbose)
                 fprintf(stderr, "Target=%p (%s)\n", (void*)value, classify_obj(value));
             hopscotch_reset(&visited);
             hopscotch_reset(&targets);
-            trace1(value, &targets, &visited,
-                   &inverted_heap, &scratchpad,
-                   n_pins, pins, context_scanner, criterion);
+            n_found += trace1(canonical_obj(value),
+                              &targets, &visited,
+                              &inverted_heap, &scratchpad,
+                              n_pins, pins, context_scanner, criterion);
         }
     } while (weak_pointers != NIL);
     os_invalidate(scratchpad.base, scratchpad.end-scratchpad.base);
     hopscotch_destroy(&inverted_heap);
     hopscotch_destroy(&visited);
     hopscotch_destroy(&targets);
+    return n_found;
 }
 
-void gc_prove_liveness(void(*context_scanner)(),
-                       lispobj objects,
-                       int n_pins, uword_t* pins,
-                       int criterion)
+/// Return number of sought objects that had paths to them.
+/// Return -1 for invalid input.
+int gc_prove_liveness(void(*context_scanner)(),
+                      lispobj objects,
+                      int n_pins, uword_t* pins,
+                      int criterion)
 {
-    int n_watched = 0, n_live = 0, n_bad = 0;
+    int n_watched = 0, n_live = 0, n_bad = 0, n_imm = 0;
     lispobj list;
-    for ( list = objects ;
-          list != NIL && lowtag_of(list) == LIST_POINTER_LOWTAG ;
-          list = CONS(list)->cdr ) {
+    for (list = objects ; list != NIL && listp(list) ; list = CONS(list)->cdr) {
         ++n_watched;
         lispobj car = CONS(list)->car;
         if ((lowtag_of(car) != OTHER_POINTER_LOWTAG ||
-             widetag_of(*native_pointer(car)) != WEAK_POINTER_WIDETAG))
+             widetag_of(native_pointer(car)) != WEAK_POINTER_WIDETAG)) {
             ++n_bad;
-        else
-            n_live += ((struct weak_pointer*)native_pointer(car))->value
-                != UNBOUND_MARKER_WIDETAG;
+            continue;
+        }
+        lispobj wpval = ((struct weak_pointer*)native_pointer(car))->value;
+        if (is_lisp_pointer(wpval))
+            ++n_live;
+        else if (wpval != UNBOUND_MARKER_WIDETAG)
+            ++n_imm;
     }
-    if (lowtag_of(list) != LIST_POINTER_LOWTAG || n_bad) {
+    if (!listp(list) || n_bad) {
         fprintf(stderr, "; Bad value in liveness tracker\n");
-        return;
+        return -1;
     }
-    fprintf(stderr, "; Liveness tracking: %d/%d live watched objects\n",
+    fprintf(stderr, "; Liveness tracking: %d/%d live watched objects",
             n_live, n_watched);
+    if (n_imm)
+        fprintf(stderr, " (ignored %d non-pointers)", n_imm);
+    putc('\n', stderr);
     if (!n_live)
-        return;
+        return 0;
     // Put back lowtags on pinned objects, since wipe_nonpinned_words() removed
     // them. But first test whether lowtags were already repaired
     // in case prove_liveness() is called after gc_prove_liveness().
@@ -879,58 +941,17 @@ void gc_prove_liveness(void(*context_scanner)(),
             pins[i] = compute_lispobj((lispobj*)pins[i]);
         }
     }
-    trace_paths(context_scanner, objects, n_pins, (lispobj*)pins, criterion);
+    return trace_paths(context_scanner, objects, n_pins, (lispobj*)pins, criterion);
 }
 
 /* This should be called inside WITHOUT-GCING so that the set
  * of pins does not change out from underneath.
  */
-void prove_liveness(lispobj objects, int criterion)
+int prove_liveness(lispobj objects, int criterion)
 {
     extern struct hopscotch_table pinned_objects;
     extern int gc_n_stack_pins;
-    gc_prove_liveness(0, objects, gc_n_stack_pins, pinned_objects.keys, criterion);
-}
-
-#include "genesis/package.h"
-#include "genesis/instance.h"
-
-static boolean __attribute__((unused)) sym_stringeq(lispobj sym, const char *string, int len)
-{
-    struct vector* name = VECTOR(SYMBOL(sym)->name);
-    return widetag_of(name->header) == SIMPLE_BASE_STRING_WIDETAG
-        && name->length == make_fixnum(len)
-        && !strcmp((char*)name->data, string);
-}
-
-/* Return the value of SB-THREAD::*ALL-THREADS*
- * This does not need to be particularly efficient.
- */
-static const char __attribute__((unused)) all_threads_sym[] = "*ALL-THREADS*";
-static lispobj all_lisp_threads()
-{
-#ifdef ENTER_FOREIGN_CALLBACK
-    // Starting with a known static symbol in SB-THREAD::, get the SB-THREAD package
-    // and find *ALL-THREADS* (which isn't static). Fewer static symbols is better.
-    struct symbol*   sym = SYMBOL(ENTER_FOREIGN_CALLBACK);
-    struct package*  pkg = (struct package*)native_pointer(sym->package);
-    struct instance* internals = (struct instance*)native_pointer(pkg->internal_symbols);
-    struct vector*   cells = (struct vector*)
-        native_pointer(internals->slots[INSTANCE_DATA_START]);
-    int cells_length = fixnum_value(cells->length);
-    static int index = 0;
-    int initial_index = index;
-    do {
-        lispobj thing = cells->data[index];
-        if (lowtag_of(thing) == OTHER_POINTER_LOWTAG
-            && widetag_of(SYMBOL(thing)->header) == SYMBOL_WIDETAG
-            && sym_stringeq(thing, all_threads_sym, strlen(all_threads_sym)))
-          return SYMBOL(thing)->value;
-        index = (index + 1) % cells_length;
-    } while (index != initial_index);
-    lose("Can't find *ALL-THREADS*");
-#endif
-    return NIL;
+    return gc_prove_liveness(0, objects, gc_n_stack_pins, pinned_objects.keys, criterion);
 }
 
 // These are slot offsets in (DEFSTRUCT THREAD),
@@ -940,7 +961,9 @@ static lispobj all_lisp_threads()
 
 struct vector* lisp_thread_name(os_thread_t os_thread)
 {
-    lispobj list = all_lisp_threads();
+    static unsigned int hint;
+    lispobj* sym = find_symbol("*ALL-THREADS*", "SB-THREAD", &hint);
+    lispobj list = sym ? ((struct symbol*)sym)->value : NIL;
     while (list != NIL) {
         struct instance* lisp_thread = (struct instance*)native_pointer(CONS(list)->car);
         list = CONS(list)->cdr;

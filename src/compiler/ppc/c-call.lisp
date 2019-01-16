@@ -9,24 +9,19 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; Return the number of bytes needed for the current non-descriptor
 ;;; stack frame.  Non-descriptor stack frames must be multiples of 16
 ;;; bytes under the PPC SVr4 ABI (though the EABI may be less
 ;;; restrictive).  On linux, two words are reserved for the stack
-;;; backlink and saved LR (see SB!VM::NUMBER-STACK-DISPLACEMENT).
+;;; backlink and saved LR (see SB-VM::NUMBER-STACK-DISPLACEMENT).
 
 (defconstant +stack-alignment-bytes+
   ;; Duh.  PPC Linux (and VxWorks) adhere to the EABI.
   #!-darwin 7
   ;; But Darwin doesn't
   #!+darwin 15)
-
-(defun my-make-wired-tn (prim-type-name sc-name offset)
-  (make-wired-tn (primitive-type-or-lose prim-type-name)
-                 (sc-number-or-lose sc-name)
-                 offset))
 
 (defstruct arg-state
   (gpr-args 0)
@@ -42,20 +37,20 @@
   (let ((reg-args (arg-state-gpr-args state)))
     (cond ((< reg-args 8)
            (setf (arg-state-gpr-args state) (1+ reg-args))
-           (my-make-wired-tn prim-type reg-sc (+ reg-args nl0-offset)))
+           (make-wired-tn* prim-type reg-sc (+ reg-args nl0-offset)))
           (t
            (let ((frame-size (arg-state-stack-frame-size state)))
              (setf (arg-state-stack-frame-size state) (1+ frame-size))
-             (my-make-wired-tn prim-type stack-sc frame-size))))))
+             (make-wired-tn* prim-type stack-sc frame-size))))))
 
 (define-alien-type-method (integer :arg-tn) (type state)
   (if (alien-integer-type-signed type)
-      (int-arg state 'signed-byte-32 'signed-reg 'signed-stack)
-      (int-arg state 'unsigned-byte-32 'unsigned-reg 'unsigned-stack)))
+      (int-arg state 'signed-byte-32 signed-reg-sc-number signed-stack-sc-number)
+      (int-arg state 'unsigned-byte-32 unsigned-reg-sc-number unsigned-stack-sc-number)))
 
 (define-alien-type-method (system-area-pointer :arg-tn) (type state)
   (declare (ignore type))
-  (int-arg state 'system-area-pointer 'sap-reg 'sap-stack))
+  (int-arg state 'system-area-pointer sap-reg-sc-number sap-stack-sc-number))
 
 ;;; The Linux/PPC 32bit ABI says:
 ;;;
@@ -74,11 +69,11 @@
     (cond ((< fprs 8)
            (incf (arg-state-fpr-args state))
            ;; Assign outgoing FPRs starting at FP1
-           (my-make-wired-tn 'single-float 'single-reg (1+ fprs)))
+           (make-wired-tn* 'single-float single-reg-sc-number (1+ fprs)))
           (t
            (let* ((stack-offset (arg-state-stack-frame-size state)))
              (setf (arg-state-stack-frame-size state) (+ stack-offset 1))
-             (my-make-wired-tn 'single-float 'single-stack stack-offset))))))
+             (make-wired-tn* 'single-float single-stack-sc-number stack-offset))))))
 
 ;;; If a single-float arg has to go on the stack, it's promoted to
 ;;; double.  That way, C programs can get subtle rounding errors when
@@ -91,18 +86,18 @@
     (cond ((< gprs 8) ; and by implication also (< fprs 13)
            (incf (arg-state-fpr-args state))
            ;; Assign outgoing FPRs starting at FP1
-           (list (my-make-wired-tn 'single-float 'single-reg (1+ fprs))
-                 (int-arg state 'signed-byte-32 'signed-reg 'signed-stack)))
+           (list (make-wired-tn* 'single-float single-reg-sc-number (1+ fprs))
+                 (int-arg state 'signed-byte-32 signed-reg-sc-number signed-stack-sc-number)))
           ((< fprs 13)
            ;; See comments below for double-float.
            (incf (arg-state-fpr-args state))
            (incf (arg-state-stack-frame-size state))
-           (my-make-wired-tn 'single-float 'single-reg (1+ fprs)))
+           (make-wired-tn* 'single-float single-reg-sc-number (1+ fprs)))
           (t
            ;; Pass on stack only
            (let ((stack-offset (arg-state-stack-frame-size state)))
              (incf (arg-state-stack-frame-size state))
-             (my-make-wired-tn 'single-float 'single-stack stack-offset))))))
+             (make-wired-tn* 'single-float single-stack-sc-number stack-offset))))))
 
 #!-darwin
 (define-alien-type-method (double-float :arg-tn) (type state)
@@ -111,13 +106,13 @@
     (cond ((< fprs 8)
            (incf (arg-state-fpr-args state))
            ;; Assign outgoing FPRs starting at FP1
-           (my-make-wired-tn 'double-float 'double-reg (1+ fprs)))
+           (make-wired-tn* 'double-float double-reg-sc-number (1+ fprs)))
           (t
            (let* ((stack-offset (arg-state-stack-frame-size state)))
              (if (oddp stack-offset)
                (incf stack-offset))
              (setf (arg-state-stack-frame-size state) (+ stack-offset 2))
-             (my-make-wired-tn 'double-float 'double-stack stack-offset))))))
+             (make-wired-tn* 'double-float double-stack-sc-number stack-offset))))))
 
 #!+darwin
 (define-alien-type-method (double-float :arg-tn) (type state)
@@ -134,19 +129,19 @@
            ;; to %alien-funcall ir2-convert by making a list of the
            ;; TNs for the float reg and for the int regs.
            ;;
-           (list (my-make-wired-tn 'double-float 'double-reg (1+ fprs))
-                 (int-arg state 'signed-byte-32 'signed-reg 'signed-stack)
-                 (int-arg state 'unsigned-byte-32 'unsigned-reg 'unsigned-stack)))
+           (list (make-wired-tn* 'double-float double-reg-sc-number (1+ fprs))
+                 (int-arg state 'signed-byte-32 signed-reg-sc-number signed-stack-sc-number)
+                 (int-arg state 'unsigned-byte-32 unsigned-reg-sc-number unsigned-stack-sc-number)))
           ((< fprs 13)
            (incf (arg-state-fpr-args state))
-           (list (my-make-wired-tn 'double-float 'double-reg (1+ fprs))
-                 (int-arg state 'signed-byte-32 'signed-reg 'signed-stack)
-                 (int-arg state 'unsigned-byte-32 'unsigned-reg 'unsigned-stack)))
+           (list (make-wired-tn* 'double-float double-reg-sc-number (1+ fprs))
+                 (int-arg state 'signed-byte-32 signed-reg-sc-number signed-stack-sc-number)
+                 (int-arg state 'unsigned-byte-32 unsigned-reg-sc-number unsigned-stack-sc-number)))
           (t
            ;; Pass on stack only
            (let ((stack-offset (arg-state-stack-frame-size state)))
              (incf (arg-state-stack-frame-size state) 2)
-             (my-make-wired-tn 'double-float 'double-stack stack-offset))))))
+             (make-wired-tn* 'double-float double-stack-sc-number stack-offset))))))
 
 ;;; Result state handling
 
@@ -167,16 +162,16 @@
   (declare (ignore type))
   (let ((num-results (result-state-num-results state)))
     (setf (result-state-num-results state) (1+ num-results))
-    (my-make-wired-tn 'system-area-pointer 'sap-reg
+    (make-wired-tn* 'system-area-pointer sap-reg-sc-number
                       (result-reg-offset num-results))))
 
 (define-alien-type-method (single-float :result-tn) (type state)
   (declare (ignore type state))
-  (my-make-wired-tn 'single-float 'single-reg 1))
+  (make-wired-tn* 'single-float single-reg-sc-number 1))
 
 (define-alien-type-method (double-float :result-tn) (type state)
   (declare (ignore type state))
-  (my-make-wired-tn 'double-float 'double-reg 1))
+  (make-wired-tn* 'double-float double-reg-sc-number 1))
 
 (define-alien-type-method (values :result-tn) (type state)
   (let ((values (alien-values-type-values type)))
@@ -191,9 +186,9 @@
     (setf (result-state-num-results state) (1+ num-results))
     (multiple-value-bind (ptype reg-sc)
         (if (alien-integer-type-signed type)
-            (values 'signed-byte-32 'signed-reg)
-            (values 'unsigned-byte-32 'unsigned-reg))
-      (my-make-wired-tn ptype reg-sc (result-reg-offset num-results)))))
+            (values 'signed-byte-32 signed-reg-sc-number)
+            (values 'unsigned-byte-32 unsigned-reg-sc-number))
+      (make-wired-tn* ptype reg-sc (result-reg-offset num-results)))))
 
 (defun make-call-out-tns (type)
   (declare (type alien-fun-type type))
@@ -201,7 +196,7 @@
     (collect ((arg-tns))
       (dolist (arg-type (alien-fun-type-arg-types type))
         (arg-tns (invoke-alien-type-method :arg-tn arg-type arg-state)))
-      (values (my-make-wired-tn 'positive-fixnum 'any-reg nsp-offset)
+      (values (make-wired-tn* 'positive-fixnum any-reg-sc-number nsp-offset)
               (* (arg-state-stack-frame-size arg-state) n-word-bytes)
               (arg-tns)
               (invoke-alien-type-method
@@ -215,8 +210,8 @@
 ;;; fit into registers or must go on the stack.
 #!-darwin
 (deftransform %alien-funcall ((function type &rest args))
-  (aver (sb!c::constant-lvar-p type))
-  (let* ((type (sb!c::lvar-value type))
+  (aver (sb-c::constant-lvar-p type))
+  (let* ((type (sb-c::lvar-value type))
          (arg-types (alien-fun-type-arg-types type))
          (result-type (alien-fun-type-result-type type))
          (gprs 0)
@@ -227,16 +222,16 @@
     ;; and results.
     (if (or (some #'(lambda (type)
                       (and (alien-integer-type-p type)
-                           (> (sb!alien::alien-integer-type-bits type) 32)))
+                           (> (sb-alien::alien-integer-type-bits type) 32)))
                   arg-types)
             (and (alien-integer-type-p result-type)
-                 (> (sb!alien::alien-integer-type-bits result-type) 32)))
+                 (> (sb-alien::alien-integer-type-bits result-type) 32)))
         (collect ((new-args) (lambda-vars) (new-arg-types))
           (dolist (type arg-types)
             (let ((arg (gensym)))
               (lambda-vars arg)
               (cond ((and (alien-integer-type-p type)
-                          (> (sb!alien::alien-integer-type-bits type) 32))
+                          (> (sb-alien::alien-integer-type-bits type) 32))
                      (when (or
                             (oddp gprs)
                             (and
@@ -282,9 +277,9 @@
                      (new-args arg)
                      (new-arg-types type)))))
                  (cond ((and (alien-integer-type-p result-type)
-                             (> (sb!alien::alien-integer-type-bits result-type) 32))
+                             (> (sb-alien::alien-integer-type-bits result-type) 32))
                         (let ((new-result-type
-                               (let ((sb!alien::*values-type-okay* t))
+                               (let ((sb-alien::*values-type-okay* t))
                                  (parse-alien-type
                                   (if (alien-integer-type-signed result-type)
                                       '(values (signed 32) (unsigned 32))
@@ -307,12 +302,12 @@
                               :arg-types (new-arg-types)
                               :result-type result-type)
                            ,@(new-args))))))
-        (sb!c::give-up-ir1-transform))))
+        (sb-c::give-up-ir1-transform))))
 
 #!+darwin
 (deftransform %alien-funcall ((function type &rest args))
-  (aver (sb!c::constant-lvar-p type))
-  (let* ((type (sb!c::lvar-value type))
+  (aver (sb-c::constant-lvar-p type))
+  (let* ((type (sb-c::lvar-value type))
          (arg-types (alien-fun-type-arg-types type))
          (result-type (alien-fun-type-result-type type)))
     (aver (= (length arg-types) (length args)))
@@ -320,16 +315,16 @@
     ;; and results.
     (if (or (some #'(lambda (type)
                       (and (alien-integer-type-p type)
-                           (> (sb!alien::alien-integer-type-bits type) 32)))
+                           (> (sb-alien::alien-integer-type-bits type) 32)))
                   arg-types)
             (and (alien-integer-type-p result-type)
-                 (> (sb!alien::alien-integer-type-bits result-type) 32)))
+                 (> (sb-alien::alien-integer-type-bits result-type) 32)))
         (collect ((new-args) (lambda-vars) (new-arg-types))
                  (dolist (type arg-types)
                    (let ((arg (gensym)))
                      (lambda-vars arg)
                      (cond ((and (alien-integer-type-p type)
-                                 (> (sb!alien::alien-integer-type-bits type) 32))
+                                 (> (sb-alien::alien-integer-type-bits type) 32))
                             ;; 64-bit long long types are stored in
                             ;; consecutive locations, most significant word
                             ;; first (big-endian).
@@ -343,9 +338,9 @@
                             (new-args arg)
                             (new-arg-types type)))))
                  (cond ((and (alien-integer-type-p result-type)
-                             (> (sb!alien::alien-integer-type-bits result-type) 32))
+                             (> (sb-alien::alien-integer-type-bits result-type) 32))
                         (let ((new-result-type
-                               (let ((sb!alien::*values-type-okay* t))
+                               (let ((sb-alien::*values-type-okay* t))
                                  (parse-alien-type
                                   (if (alien-integer-type-signed result-type)
                                       '(values (signed 32) (unsigned 32))
@@ -368,7 +363,7 @@
                               :arg-types (new-arg-types)
                               :result-type result-type)
                            ,@(new-args))))))
-        (sb!c::give-up-ir1-transform))))
+        (sb-c::give-up-ir1-transform))))
 
 (define-vop (foreign-symbol-sap)
   (:translate foreign-symbol-sap)
@@ -459,11 +454,11 @@
 (progn
   (defun alien-callback-accessor-form (type sap offset)
     (let ((parsed-type (parse-alien-type type nil)))
-      (cond ((sb!alien::alien-integer-type-p parsed-type)
+      (cond ((sb-alien::alien-integer-type-p parsed-type)
              ;; Unaligned access is slower, but possible, so this is nice and
              ;; simple. Also, we're a big-endian machine, so we need to get
              ;; byte offsets correct.
-             (let ((bits (sb!alien::alien-type-bits parsed-type)))
+             (let ((bits (sb-alien::alien-type-bits parsed-type)))
                (let ((byte-offset
                       (cond ((< bits n-word-bits)
                              (- n-word-bytes
@@ -497,7 +492,7 @@
                                                 'double-reg) :offset
                                                 n)))
       (let* ((segment (make-segment)))
-        (assemble (segment)
+        (assemble (segment 'nil)
           ;; Copy args from registers or stack to new position
           ;; on stack.
           (let* (
@@ -668,13 +663,13 @@
               (inst lwz r0 stack-pointer (* 2 n-word-bytes))
               (inst mtlr r0)
               (cond
-                ((sb!alien::alien-single-float-type-p result-type)
+                ((sb-alien::alien-single-float-type-p result-type)
                  (let ((f1 (make-fpr 1)))
                    (inst lfs f1 stack-pointer (- return-area-pos))))
-                ((sb!alien::alien-double-float-type-p result-type)
+                ((sb-alien::alien-double-float-type-p result-type)
                  (let ((f1 (make-fpr 1)))
                    (inst lfd f1 stack-pointer (- return-area-pos))))
-                ((sb!alien::alien-void-type-p result-type)
+                ((sb-alien::alien-void-type-p result-type)
                  ;; Nothing to do
                  )
                 (t
@@ -692,7 +687,7 @@
 
         ;; Now that the segment is done, convert it to a static
         ;; vector we can point foreign code to.
-        (let* ((buffer (sb!assem::segment-buffer segment))
+        (let* ((buffer (sb-assem::segment-buffer segment))
                (vector (make-static-vector (length buffer)
                                            :element-type '(unsigned-byte 8)
                                            :initial-contents buffer))
@@ -811,13 +806,13 @@
               (inst lwz r0 sp (* 2 n-word-bytes))
               (inst mtlr r0)
               (cond
-                ((sb!alien::alien-single-float-type-p result-type)
+                ((sb-alien::alien-single-float-type-p result-type)
                  (let ((f1 (make-fpr 1)))
                    (inst lfs f1 sp (- (* n-return-area-words n-word-bytes)))))
-                ((sb!alien::alien-double-float-type-p result-type)
+                ((sb-alien::alien-double-float-type-p result-type)
                  (let ((f1 (make-fpr 1)))
                    (inst lfd f1 sp (- (* n-return-area-words n-word-bytes)))))
-                ((sb!alien::alien-void-type-p result-type)
+                ((sb-alien::alien-void-type-p result-type)
                  ;; Nothing to do
                  )
                 (t
@@ -834,7 +829,7 @@
         (finalize-segment segment)
         ;; Now that the segment is done, convert it to a static
         ;; vector we can point foreign code to.
-        (let* ((buffer (sb!assem::segment-buffer segment))
+        (let* ((buffer (sb-assem::segment-buffer segment))
                (vector (make-static-vector (length buffer)
                                            :element-type '(unsigned-byte 8)
                                            :initial-contents buffer))

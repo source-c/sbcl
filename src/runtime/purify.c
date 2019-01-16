@@ -29,6 +29,7 @@
 #include "interr.h"
 #include "gc.h"
 #include "gc-internal.h"
+#include "gc-private.h"
 #include "thread.h"
 #include "genesis/gc-tables.h"
 #include "genesis/primitive-objects.h"
@@ -36,7 +37,7 @@
 #include "genesis/layout.h"
 #include "genesis/defstruct-description.h"
 #include "genesis/hash-table.h"
-#include "gencgc.h"
+#include "code.h"
 
 /* We don't ever do purification with GENCGC as of 1.0.5.*. There was
  * a lot of hairy and fragile ifdeffage in here to support purify on
@@ -148,7 +149,7 @@ ptrans_boxed(lispobj thing, lispobj header, boolean constant)
 {
     /* Allocate it */
     lispobj *old = native_pointer(thing);
-    long nwords = sizetab[widetag_of(header)](old);
+    long nwords = sizetab[header_widetag(header)](old);
     lispobj *new = newspace_alloc(nwords,constant);
 
     /* Copy it. */
@@ -188,7 +189,7 @@ ptrans_fdefn(lispobj thing, lispobj header)
 {
     /* Allocate it */
     lispobj *old = native_pointer(thing);
-    long nwords = sizetab[widetag_of(header)](old);
+    long nwords = sizetab[header_widetag(header)](old);
     lispobj *new = newspace_alloc(nwords, 0);    /* inconstant */
 
     /* Copy it. */
@@ -213,7 +214,7 @@ ptrans_unboxed(lispobj thing, lispobj header)
 {
     /* Allocate it */
     lispobj *old = native_pointer(thing);
-    long nwords = sizetab[widetag_of(header)](old);
+    long nwords = sizetab[header_widetag(header)](old);
     lispobj *new = newspace_alloc(nwords, 1);     /* always constant */
 
     /* copy it. */
@@ -230,7 +231,7 @@ static lispobj
 ptrans_vector(lispobj thing, boolean boxed, boolean constant)
 {
     struct vector *vector = VECTOR(thing);
-    long nwords = sizetab[widetag_of(vector->header)]((lispobj*)vector);
+    long nwords = sizetab[header_widetag(vector->header)]((lispobj*)vector);
 
     lispobj *new = newspace_alloc(nwords, (constant || !boxed));
     bcopy(vector, new, nwords * sizeof(lispobj));
@@ -248,8 +249,7 @@ static lispobj
 ptrans_code(lispobj thing)
 {
     struct code *code = (struct code *)native_pointer(thing);
-    long nwords = code_header_words(code->header)
-                + code_instruction_words(code->code_size);
+    long nwords = code_total_nwords(code);
 
     struct code *new = (struct code *)newspace_alloc(nwords,1); /* constant */
 
@@ -273,7 +273,7 @@ ptrans_code(lispobj thing)
 
     /* Scavenge the constants. */
     pscav(new->constants,
-          code_header_words(new->header) - (offsetof(struct code, constants) >> WORD_SHIFT),
+          code_header_words(new) - (offsetof(struct code, constants) >> WORD_SHIFT),
           1);
 
     /* Scavenge all the functions. */
@@ -295,7 +295,7 @@ ptrans_func(lispobj thing, lispobj header)
      * Otherwise we have to do something strange, 'cause it is buried
      * inside a code object. */
 
-    if (widetag_of(header) == SIMPLE_FUN_WIDETAG) {
+    if (header_widetag(header) == SIMPLE_FUN_WIDETAG) {
 
         /* We can only end up here if the code object has not been
          * scavenged, because if it had been scavenged, forwarding pointers
@@ -315,13 +315,13 @@ ptrans_func(lispobj thing, lispobj header)
     } else {
         /* It's some kind of closure-like thing. */
         lispobj *old = native_pointer(thing);
-        long nwords = sizetab[widetag_of(header)](old);
+        long nwords = sizetab[header_widetag(header)](old);
 
         /* Allocate the new one.  FINs *must* not go in read_only
          * space.  Closures can; they never change */
 
         lispobj *new = newspace_alloc
-            (nwords,(widetag_of(header)!=FUNCALLABLE_INSTANCE_WIDETAG));
+            (nwords,(header_widetag(header)!=FUNCALLABLE_INSTANCE_WIDETAG));
 
         /* Copy it. */
         bcopy(old, new, nwords * sizeof(lispobj));
@@ -352,7 +352,7 @@ ptrans_returnpc(lispobj thing, lispobj header)
     return new + (thing - code);
 }
 
-#define WORDS_PER_CONS CEILING(sizeof(struct cons) / sizeof(lispobj), 2)
+#define WORDS_PER_CONS ALIGN_UP(sizeof(struct cons) / sizeof(lispobj), 2)
 
 static lispobj
 ptrans_list(lispobj thing, boolean constant)
@@ -377,7 +377,7 @@ ptrans_list(lispobj thing, boolean constant)
 
         /* And count this cell. */
         length++;
-    } while (lowtag_of(thing) == LIST_POINTER_LOWTAG &&
+    } while (listp(thing) &&
              dynamic_pointer_p(thing) &&
              !(forwarding_pointer_p(*native_pointer(thing))));
 
@@ -390,7 +390,7 @@ ptrans_list(lispobj thing, boolean constant)
 static lispobj
 ptrans_otherptr(lispobj thing, lispobj header, boolean constant)
 {
-    int widetag = widetag_of(header);
+    int widetag = header_widetag(header);
     switch (widetag) {
         /* FIXME: this needs a reindent */
       case BIGNUM_WIDETAG:
@@ -446,7 +446,7 @@ ptrans_otherptr(lispobj thing, lispobj header, boolean constant)
         if (other_immediate_lowtag_p(widetag) &&
             specialized_vector_widetag_p(widetag))
             return ptrans_vector(thing, 0, constant);
-        fprintf(stderr, "Invalid widetag: %d\n", widetag_of(header));
+        fprintf(stderr, "Invalid widetag: %d\n", header_widetag(header));
         /* Should only come across other pointers to the above stuff. */
         gc_abort();
         return NIL;
@@ -474,7 +474,7 @@ pscav(lispobj *addr, long nwords, boolean constant)
 
     while (nwords > 0) {
         thing = *addr;
-        int widetag = widetag_of(thing);
+        int widetag = header_widetag(thing);
         if (is_lisp_pointer(thing)) {
             /* It's a pointer. Is it something we might have to move? */
             if (dynamic_pointer_p(thing)) {
@@ -529,15 +529,16 @@ pscav(lispobj *addr, long nwords, boolean constant)
 #endif
               case SAP_WIDETAG:
                 /* It's an unboxed simple object. */
-                count = CEILING(HeaderValue(thing)+1, 2);
+                count = ALIGN_UP(HeaderValue(thing)+1, 2);
                 break;
 
               case SIMPLE_VECTOR_WIDETAG:
-                  if (HeaderValue(thing) == subtype_VectorValidHashing) {
-                    struct hash_table *hash_table =
-                        (struct hash_table *)native_pointer(addr[2]);
-                    hash_table->needs_rehash_p = T;
-                  }
+                // addr[0] : header
+                //     [1] : vector length
+                //     [2] : element[0] = hashtable
+                //     [3] : element[1] = rehash bit
+                if (is_vector_subtype(thing, VectorValidHashing))
+                    addr[3] = make_fixnum(1);
                 count = 2;
                 break;
 
@@ -572,7 +573,7 @@ pscav(lispobj *addr, long nwords, boolean constant)
                     long nslots = instance_length(*addr) | 1;
                     int index;
                     if (fixnump(lbitmap)) {
-                      sword_t bitmap = (sword_t)lbitmap >> N_FIXNUM_TAG_BITS;
+                      sword_t bitmap = fixnum_value(lbitmap);
                       for (index = 0; index < nslots ; index++, bitmap >>= 1)
                         if (bitmap & 1)
                           pscav(slots + index, 1, constant);
@@ -590,7 +591,7 @@ pscav(lispobj *addr, long nwords, boolean constant)
               default:
                 if (other_immediate_lowtag_p(widetag) &&
                     specialized_vector_widetag_p(widetag))
-                    count = sizetab[widetag_of(thing)](addr);
+                    count = sizetab[header_widetag(thing)](addr);
                 else
                     count = 1;
                 break;
@@ -764,7 +765,8 @@ purify(lispobj static_roots, lispobj read_only_roots)
 }
 #else /* LISP_FEATURE_GENCGC */
 int
-purify(lispobj static_roots, lispobj read_only_roots)
+purify(lispobj __attribute__((unused)) static_roots,
+       lispobj __attribute__((unused)) read_only_roots)
 {
     lose("purify called for GENCGC. This should not happen.");
 }

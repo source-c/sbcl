@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (defun load-immediate-word (y val)
   (cond ((typep val '(unsigned-byte 16))
@@ -20,6 +20,13 @@
          (inst movn y (ldb (byte 64 0) (lognot val))))
         ((encode-logical-immediate val)
          (inst orr y zr-tn val))
+        ((loop for i below 64 by 16
+               for part = (ldb (byte 16 i) val)
+               for zeroed = (dpb 0 (byte 16 i) val)
+               thereis (cond ((encode-logical-immediate zeroed)
+                              (inst orr y zr-tn zeroed)
+                              (inst movk y part i)
+                              t))))
         ((minusp val)
          (loop with first = t
                for i below 64 by 16
@@ -49,7 +56,7 @@
          (load-immediate-word temp x))))
 
 (define-move-fun (load-immediate 1) (vop x y)
-  ((null immediate)
+  ((immediate)
    (any-reg descriptor-reg))
   (let ((val (tn-value x)))
     (etypecase val
@@ -61,8 +68,6 @@
        (let* ((codepoint (char-code val))
               (encoded-character (dpb codepoint (byte 24 8) character-widetag)))
          (load-immediate-word y encoded-character)))
-      (null
-       (move y null-tn))
       (symbol
        (load-symbol y val)))))
 
@@ -78,7 +83,7 @@
 (define-move-fun (load-system-area-pointer 1) (vop x y)
   ((immediate) (sap-reg))
   (let ((immediate-label (gen-label)))
-    (assemble (*elsewhere*)
+    (assemble (:elsewhere)
       (emit-label immediate-label)
       (inst dword (sap-int (tn-value x))))
     (inst ldr y (@ immediate-label))))
@@ -119,7 +124,7 @@
 ;;;; The Move VOP:
 (define-vop (move)
   (:args (x :target y
-            :scs (any-reg descriptor-reg null)
+            :scs (any-reg descriptor-reg)
             :load-if (not (or (location= x y)
                               (and (sc-is x immediate)
                                    (eql (tn-value x) 0))))))
@@ -144,7 +149,7 @@
 ;;; frame for argument or known value passing.
 (define-vop (move-arg)
   (:args (x :target y
-            :scs (any-reg descriptor-reg null))
+            :scs (any-reg descriptor-reg))
          (fp :scs (any-reg)
              :load-if (not (sc-is y any-reg descriptor-reg))))
   (:results (y))
@@ -161,9 +166,9 @@
 
 ;;; Use LDP/STP when possible
 (defun load-store-two-words (vop1 vop2)
-  (let ((register-sb (sb-or-lose 'sb!vm::registers))
+  (let ((register-sb (sb-or-lose 'sb-vm::registers))
         used-load-tn)
-    (declare (notinline sb!c::vop-name)) ; too late
+    (declare (notinline sb-c::vop-name)) ; too late
     (labels ((register-p (tn)
                (and (tn-p tn)
                     (eq (sc-sb (tn-sc tn)) register-sb)))
@@ -171,11 +176,11 @@
                (and (tn-p tn)
                     (sc-is tn control-stack)))
              (source (vop)
-               (tn-ref-tn (sb!c::vop-args  vop)))
+               (tn-ref-tn (sb-c::vop-args  vop)))
              (dest (vop)
-               (tn-ref-tn (sb!c::vop-results vop)))
+               (tn-ref-tn (sb-c::vop-results vop)))
              (load-tn (vop)
-               (tn-ref-load-tn (sb!c::vop-args vop)))
+               (tn-ref-load-tn (sb-c::vop-args vop)))
              (suitable-offsets-p (tn1 tn2)
                (and (= (abs (- (tn-offset tn1)
                                (tn-offset tn2)))
@@ -186,26 +191,37 @@
                                       n-word-bits)))
              (load-arg (x load-tn)
                (sc-case x
-                 (null
-                  null-tn)
                  ((constant immediate control-stack)
-                  (let ((tn (if (and used-load-tn
-                                     (location= used-load-tn
-                                                load-tn))
-                                tmp-tn
-                                load-tn)))
+                  (let ((load-tn (if (and used-load-tn
+                                          (location= used-load-tn load-tn))
+                                     tmp-tn
+                                     load-tn)))
+                    (setf used-load-tn load-tn)
                     (sc-case x
                       (constant
-                       (load-constant vop1 x tn))
-                      (immediate
-                       (load-immediate vop1 x tn))
+                       (when (eq load-tn tmp-tn)
+                         ;; TMP-TN is not a descriptor
+                         (return-from load-arg))
+                       (lambda ()
+                         (load-constant vop1 x load-tn)
+                         load-tn))
                       (control-stack
-                       (load-stack vop1 x tn)))
-                    (setf used-load-tn tn)
-                    tn))
+                       (when (eq load-tn tmp-tn)
+                         (return-from load-arg))
+                       (lambda ()
+                         (load-stack vop1 x load-tn)
+                         load-tn))
+                      (immediate
+                       (cond ((eql (tn-value x) 0)
+                              (setf used-load-tn nil)
+                              (lambda () zr-tn))
+                             (t
+                              (lambda ()
+                                (load-immediate vop1 x load-tn)
+                                load-tn)))))))
                  (t
                   (setf used-load-tn x)
-                  x)))
+                  (lambda () x))))
              (do-moves (source1 source2 dest1 dest2 &optional (fp cfp-tn)
                                                               fp-load-tn)
                (cond ((and (stack-p dest1)
@@ -216,19 +232,29 @@
                                (and (not (location= dest1 source2))
                                     (not (location= dest2 source1))))
                            (suitable-offsets-p dest1 dest2))
-                      (if (and (stack-p source1)
-                               (stack-p source2)
-                               (do-moves source1 source2
-                                 (load-tn vop1)
-                                 (if (location= (load-tn vop1) (load-tn vop2))
-                                     tmp-tn
-                                     (load-tn vop2))))
-                          (setf source1 (load-tn vop1)
-                                source2 (if (location= (load-tn vop1) (load-tn vop2))
-                                            tmp-tn
-                                            (load-tn vop2)))
-                          (setf source1 (load-arg source1 (load-tn vop1))
-                                source2 (load-arg source2 (load-tn vop2))))
+                      ;; Load the source registers
+                      (let (new-source1 new-source2)
+                        (if (and (stack-p source1)
+                                 (stack-p source2)
+                                 ;; Can load using LDP
+                                 (do-moves source1 source2
+                                   (setf new-source1 (load-tn vop1))
+                                   (setf new-source2
+                                         (cond ((not (location= (load-tn vop1) (load-tn vop2)))
+                                                (load-tn vop2))
+                                               ((sc-is (load-tn vop2) descriptor-reg)
+                                                (return-from do-moves))
+                                               (t
+                                                tmp-tn)))))
+                            (setf source1 new-source1
+                                  source2 new-source2)
+                            ;; Load one by one
+                            (let ((load1 (load-arg source1 (load-tn vop1)))
+                                  (load2 (load-arg source2 (load-tn vop2))))
+                              (unless (and load1 load2)
+                                (return-from do-moves))
+                              (setf source1 (funcall load1)
+                                    source2 (funcall load2)))))
                       (when (> (tn-offset dest1)
                                (tn-offset dest2))
                         (rotatef dest1 dest2)
@@ -249,33 +275,30 @@
                                (tn-offset source2))
                         (rotatef dest1 dest2)
                         (rotatef source1 source2))
-                      (when fp-load-tn
-                        (load-stack-tn fp-load-tn fp)
-                        (setf fp fp-load-tn))
                       (inst ldp dest1 dest2
                             (@ fp (* (tn-offset source1) n-word-bytes)))
                       t))))
-      (case (sb!c::vop-name vop1)
+      (case (sb-c::vop-name vop1)
         (move
          (do-moves (source vop1) (source vop2) (dest vop1) (dest vop2)))
-        (sb!c::move-operand
-         (cond ((and (equal (sb!c::vop-codegen-info vop1)
-                            (sb!c::vop-codegen-info vop2))
-                     (memq (car (sb!c::vop-codegen-info vop1))
+        (sb-c::move-operand
+         (cond ((and (equal (sb-c::vop-codegen-info vop1)
+                            (sb-c::vop-codegen-info vop2))
+                     (memq (car (sb-c::vop-codegen-info vop1))
                            '(load-stack store-stack)))
                 (do-moves (source vop1) (source vop2) (dest vop1) (dest vop2)))))
         (move-arg
-         (let ((fp1 (tn-ref-tn (tn-ref-across (sb!c::vop-args vop1))))
-               (fp2 (tn-ref-tn (tn-ref-across (sb!c::vop-args vop2))))
+         (let ((fp1 (tn-ref-tn (tn-ref-across (sb-c::vop-args vop1))))
+               (fp2 (tn-ref-tn (tn-ref-across (sb-c::vop-args vop2))))
                (dest1 (dest vop1))
                (dest2 (dest vop2)))
-           (do-moves (source vop1) (source vop2) (dest vop1) (dest vop2)
-             (if (and (stack-p dest1)
-                      (stack-p dest2)
-                      (eq fp1 fp2))
-                 fp1
-                 cfp-tn)
-             (tn-ref-load-tn (tn-ref-across (sb!c::vop-args vop1))))))))))
+           (when (eq fp1 fp2)
+             (do-moves (source vop1) (source vop2) (dest vop1) (dest vop2)
+               (if (and (stack-p dest1)
+                        (stack-p dest2))
+                   fp1
+                   cfp-tn)
+               (tn-ref-load-tn (tn-ref-across (sb-c::vop-args vop1)))))))))))
 
 
 ;;;; ILLEGAL-MOVE
@@ -318,7 +341,7 @@
   (:vop-var vop)
   (:note "constant load")
   (:generator 1
-    (cond ((sb!c::tn-leaf x)
+    (cond ((sb-c::tn-leaf x)
            (load-immediate-word y (tn-value x)))
           (t
            (load-constant vop x y)
@@ -378,6 +401,25 @@
     DONE))
 (define-move-vop move-from-signed :move
   (signed-reg) (descriptor-reg))
+
+(define-vop (move-from-fixnum+1)
+  (:args (x :scs (signed-reg unsigned-reg)))
+  (:results (y :scs (any-reg descriptor-reg)))
+  (:vop-var vop)
+  (:generator 4
+    (inst adds y x x)
+    (inst b :vc DONE)
+    (load-constant vop (emit-constant (1+ sb-xc:most-positive-fixnum))
+                   y)
+    DONE))
+
+(define-vop (move-from-fixnum-1 move-from-fixnum+1)
+  (:generator 4
+    (inst adds y x x)
+    (inst b :vc DONE)
+    (load-constant vop (emit-constant (1- sb-xc:most-negative-fixnum))
+                   y)
+    DONE))
 
 ;;; Check for fixnum, and possibly allocate one or two word bignum
 ;;; result.  Use a worst-case cost to make sure people know they may

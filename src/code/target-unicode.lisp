@@ -9,15 +9,15 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!UNICODE")
+(in-package "SB-UNICODE")
 
 (declaim (type simple-vector **special-numerics**))
-(sb!impl::defglobal **special-numerics**
+(sb-ext:define-load-time-global **special-numerics**
   #.(sb-cold:read-from-file "output/numerics.lisp-expr"))
 
 (declaim (type (simple-array (unsigned-byte 32) (*)) **block-ranges**))
-(sb!impl::defglobal **block-ranges**
-  #.(sb!int:!coerce-to-specialized
+(sb-ext:define-load-time-global **block-ranges**
+  #.(!coerce-to-specialized
      (sb-cold:read-from-file "output/blocks.lisp-expr")
      '(unsigned-byte 32)))
 
@@ -29,9 +29,12 @@
                    (bidi-mirroring-list
                     (sb-cold:read-from-file "output/bidi-mirrors.lisp-expr")))
                `(progn
-                  (sb!impl::defglobal **proplist-properties** ',proplist-dump)
-                  (sb!impl::defglobal **confusables** ',confusable-sets)
-                  (sb!impl::defglobal **bidi-mirroring-glyphs** ',bidi-mirroring-list)
+                  (sb-ext:define-load-time-global **proplist-properties**
+                    ',proplist-dump)
+                  (sb-ext:define-load-time-global **confusables**
+                    ',confusable-sets)
+                  (sb-ext:define-load-time-global **bidi-mirroring-glyphs**
+                    ',bidi-mirroring-list)
                   (defun !unicode-properties-cold-init ()
                     (let ((hash (make-hash-table)) (list ',proplist-dump))
                       (do ((k (car list) (car list)) (v (cadr list) (cadr list)))
@@ -50,7 +53,7 @@
                                               #'(lambda (item)
                                                   (every
                                                    #'(lambda (x)
-                                                       (< x sb!xc:char-code-limit))
+                                                       (< x sb-xc:char-code-limit))
                                                    item)) set))
                          do (dolist (i items)
                               (setf (gethash (logically-readonlyize (possibly-base-stringize i))
@@ -118,19 +121,19 @@ with underscores replaced by dashes."
 ;; WARNING: These have to be manually kept in sync with the values in ucd.lisp
 (declaim (type simple-vector *general-categories* *bidi-classes* *east-asian-widths*
                *scripts* *line-break-classes* *blocks*))
-(sb!impl::defglobal *general-categories*
+(sb-ext:define-load-time-global *general-categories*
   #(:Lu :Ll :Lt :Lm :Lo :Cc :Cf :Co :Cs :Cn :Mc :Me :Mn :Nd
     :Nl :No :Pc :Pd :Pe :Pf :Pi :Po :Ps :Sc :Sk :Sm :So :Zl
     :Zp :Zs))
 
-(sb!impl::defglobal *bidi-classes*
+(sb-ext:define-load-time-global *bidi-classes*
   #(:BN :AL :AN :B :CS :EN :ES :ET :L :LRE :LRO :NSM :ON
     :PDF :R :RLE :RLO :S :WS :LRI :RLI :FSI :PDI))
 
-(sb!impl::defglobal *east-asian-widths*
+(sb-ext:define-load-time-global *east-asian-widths*
   #(:N :A :H :W :F :Na))
 
-(sb!impl::defglobal *scripts*
+(sb-ext:define-load-time-global *scripts*
   #(:Unknown :Common :Latin :Greek :Cyrillic :Armenian :Hebrew :Arabic :Syriac
     :Thaana :Devanagari :Bengali :Gurmukhi :Gujarati :Oriya :Tamil :Telugu
     :Kannada :Malayalam :Sinhala :Thai :Lao :Tibetan :Myanmar :Georgian :Hangul
@@ -150,12 +153,12 @@ with underscores replaced by dashes."
     :Psalter-Pahlavi :Grantha :Mro :Siddham :Khojki :Nabataean :Tirhuta
     :Khudawadi :Old-North-Arabian :Warang-Citi :Linear-A :Old-Permic))
 
-(sb!impl::defglobal *line-break-classes*
+(sb-ext:define-load-time-global *line-break-classes*
     #(:XX :AI :AL :B2 :BA :BB :BK :CB :CJ :CL :CM :CP :CR :EX :GL
       :HL :HY :ID :IN :IS :LF :NL :NS :NU :OP :PO :PR :QU :RI :SA
       :SG :SP :SY :WJ :ZW))
 
-(sb!impl::defglobal *blocks*
+(sb-ext:define-load-time-global *blocks*
   #(:Basic-Latin :Latin-1-Supplement :Latin-Extended-A :Latin-Extended-B
     :IPA-Extensions :Spacing-Modifier-Letters :Combining-Diacritical-Marks
     :Greek-and-Coptic :Cyrillic :Cyrillic-Supplement :Armenian :Hebrew :Arabic
@@ -230,7 +233,7 @@ with underscores replaced by dashes."
 
 (defun general-category (character)
   "Returns the general category of CHARACTER as it appears in UnicodeData.txt"
-  (svref-or-null *general-categories* (sb!impl::ucd-general-category character)))
+  (svref-or-null *general-categories* (sb-impl::ucd-general-category character)))
 
 (defun bidi-class (character)
   "Returns the bidirectional class of CHARACTER"
@@ -254,7 +257,7 @@ The only characters in Unicode with a decimal digit value are those
 that are part of a range of characters that encode the digits 0-9.
 Because of this, `(decimal-digit c) <=> (digit-char-p c 10)` in
 #+sb-unicode builds"
-  (sb!impl::ucd-decimal-digit character))
+  (sb-impl::ucd-decimal-digit character))
 
 (defun digit-value (character)
   "Returns the Unicode digit value of CHARACTER or NIL if it doesn't exist.
@@ -526,10 +529,10 @@ disappears when accents are placed on top of it. and NIL otherwise"
                                 (t
                                  (push char chars)
                                  (setf previous-combining-class combining-class))))))
-      (sb!kernel:with-array-data ((string string) (start) (end)
+      (sb-kernel:with-array-data ((string string) (start) (end)
                                   :check-fill-pointer t)
         (let ((calback (if filter
-                           (let ((filter (sb!kernel:%coerce-callable-to-fun filter)))
+                           (let ((filter (sb-kernel:%coerce-callable-to-fun filter)))
                              (lambda (char)
                                (when (funcall filter char)
                                  (callback char))))
@@ -704,10 +707,10 @@ only characters for which it returns T are collected."
 
 ;;; Unicode case algorithms
 ;; FIXME: Make these parts less redundant (macro?)
-(sb!ext:defglobal **special-titlecases**
+(sb-ext:define-load-time-global **special-titlecases**
   '#.(sb-cold:read-from-file "output/titlecases.lisp-expr"))
 
-(sb!ext:defglobal **special-casefolds**
+(sb-ext:define-load-time-global **special-casefolds**
   '#.(sb-cold:read-from-file "output/foldcases.lisp-expr"))
 
 (defun has-case-p (char)
@@ -756,11 +759,11 @@ only characters for which it returns T are collected."
     (setf result (nreverse result))
     (coerce result 'string)))
 
-(declaim (type function sb!unix::posix-getenv))
+(declaim (type function sb-unix::posix-getenv))
 (defun get-user-locale ()
   (let ((raw-locale
-         #!+(or win32 unix) (or (sb!unix::posix-getenv "LC_ALL")
-                                (sb!unix::posix-getenv "LANG"))
+         #!+(or win32 unix) (or (sb-unix::posix-getenv "LC_ALL")
+                                (sb-unix::posix-getenv "LANG"))
          #!-(or win32 unix) nil))
     (when raw-locale
       (let ((lang-code (string-upcase
@@ -985,7 +988,7 @@ The result is not guaranteed to have the same length as the input."
   (def map-graphemes map-grapheme-boundaries))
 
 (defun graphemes (string)
-  "Breaks STRING into graphemes acording to the default
+  "Breaks STRING into graphemes according to the default
 grapheme breaking rules specified in UAX #29, returning a list of strings."
   (let (result)
     (map-graphemes (lambda (a) (push (subseq a 0) result)) string)
@@ -1044,7 +1047,7 @@ grapheme breaking rules specified in UAX #29, returning a list of strings."
            (push ,%thing ,list)))))
 
 (defun words (string)
-  "Breaks STRING into words acording to the default
+  "Breaks STRING into words according to the default
 word breaking rules specified in UAX #29. Returns a list of strings"
   (let ((chars (mapcar
                  #'(lambda (s)
@@ -1164,7 +1167,7 @@ Specifically,
     (flush) (nreverse clusters))))
 
 (defun sentences (string)
-  "Breaks STRING into sentences acording to the default
+  "Breaks STRING into sentences according to the default
 sentence breaking rules specified in UAX #29"
   (let ((special-handling '(:close :sp :sep :cr :lf :scontinue :sterm :aterm))
         (chars (sentence-prebreak string))

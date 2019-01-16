@@ -9,17 +9,17 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!EVAL")
+(in-package "SB-EVAL")
 
-(sb!int:!defparameter *eval-level* -1)
-(sb!int:!defparameter *eval-verbose* nil)
+(defparameter *eval-level* -1) ; initialized by genesis
+(defparameter *eval-verbose* nil) ; initialized by genesis
 
 ;; !defstruct-with-alternate-metaclass is unslammable and the
 ;; RECOMPILE restart doesn't work on it.  This is the main reason why
 ;; this stuff is split out into its own file.  Also, it lets the
 ;; INTERPRETED-FUNCTION type be declared before it is used in
 ;; compiler/main and code/deftypes-for-target.
-(sb!kernel::!defstruct-with-alternate-metaclass
+(sb-kernel::!defstruct-with-alternate-metaclass
  interpreted-function
  ;; DEBUG-NAME and DEBUG-LAMBDA-LIST are initially a copies of the proper
  ;; ones, but is analogous to SIMPLE-FUN-NAME and ARGLIST in the sense that it
@@ -27,12 +27,11 @@
  ;; function -- so DEFMACRO can set them to more informative values.
  :slot-names (name debug-name lambda-list debug-lambda-list env
                    declarations documentation body source-location)
- :boa-constructor %make-interpreted-function
+ :constructor %make-interpreted-function
  :superclass-name function
  :metaclass-name static-classoid
  :metaclass-constructor make-static-classoid
- :dd-type funcallable-structure
- :runtime-type-checks-p nil)
+ :dd-type funcallable-structure)
 
 ;; INTERPRETED-FUNCTION can not subclassed at runtime.
 ;; For one, DEFSTRUCT-WITH-ALTERNATE-METACLASS does not exist in the target,
@@ -49,7 +48,7 @@
     (let ((function (%make-interpreted-function
                      name name lambda-list debug-lambda-list env
                      declarations documentation body source-location)))
-      (setf (funcallable-instance-fun function)
+      (setf (%funcallable-instance-fun function)
             #'(lambda (&rest args)
                 (interpreted-apply function args)))
       function))

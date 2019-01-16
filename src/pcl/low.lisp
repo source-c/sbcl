@@ -35,13 +35,8 @@
 ;;;; warranty about the software, its performance or its conformity to any
 ;;;; specification.
 
-(in-package "SB!PCL")
+(in-package "SB-PCL")
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-(defvar *optimize-speed*
-  '(optimize (speed 3) (safety 0) (sb!ext:inhibit-warnings 3) (debug 0)))
-) ; EVAL-WHEN
-
 (defmacro dotimes-fixnum ((var count &optional (result nil)) &body body)
   `(dotimes (,var (the fixnum ,count) ,result)
      (declare (fixnum ,var))
@@ -59,17 +54,17 @@
 (defmacro randomly-punting-lambda (lambda-list &body body)
   (with-unique-names (drops drop-pos)
     `(let ((,drops (random-fixnum)) ; means a POSITIVE fixnum
-           (,drop-pos sb!vm:n-positive-fixnum-bits))
+           (,drop-pos sb-vm:n-positive-fixnum-bits))
        (declare (fixnum ,drops)
-                (type (mod #.sb!vm:n-fixnum-bits) ,drop-pos))
+                (type (mod #.sb-vm:n-fixnum-bits) ,drop-pos))
        (lambda ,lambda-list
          (when (logbitp (the unsigned-byte (decf ,drop-pos)) ,drops)
            (locally ,@body))
          (when (zerop ,drop-pos)
            (setf ,drops (random-fixnum)
-                 ,drop-pos sb!vm:n-positive-fixnum-bits))))))
+                 ,drop-pos sb-vm:n-positive-fixnum-bits))))))
 
-(import 'sb!kernel:funcallable-instance-p) ; why?
+(import 'sb-kernel:funcallable-instance-p) ; why?
 
 (defun set-funcallable-instance-function (fin new-value)
   (declare (type function new-value)
@@ -80,7 +75,7 @@
            ;; PCL's internal use of SET-FUNCALLABLE-INSTANCE-FUNCTION
            ;; doesn't obey this restriction.
            (type funcallable-instance fin))
-  (setf (funcallable-instance-fun fin) new-value))
+  (setf (%funcallable-instance-fun fin) new-value))
 
 ;;; FIXME: these macros should just go away.  It's not clear whether
 ;;; the inline functions defined by
@@ -90,13 +85,15 @@
 (defun fsc-instance-p (fin)
   (funcallable-instance-p fin))
 (defmacro fsc-instance-slots (fin)
-  `(%funcallable-instance-info ,fin sb!vm:instance-data-start))
+  `(truly-the simple-vector
+              (%funcallable-instance-info
+               ,fin ,(get-dsd-index standard-funcallable-instance clos-slots))))
 
 (declaim (inline clos-slots-ref (setf clos-slots-ref)))
-(declaim (ftype (function (simple-vector index) t) clos-slots-ref))
+(declaim (ftype (function (simple-vector t) t) clos-slots-ref))
 (defun clos-slots-ref (slots index)
   (svref slots index))
-(declaim (ftype (function (t simple-vector index) t) (setf clos-slots-ref)))
+(declaim (ftype (function (t simple-vector t) t) (setf clos-slots-ref)))
 (defun (setf clos-slots-ref) (new-value slots index)
   (setf (svref slots index) new-value))
 
@@ -126,7 +123,7 @@
   (typecase fun
     (%method-function fun)
     ;; a closure potentially becomes a different closure
-    (closure (setq fun (sb!impl::set-closure-name fun new-name)))
+    (closure (setq fun (set-closure-name fun t new-name)))
     (t (setf (%fun-name fun) new-name)))
   ;; Fixup name-to-function mappings in cases where the function
   ;; hasn't been defined by DEFUN.  (FIXME: is this right?  This logic
@@ -177,7 +174,8 @@
 ;;; weakening of STD-INSTANCE-P.
 ;;; FIXME: what does the preceding comment mean? You can't use instance-slots
 ;;; on a structure. (Consider especially a structure of 0 slots.)
-(defmacro std-instance-slots (x) `(%instance-ref ,x sb!vm:instance-data-start))
+(defmacro std-instance-slots (x)
+  `(truly-the simple-vector (%instance-ref ,x ,(get-dsd-index standard-instance slots))))
 
 ;;; FIXME: These functions are called every place we do a
 ;;; CALL-NEXT-METHOD, and probably other places too. It's likely worth

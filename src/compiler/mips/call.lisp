@@ -9,10 +9,10 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
-(defconstant arg-count-sc (make-sc-offset immediate-arg-scn nargs-offset))
-(defconstant closure-sc (make-sc-offset descriptor-reg-sc-number lexenv-offset))
+(defconstant arg-count-sc (make-sc+offset immediate-arg-scn nargs-offset))
+(defconstant closure-sc (make-sc+offset descriptor-reg-sc-number lexenv-offset))
 
 ;;; Make a passing location TN for a local call return PC.  If standard is
 ;;; true, then use the standard (full call) location, otherwise use any legal
@@ -28,10 +28,11 @@
 ;;; standard convention, but is totally unrestricted in non-standard
 ;;; conventions, since we can always fetch it off of the stack using
 ;;; the arg pointer.
-(defun make-old-fp-passing-location (standard)
-  (if standard
-      (make-wired-tn *fixnum-primitive-type* immediate-arg-scn ocfp-offset)
-      (make-normal-tn *fixnum-primitive-type*)))
+(defun make-old-fp-passing-location ()
+  (make-wired-tn *fixnum-primitive-type* immediate-arg-scn ocfp-offset))
+
+(defconstant old-fp-passing-offset
+  (make-sc+offset descriptor-reg-sc-number ocfp-offset))
 
 ;;; Make the TNs used to hold OLD-FP and RETURN-PC within the current
 ;;; function. We treat these specially so that the debugger can find
@@ -118,8 +119,7 @@
     (emit-label start-lab)
     ;; Allocate function header.
     (inst simple-fun-header-word)
-    (dotimes (i (1- simple-fun-code-offset))
-      (inst word 0))
+    (inst .skip (* (1- simple-fun-code-offset) n-word-bytes))
     ;; The start of the actual code.
     ;; Compute CODE from the address of this entry point.
     (let ((entry-point (gen-label)))
@@ -297,7 +297,7 @@ default-value-8
 
             (let ((defaults (defaults)))
               (aver defaults)
-              (assemble (*elsewhere*)
+              (assemble (:elsewhere)
                 (emit-label default-stack-vals)
                 (do ((remaining defaults (cdr remaining)))
                     ((null remaining))
@@ -348,7 +348,7 @@ default-value-8
 
     (emit-label done)
 
-    (assemble (*elsewhere*)
+    (assemble (:elsewhere)
       (emit-label variable-values)
       (when lra-label
         (inst compute-code-from-lra code-tn code-tn lra-label temp))
@@ -760,19 +760,15 @@ default-value-8
                 (insert-step-instrumenting (callable-tn)
                   ;; Conditionally insert a conditional trap:
                   (when step-instrumenting
-                    (load-symbol-value stepping sb!impl::*stepping*)
+                    (load-symbol-value stepping sb-impl::*stepping*)
                     ;; If it's not 0, trap.
                     (inst beq stepping STEP-DONE-LABEL)
                     (inst nop)
                     ;; CONTEXT-PC will be pointing here when the
                     ;; interrupt is handled, not after the BREAK.
                     (note-this-location vop :step-before-vop)
-                    ;; Construct a trap code with the low bits from
-                    ;; SINGLE-STEP-AROUND-TRAP and the high bits from
-                    ;; the register number of CALLABLE-TN.
-                    (inst break 0 (logior single-step-around-trap
-                                          (ash (reg-tn-encoding callable-tn)
-                                               5)))
+                    (inst break (reg-tn-encoding callable-tn)
+                          single-step-around-trap)
                     (emit-label step-done-label))))
            (declare (ignorable #'insert-step-instrumenting))
            ,@(case named
@@ -1106,7 +1102,28 @@ default-value-8
 ;;; More args are stored consecutively on the stack, starting
 ;;; immediately at the context pointer.  The context pointer is not
 ;;; typed, so the lowtag is 0.
-(define-full-reffer more-arg * 0 0 (descriptor-reg any-reg) * %more-arg)
+(define-vop (more-arg)
+  (:translate %more-arg)
+  (:policy :fast-safe)
+  (:args (context :scs (descriptor-reg)) (index :scs (any-reg)))
+  (:arg-types * tagged-num)
+  (:temporary (:scs (any-reg)) temp)
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:result-types *)
+  (:generator 5
+   (inst addu temp context index)
+   (loadw value temp)))
+(define-vop (more-arg-c)
+  (:translate %more-arg)
+  (:policy :fast-safe)
+  (:args (context :scs (descriptor-reg)))
+  (:info index)
+  (:arg-types * (:constant (load/store-index 8 0 0)))
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:result-types *)
+  (:generator 4
+    (loadw value context index)))
+
 
 ;;; Turn more arg (context, count) into a list.
 (define-vop (listify-rest-args)
@@ -1179,7 +1196,7 @@ default-value-8
 ;;;
 (define-vop (more-arg-context)
   (:policy :fast-safe)
-  (:translate sb!c::%more-arg-context)
+  (:translate sb-c::%more-arg-context)
   (:args (supplied :scs (any-reg)))
   (:arg-types tagged-num (:constant fixnum))
   (:info fixed)
@@ -1191,64 +1208,39 @@ default-value-8
     (inst addu count supplied (fixnumize (- fixed)))
     (inst subu context csp-tn count)))
 
-
-;;; Signal wrong argument count error if Nargs isn't = to Count.
-;;;
-#!-precise-arg-count-error
-(define-vop (verify-arg-count)
-  (:policy :fast-safe)
-  (:translate sb!c::%verify-arg-count)
-  (:args (nargs :scs (any-reg)))
-  (:arg-types positive-fixnum (:constant t))
-  (:temporary (:scs (any-reg) :type fixnum) temp)
-  (:info count)
-  (:vop-var vop)
-  (:save-p :compute-only)
-  (:generator 3
-    (let ((err-lab
-           (generate-error-code vop 'invalid-arg-count-error nargs)))
-      (cond ((zerop count)
-             (inst bne nargs err-lab)
-             (inst nop))
-            (t
-             (inst li temp (fixnumize count))
-             (inst bne nargs temp err-lab)
-             (inst nop))))))
-
-#!+precise-arg-count-error
 (define-vop (verify-arg-count)
   (:policy :fast-safe)
   (:args (nargs :scs (any-reg)))
-  (:temporary (:scs (any-reg) :type fixnum) temp)
+  (:temporary (:scs (unsigned-reg)) temp)
   (:arg-types positive-fixnum (:constant t) (:constant t))
   (:info min max)
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 3
-              (let ((err-lab
-                      (generate-error-code vop 'invalid-arg-count-error nargs)))
-                (cond ((not min)
-                       (cond ((zerop max)
-                              (inst bne nargs err-lab))
-                             (t
-                              (inst li temp (fixnumize max))
-                              (inst bne nargs temp err-lab)))
-                       (inst nop))
-                      (max
-                       (when (plusp min)
-                         (inst li temp (fixnumize min))
-                         (inst sltu temp nargs temp)
-                         (inst bne temp err-lab)
-                         (inst nop))
-                       (inst li temp (fixnumize max))
-                       (inst sltu temp temp nargs)
-                       (inst bne temp err-lab)
-                       (inst nop))
-                      ((plusp min)
-                       (inst li temp (fixnumize min))
-                       (inst sltu temp nargs temp)
-                       (inst bne temp err-lab)
-                       (inst nop))))))
+    (let ((err-lab
+            (generate-error-code vop 'invalid-arg-count-error nargs)))
+      (cond ((not min)
+             (cond ((zerop max)
+                    (inst bne nargs err-lab))
+                   (t
+                    (inst li temp (fixnumize max))
+                    (inst bne nargs temp err-lab)))
+             (inst nop))
+            (max
+             (when (plusp min)
+               (inst li temp (fixnumize min))
+               (inst sltu temp nargs temp)
+               (inst bne temp err-lab)
+               (inst nop))
+             (inst li temp (fixnumize max))
+             (inst sltu temp temp nargs)
+             (inst bne temp err-lab)
+             (inst nop))
+            ((plusp min)
+             (inst li temp (fixnumize min))
+             (inst sltu temp nargs temp)
+             (inst bne temp err-lab)
+             (inst nop))))))
 
 ;;; Single-stepping
 
@@ -1257,7 +1249,7 @@ default-value-8
   (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
-    (load-symbol-value stepping sb!impl::*stepping*)
+    (load-symbol-value stepping sb-impl::*stepping*)
     ;; If it's not 0, trap.
     (inst beq stepping DONE)
     (inst nop)

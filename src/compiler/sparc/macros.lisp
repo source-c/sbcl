@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; Instruction-like macros.
 
@@ -42,7 +42,7 @@
                                           "SYMBOL-"
                                           (string slot)
                                           "-SLOT")
-                             (find-package "SB!VM"))))
+                             (find-package "SB-VM"))))
          `(progn
             (defmacro ,loader (reg symbol)
               `(inst ld ,reg null-tn
@@ -63,8 +63,6 @@
   (once-only ((n-target target)
               (n-source source)
               (n-offset offset))
-    ;; FIXME: although I don't understand entirely, I'm going to do
-    ;; what whn does in x86/macros.lisp -- Christophe
     (ecase *backend-byte-order*
       (:little-endian
        `(inst ldub ,n-target ,n-source ,n-offset))
@@ -160,15 +158,15 @@
       ;; space.
 
       ;; Make sure the temp-tn is a non-descriptor register!
-      (assert (and ,temp-tn (sc-is ,temp-tn non-descriptor-reg)))
+      (aver (and ,temp-tn (sc-is ,temp-tn non-descriptor-reg)))
 
       ;; temp-tn is csp-tn rounded up to a multiple of 8 (lispobj size)
       (align-csp ,temp-tn)
       ;; For the benefit of future historians, this is how CMUCL does the
       ;; align-csp (I think their version is branch free only because
       ;; they simply don't worry about zeroing the pad word):
-      #+nil (inst add ,temp-tn csp-tn sb!vm:lowtag-mask)
-      #+nil (inst andn ,temp-tn sb!vm:lowtag-mask)
+      #+nil (inst add ,temp-tn csp-tn sb-vm:lowtag-mask)
+      #+nil (inst andn ,temp-tn sb-vm:lowtag-mask)
 
       ;; Set the result to temp-tn, with appropriate lowtag
       (inst or ,result-tn csp-tn ,lowtag)
@@ -205,7 +203,7 @@
      ;; it.
      #!+gencgc
      (t
-      (inst li ,temp-tn (make-fixup "boxed_region" :foreign))
+      (inst li ,temp-tn (make-fixup "gc_alloc_region" :foreign))
       (loadw ,result-tn ,temp-tn 0)     ;boxed_region.free_pointer
       (loadw ,temp-tn ,temp-tn 1)       ;boxed_region.end_addr
 
@@ -233,7 +231,7 @@
           ;; Kludge: We ought to have two distinct FLAG-TN and TEMP-TN
           ;; here, to avoid the SUB and the TEMP-TN reload which is
           ;; causing it.  PPC gets it right.
-          (inst li ,temp-tn (make-fixup "boxed_region" :foreign))
+          (inst li ,temp-tn (make-fixup "gc_alloc_region" :foreign))
           (storew ,result-tn ,temp-tn 0)
 
           (inst b done)
@@ -288,20 +286,15 @@
   (assemble ()
     (when vop
       (note-this-location vop :internal-error))
-    (inst unimp kind)
-    (inst byte code)
-    (encode-internal-error-args values)
+    (emit-internal-error kind code values
+                         :trap-emitter (lambda (tramp-number)
+                                         (inst unimp tramp-number)))
     (emit-alignment word-shift)))
-
-(defun error-call (vop error-code &rest values)
-  "Cause an error.  ERROR-CODE is the error to cause."
-  (emit-error-break vop error-trap (error-number-or-lose error-code) values))
-
 
 (defun generate-error-code (vop error-code &rest values)
   "Generate-Error-Code Error-code Value*
   Emit code for an error with the specified Error-Code and context Values."
-  (assemble (*elsewhere*)
+  (assemble (:elsewhere)
     (let ((start-lab (gen-label)))
       (emit-label start-lab)
       (apply #'error-call vop error-code values)

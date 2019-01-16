@@ -86,7 +86,8 @@
             ,@body)
        (ignore-errors (untrace ,name)))))
 
-(defun trace-this ()
+(defun trace-this (&optional arg)
+  (declare (ignore arg))
   'ok)
 
 (defun trace-fact (n)
@@ -100,21 +101,26 @@
     (assert (search "TRACE-THIS" output))
     (assert (search "returned OK" output))))
 
+(with-test (:name (trace :print-readably))
+  (let ((output (with-traced-function (trace-this)
+                  (let ((*print-readably* t))
+                    (assert (eq 'ok (trace-this (sb-int:make-unprintable-object "foo"))))))))
+    (assert (search "TRACE-THIS" output))
+    (assert (search "foo" output))
+    (assert (search "returned OK" output))))
+
 ;;; bug 379
-;;; This is not a WITH-TEST :FAILS-ON PPC DARWIN since there are
-;;; suspicions that the breakpoint trace might corrupt the whole image
-;;; on that platform.
 (with-test (:name (trace :encapsulate nil)
-            :fails-on '(or (and :ppc (not :linux)) :sparc :arm64)
-            :broken-on '(or :darwin :sunos :hppa))
+            :fails-on (or (and :ppc (not :linux)) :sparc :arm64)
+            :broken-on (or :sunos :hppa))
   (let ((output (with-traced-function (trace-this :encapsulate nil)
                   (assert (eq 'ok (trace-this))))))
     (assert (search "TRACE-THIS" output))
     (assert (search "returned OK" output))))
 
 (with-test (:name (:trace :encapsulate nil :recursive)
-            :fails-on '(or (and :ppc (not :linux)) :sparc :sunos :arm64)
-            :broken-on '(or :darwin (and :x86 :sunos) :hppa))
+            :fails-on (or (and :ppc (not :linux)) :sparc :sunos :arm64)
+            :broken-on (or (and :x86 :sunos) :hppa))
   (let ((output (with-traced-function (trace-fact :encapsulate nil)
                   (assert (= 120 (trace-fact 5))))))
     (assert (search "TRACE-FACT" output))
@@ -166,7 +172,7 @@
     (untrace)
     (assert (>= (count #\Newline (get-output-stream-string s)) 4))))
 
-(with-test (:name :bug-310175 :fails-on '(not :stack-allocatable-lists))
+(with-test (:name :bug-310175 :fails-on (not :stack-allocatable-lists))
   ;; KLUDGE: Not all DX-enabled platforms DX CONS, and the compiler
   ;; transforms two-arg-LIST* (and one-arg-LIST) to CONS.  Therefore,
   ;; use two-arg-LIST, which should get through to VOP LIST, and thus
@@ -239,7 +245,7 @@
   (test-infinite-error-protection))
 
 (with-test (:name (:infinite-error-protection :thread)
-                  :skipped-on '(not :sb-thread))
+                  :skipped-on (not :sb-thread))
   (enable-debugger)
   (let ((thread (sb-thread:make-thread #'test-infinite-error-protection)))
     (loop while (sb-thread:thread-alive-p thread))))
@@ -323,10 +329,7 @@
       (error "Missed: ~S" targets))
     (assert (not oops))))
 
-(with-test (:name (:debugger :source 1)
-            ;; Division is done by an assembly routine on ppc
-            ;; and it can't locate the div-by-zero error there
-            :fails-on :ppc)
+(with-test (:name (:debugger :source 1))
   (test-debugger
    "d
     source 0
@@ -417,19 +420,6 @@
     (let ((problems (get-output-stream-string oopses)))
       (unless (zerop (length problems))
         (error problems)))))
-
-;; The test named :GF-dispatch-backtrace depends on the fact that renaming
-;; a closure works, and that the debugger can extract a closure name.
-;; First things first: verify that a closure can be named.
-(defun make-adder (x)
-  (sb-impl::set-closure-name (lambda (y) (+ x y)) `(adder ,x)))
-(with-test (:name :closure-renaming-really-works)
-  (let ((f1 (make-adder 5))
-        (expect "#<CLOSURE (ADDER 5)"))
-    (assert (= (mismatch (write-to-string (make-adder 5)) expect)
-               (length expect)))
-    (assert (and (eq (sb-impl::set-closure-name f1 "ADD5") f1)
-                 (string= (sb-impl::%fun-name f1) "ADD5")))))
 
 (with-test (:name (:xep-arglist-clean-up :bug-1192929))
   (assert

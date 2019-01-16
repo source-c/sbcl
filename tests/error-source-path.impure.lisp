@@ -120,3 +120,90 @@
    (defmethod using-deprecated ((thing t))
      (progn (error-signalling-macro)))
    (1 3)))
+
+;;; In the following two tests, using 1 as the instance avoids
+;;; "undefined variable" noise. The strange "slot names" EVEN and ODD
+;;; stem from that (and would work with WITH-ACCESSORS).
+
+(with-test (:name (:source-path with-slots))
+  ;; instance sub-form
+  (assert-condition-source-paths
+   (with-slots (even) (the integer 1 2))
+   (2))
+  ;; slot-entry sub-forms
+  (assert-condition-source-paths
+   (with-slots (1) 1)
+   (1))
+  (assert-condition-source-paths
+   (with-slots (()) 1)
+   (1))
+  (assert-condition-source-paths
+   (with-slots ((even)) 1)
+   (0 1))
+  (assert-condition-source-paths
+   (with-slots ((even 1)) 1)
+   (0 1))
+  (assert-condition-source-paths
+   (with-slots ((even even) (odd odd 1)) 1)
+   (1 1)))
+
+(with-test (:name (:source-path with-accessors))
+  ;; instance sub-form
+  (assert-condition-source-paths
+   (with-accessors ((even evenp)) (the integer 1 2))
+   (2))
+  ;; slot-entry sub-forms
+  (assert-condition-source-paths
+   (with-accessors (1) 1)
+   (1))
+  (assert-condition-source-paths
+   (with-accessors (()) 1)
+   (1))
+  (assert-condition-source-paths
+   (with-accessors ((even)) 1)
+   (0 1))
+  (assert-condition-source-paths
+   (with-accessors ((even evenp) (odd oddp 1)) 1)
+   (1 1)))
+
+(with-test (:name (:source-path flet :unused))
+  (assert-condition-source-paths
+   (flet ((f ())))
+   (0 1)))
+
+(with-test (:name (:source-path flet :malformed))
+  (assert-condition-source-paths
+   (flet ((f)))
+   (0 1))
+  (assert-condition-source-paths
+   (flet #())
+   ()))
+
+(with-test (:name (:source-path labels :unused))
+  (assert-condition-source-paths
+   (labels ((f ())))
+   (0 1)))
+
+(with-test (:name (:source-path labels :malformed))
+  (assert-condition-source-paths
+   (labels ((f)))
+   (0 1))
+  (assert-condition-source-paths
+   (labels #())
+   ()))
+
+(with-test (:name (:source-path let :malformed))
+  (assert-condition-source-paths
+   (let ((x 1 2)))
+   (0 1))
+  (assert-condition-source-paths
+   (let #())
+   ()))
+
+(with-test (:name (:source-path let* :malformed))
+  (assert-condition-source-paths
+   (let* ((x 1 2)))
+   (0 1))
+  (assert-condition-source-paths
+   (let* #())
+   ()))

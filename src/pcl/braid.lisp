@@ -46,26 +46,39 @@
    :references '((:amop :generic-function allocate-instance)
                  (:amop :function set-funcallable-instance-function))))
 
-(defun allocate-standard-funcallable-instance (wrapper)
+(defun allocate-standard-funcallable-instance-immobile (wrapper name)
+  (allocate-standard-funcallable-instance wrapper name
+                                          #+(and compact-instance-header immobile-code) t))
+
+(defun allocate-standard-funcallable-instance (wrapper name &optional
+                                                              #+(and compact-instance-header immobile-code)
+                                                              immobile)
   (declare (layout wrapper))
-  (let* ((slots (make-array (layout-length wrapper) :initial-element +slot-unbound+))
+  (let* ((hash (if name
+                   (mix (sxhash name) (sxhash :generic-function)) ; arb. constant
+                   (sb-impl::new-instance-hash-code)))
+         (slots (make-array (layout-length wrapper) :initial-element +slot-unbound+))
          (fin (cond #+(and compact-instance-header immobile-code)
-                    ((not (eql (layout-bitmap wrapper) -1))
-                     (let ((f (truly-the funcallable-instance
-                               (sb-sys:%primitive sb-vm::alloc-generic-function slots))))
-                       ;; Set layout prior to writing raw slots
-                       (setf (%funcallable-instance-layout f) wrapper)
-                       (sb-vm::%set-fin-trampoline f)))
+                    ((and immobile
+                          (not (eql (layout-bitmap wrapper) -1)))
+                     (truly-the funcallable-instance
+                                (sb-vm::make-immobile-gf wrapper slots)))
                     (t
                      (let ((f (truly-the funcallable-instance
-                               (%make-standard-funcallable-instance
-                                slots
-                                #-compact-instance-header (sb-impl::new-instance-hash-code)))))
+                                         (%make-standard-funcallable-instance
+                                          slots
+                                          #-compact-instance-header hash))))
                        (setf (%funcallable-instance-layout f) wrapper)
                        f)))))
+    ;; Compact-instance-header uses the high 32 bits of the slot vector's
+    ;; header word. Mix down the full hash, then shift left 24 bits
+    ;; which when shifted by N-WIDETAG-BITS puts it in the upper 32.
+    ;; The contraint on size is that we must not touch the byte for immobile
+    ;; GC's generation. But, you might say, vector's don't go in immobile
+    ;; space. That's true for the time being, but might not be true always.
     #+compact-instance-header
-    (set-header-data slots
-                     (ash (logand (sb-impl::new-instance-hash-code) #xFFFFFFFF) 24))
+    (set-header-data slots (ash (ldb (byte 32 0) (logxor (ash hash -32) hash))
+                                24))
     (set-funcallable-instance-function
      fin
      #'(lambda (&rest args)
@@ -196,7 +209,9 @@
                                   (t
                                    (!boot-make-wrapper (length slots) name))))
                    (proto nil))
-              (set (make-class-symbol name) class)
+              (let ((symbol (make-class-symbol name)))
+                (when (eq (info :variable :kind symbol) :global)
+                  (set symbol class)))
               (dolist (slot slots)
                 (unless (eq (getf slot :allocation :instance) :instance)
                   (error "Slot allocation ~S is not supported in bootstrap."
@@ -206,7 +221,7 @@
                 (setf (layout-slot-list wrapper) slots))
 
               (setq proto (if (eq meta 'funcallable-standard-class)
-                              (allocate-standard-funcallable-instance wrapper)
+                              (allocate-standard-funcallable-instance wrapper name)
                               (allocate-standard-instance wrapper)))
 
               (setq direct-slots
@@ -274,15 +289,17 @@
         (funcall set-slot 'source nil)
         (funcall set-slot 'type-name 'standard)
         (funcall set-slot 'options '())
+        (funcall set-slot '%generic-functions (make-hash-table :weakness :key))
         (funcall set-slot '%documentation "The standard method combination.")
         (setq *standard-method-combination* method-combination))
-      ;; Create the OR method combination object.
+      ;; Create an OR method combination object.
       (multiple-value-bind (method-combination set-slot)
           (make-method-combination 'short-method-combination)
         (funcall set-slot 'source 'nil)
         (funcall set-slot 'type-name 'or)
         (funcall set-slot 'operator 'or)
         (funcall set-slot 'identity-with-one-argument t)
+        (funcall set-slot '%generic-functions (make-hash-table :weakness :key))
         (funcall set-slot '%documentation nil)
         (funcall set-slot 'options '(:most-specific-first))
         (setq *or-method-combination* method-combination)))))
@@ -489,7 +506,7 @@
                                      :slot-name slot-name
                                      :object-class class-name
                                      :method-class-function (constantly (find-class accessor-class))
-                                     :definition-source source-location))))))
+                                     'source source-location))))))
 
 (defun !bootstrap-accessor-definitions1 (class-name
                                          slot-name
@@ -551,7 +568,6 @@
         (let* ((class (find-class name))
                (lclass (find-classoid name))
                (wrapper (classoid-layout lclass)))
-          (set (get-built-in-class-symbol name) class)
           (setf (classoid-pcl-class lclass) class)
 
           (!bootstrap-initialize-class 'built-in-class class
@@ -618,7 +634,7 @@
 
 (defun !make-class-predicate (class name source-location)
   (let* ((gf (ensure-generic-function name :lambda-list '(object)
-                                      :definition-source source-location))
+                                      'source source-location))
          (mlist (if (eq **boot-state** 'complete)
                     (early-gf-methods gf)
                     (generic-function-methods gf))))
@@ -702,36 +718,66 @@
 
 (setq **boot-state** 'braid)
 
-(defmethod no-applicable-method (generic-function &rest args)
-  (error "~@<There is no applicable method for the generic function ~2I~_~S~
-          ~I~_when called with arguments ~2I~_~S.~:>"
-         generic-function
-         args))
+(define-condition effective-method-condition (reference-condition)
+  ((generic-function :initarg :generic-function
+                     :reader effective-method-condition-generic-function)
+   (method :initarg :method :initform nil
+           :reader effective-method-condition-method)
+   (args :initarg :args
+         :reader effective-method-condition-args))
+  (:default-initargs
+   :generic-function (missing-arg)
+   :args (missing-arg)))
 
+(define-condition effective-method-error (error
+                                          effective-method-condition)
+  ((problem :initarg :problem :reader effective-method-error-problem))
+  (:default-initargs :problem (missing-arg))
+  (:report
+   (lambda (condition stream)
+     (format stream "~@<~A for the generic function ~2I~_~S ~I~_when ~
+                     called ~@[from method ~2I~_~S~I~_~]with arguments ~
+                     ~2I~_~S.~:>"
+             (effective-method-error-problem condition)
+             (effective-method-condition-generic-function condition)
+             (effective-method-condition-method condition)
+             (effective-method-condition-args condition)))))
+
+(define-condition no-applicable-method-error (effective-method-error)
+  ()
+  (:default-initargs
+   :problem "There is no applicable method"
+   :references '((:ansi-cl :section (7 6 6)))))
+(defmethod no-applicable-method (generic-function &rest args)
+  (error 'no-applicable-method-error
+         :generic-function generic-function
+         :args args))
+
+(define-condition no-next-method-error (effective-method-error)
+  ()
+  (:default-initargs
+   :problem "There is no next method"
+   :references '((:ansi-cl :section (7 6 6 2)))))
 (defmethod no-next-method ((generic-function standard-generic-function)
                            (method standard-method) &rest args)
-  (error "~@<There is no next method for the generic function ~2I~_~S~
-          ~I~_when called from method ~2I~_~S~I~_with arguments ~2I~_~S.~:>"
-         generic-function
-         method
-         args))
+  (error 'no-next-method-error
+         :generic-function generic-function
+         :method method
+         :args args))
 
 ;;; An extension to the ANSI standard: in the presence of e.g. a
 ;;; :BEFORE method, it would seem that going through
 ;;; NO-APPLICABLE-METHOD is prohibited, as in fact there is an
 ;;; applicable method.  -- CSR, 2002-11-15
-(define-condition no-primary-method (reference-condition error)
-  ((generic-function :initarg :generic-function :reader no-primary-method-generic-function)
-   (args :initarg :args :reader no-primary-method-args))
-  (:report
-   (lambda (c s)
-     (format s "~@<There is no primary method for the generic function ~2I~_~S~
-                ~I~_when called with arguments ~2I~_~S.~:>"
-             (no-primary-method-generic-function c)
-             (no-primary-method-args c))))
-  (:default-initargs :references '((:ansi-cl :section (7 6 6 2)))))
+(define-condition no-primary-method-error (effective-method-error)
+  ()
+  (:default-initargs
+   :problem "There is no primary method"
+   :references '((:ansi-cl :section (7 6 6 2)))))
 (defmethod no-primary-method (generic-function &rest args)
-  (error 'no-primary-method :generic-function generic-function :args args))
+  (error 'no-primary-method-error
+         :generic-function generic-function
+         :args args))
 
 ;; FIXME shouldn't this specialize on STANDARD-METHOD-COMBINATION?
 (defmethod invalid-qualifiers ((gf generic-function)

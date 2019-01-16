@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (define-move-fun (load-immediate 1) (vop x y)
   ((null zero immediate)
@@ -139,7 +139,7 @@
   (:results (y :scs (signed-reg unsigned-reg)))
   (:note "constant load")
   (:generator 1
-    (cond ((sb!c::tn-leaf x)
+    (cond ((sb-c::tn-leaf x)
            (inst li (tn-value x) y))
           (t
            (loadw y code-tn (tn-offset x) other-pointer-lowtag)
@@ -221,6 +221,32 @@
     DONE))
 (define-move-vop move-from-signed :move
   (signed-reg) (descriptor-reg))
+
+(define-vop (move-from-fixnum+1)
+  (:args (x :scs (signed-reg unsigned-reg)))
+  (:results (y :scs (any-reg descriptor-reg)))
+  (:temporary (:scs (non-descriptor-reg)) temp)
+  (:vop-var vop)
+  (:generator 4
+    (inst sra x n-positive-fixnum-bits temp)
+    (inst sll x n-fixnum-tag-bits y)
+    (inst beq temp done)
+    (inst not temp temp)
+    (inst beq temp done)
+    (load-constant vop (emit-constant (1+ sb-xc:most-positive-fixnum))
+                   y)
+    DONE))
+
+(define-vop (move-from-fixnum-1 move-from-fixnum+1)
+  (:generator 4
+    (inst sra x n-positive-fixnum-bits temp)
+    (inst sll x n-fixnum-tag-bits y)
+    (inst beq temp done)
+    (inst not temp temp)
+    (inst beq temp done)
+    (load-constant vop (emit-constant (1- sb-xc:most-negative-fixnum))
+                   y)
+    DONE))
 
 ;;; Check for fixnum, and possibly allocate one or two word bignum
 ;;; result. Use a worst-case cost to make sure people know they may be

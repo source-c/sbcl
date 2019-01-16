@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 (define-optimization-quality check-constant-modification
     safety
@@ -112,9 +112,9 @@ This option has no effect without COMPUTE-DEBUG-FUN.")
     debug
   ("minimal" "yes" "yes" "yes"))
 
-(define-optimization-quality eval-store-source-form
+(define-optimization-quality store-source-form
     debug
-  ("no" "yes" "yes" "yes"))
+  ("no" "maybe" "yes" "yes"))
 
 (define-optimization-quality preserve-single-use-debug-variables
     (if (and (>= debug 2)
@@ -142,6 +142,10 @@ debugger.")
 
 (define-optimization-quality store-coverage-data
     0
+  ("no" "no" "yes" "yes"))
+
+(define-optimization-quality instrument-consing
+    1
   ("no" "no" "yes" "yes"))
 
 #!+sb-safepoint
@@ -180,6 +184,3 @@ compiled with this declaration in effect.")
 (define-optimization-quality allow-non-returning-tail-call
     0
   ("no" "no" "no" "yes"))
-
-;;; On the cross-compilation host, we initialize at load time
-#+sb-xc-host (!policy-cold-init-or-resanify)

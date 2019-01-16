@@ -10,10 +10,10 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
-(declaim (special sb!debug:*in-the-debugger*
-                  sb!debug:*stack-top-hint*
+(declaim (special sb-debug:*in-the-debugger*
+                  sb-debug:*stack-top-hint*
                   *handler-clusters*
                   *restart-clusters*
                   *gc-inhibit* *gc-pending*
@@ -23,5 +23,5 @@
 ;;; (To prove that it isn't used, it's not a toplevel form)
 #!+(and sb-dynamic-core (host-feature sb-xc))
 (let ()
-  (defconstant sb!vm::+required-foreign-symbols+
-    (symbol-value 'sb!vm::+required-foreign-symbols+)))
+  (defconstant sb-vm::+required-foreign-symbols+
+    (symbol-value 'sb-vm::+required-foreign-symbols+)))

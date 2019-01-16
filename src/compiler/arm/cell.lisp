@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; Data object ref/set stuff.
 
@@ -136,7 +136,7 @@
   (:results (result :scs (descriptor-reg)))
   (:generator 38
     (let ((closure-tramp-fixup (gen-label)))
-      (assemble (*elsewhere*)
+      (assemble (:elsewhere)
         (emit-label closure-tramp-fixup)
         (inst word (make-fixup 'closure-tramp :assembly-routine)))
       (load-type type function (- fun-pointer-lowtag))
@@ -156,7 +156,7 @@
   (:results (result :scs (descriptor-reg)))
   (:generator 38
     (let ((undefined-tramp-fixup (gen-label)))
-      (assemble (*elsewhere*)
+      (assemble (:elsewhere)
         (emit-label undefined-tramp-fixup)
         (inst word (make-fixup 'undefined-tramp :assembly-routine)))
       (storew null-tn fdefn fdefn-fun-slot other-pointer-lowtag)
@@ -242,11 +242,19 @@
   funcallable-instance-info-offset fun-pointer-lowtag
   (descriptor-reg any-reg) * %funcallable-instance-info)
 
-(define-vop (closure-ref slot-ref)
-  (:variant closure-info-offset fun-pointer-lowtag))
+(define-vop (closure-ref)
+  (:args (object :scs (descriptor-reg)))
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:info offset)
+  (:generator 4
+    (loadw value object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
-(define-vop (closure-init slot-set)
-  (:variant closure-info-offset fun-pointer-lowtag))
+(define-vop (closure-init)
+  (:args (object :scs (descriptor-reg))
+         (value :scs (descriptor-reg any-reg)))
+  (:info offset)
+  (:generator 4
+    (storew value object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
 (define-vop (closure-init-from-fp)
   (:args (object :scs (descriptor-reg)))

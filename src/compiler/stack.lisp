@@ -15,7 +15,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; Scan through BLOCK looking for uses of :UNKNOWN lvars that have
 ;;; their DEST outside of the block. We do some checking to verify the
@@ -46,6 +46,10 @@
   (values))
 
 ;;;; Computation of live UVL sets
+(defun nle-block-p (block)
+  (and (eq (component-head (block-component block))
+           (first (block-pred block)))
+       (not (bind-p (block-start-node block)))))
 (defun nle-block-nlx-info (block)
   (let* ((start-node (block-start-node block))
          (nlx-ref (ctran-next (node-next start-node)))
@@ -93,32 +97,77 @@
   ;; over an arbitrarily complex chunk of flow graph that is known to
   ;; have a single entry block.
   (let* ((use-blocks (mapcar #'node-block (find-uses dx-lvar)))
+         (flag use-blocks) ;; for block-flag, no need to clear-flags, as it's fresh
+         (cycle (list :cycle))
+         (nlx (list :nlx))
+         ;; We have to back-propagate not just the DX-LVAR, but every
+         ;; UVL or DX LVAR that is live wherever DX-LVAR is USEd
+         ;; (allocated) because we can't move live DX-LVARs to release
+         ;; them.
+         (preserve-lvars (reduce #'merge-uvl-live-sets
+                                 use-blocks
+                                 :key (lambda (block)
+                                        (let ((2block (block-info block)))
+                                          (merge-uvl-live-sets
+                                           (ir2-block-end-stack 2block)
+                                           (ir2-block-pushed 2block))))))
          (start-block (find-lowest-common-dominator
                        (list* block use-blocks))))
-    (labels ((mark-lvar-live-on-path (arc-list)
-               (dolist (arc arc-list)
-                 (let ((2block (block-info (car arc))))
-                   (pushnew dx-lvar (ir2-block-end-stack 2block))
-                   (pushnew dx-lvar (ir2-block-start-stack 2block)))))
-             (back-propagate-pathwise (current-block path)
+    (labels ((revisit-cycles (block)
+               (dolist (succ (block-succ block))
+                 (when (eq (block-flag succ) cycle)
+                   (mark succ)))
+               (when (eq (block-out block) nlx)
+                 (map-block-nlxes
+                  (lambda (nlx)
+                    (let ((target (nlx-info-target nlx)))
+                      (when (eq (block-flag target) cycle)
+                        (mark target))))
+                  block)))
+             (mark (block)
+               (let ((2block (block-info block)))
+                 (unless (eq (block-flag block) flag)
+                   (setf (block-flag block) flag)
+                   (setf (ir2-block-end-stack 2block)
+                         (merge-uvl-live-sets
+                          preserve-lvars
+                          (ir2-block-end-stack 2block)))
+                   (setf (ir2-block-start-stack 2block)
+                         (merge-uvl-live-sets
+                          preserve-lvars
+                          (ir2-block-start-stack 2block)))
+                   (revisit-cycles block))))
+             (back-propagate-pathwise (current-block)
                (cond
                  ((member current-block use-blocks)
                   ;; The LVAR is live on exit from a use-block, but
                   ;; not on entry.
                   (pushnew dx-lvar (ir2-block-end-stack
                                     (block-info current-block)))
-                  (mark-lvar-live-on-path path))
+                  t)
+                 ((eq (block-flag current-block) flag)
+                  t)
+                 ((eq (block-flag current-block) cycle))
                  ;; Don't go back past START-BLOCK.
                  ((not (eq current-block start-block))
-                  (dolist (pred-block (block-pred current-block))
-                    (let ((new-arc (cons current-block pred-block)))
-                      (declare (dynamic-extent new-arc))
-                      ;; Never follow the same path segment twice.
-                      (unless (member new-arc path :test #'equal)
-                        (let ((new-path (list* new-arc path)))
-                          (declare (dynamic-extent new-path))
-                          (back-propagate-pathwise pred-block new-path)))))))))
-      (back-propagate-pathwise block nil))))
+                  (setf (block-flag current-block) cycle)
+                  (let (marked)
+                    (dolist (pred-block (if (nle-block-p current-block)
+                                            ;; Follow backwards through
+                                            ;; NLEs to the start of
+                                            ;; their environment
+                                            (let ((entry-block (nle-block-entry-block current-block)))
+                                              ;; Mark for later if
+                                              ;; revisit-cycles needs
+                                              ;; to go back from here.
+                                              (setf (block-out entry-block) nlx)
+                                              (list* entry-block (block-pred current-block)))
+                                            (block-pred current-block)))
+                      (when (back-propagate-pathwise pred-block)
+                        (mark current-block)
+                        (setf marked t)))
+                    marked)))))
+      (back-propagate-pathwise block))))
 
 (defun back-propagate-dx-lvars (block dx-lvars)
   (declare (type cblock block)
@@ -185,8 +234,6 @@
     ;; environment) then we need to back-propagate the DX LVARs to
     ;; their allocation sites.  We need to be clever about this
     ;; because some code paths may not allocate all of the DX LVARs.
-    ;;
-    ;; FIXME: Use BLOCK-FLAG to make this happen only once.
     (let ((first-node (ctran-next (block-start block))))
       (when (typep first-node 'entry)
         (let ((cleanup (entry-cleanup first-node)))
@@ -208,9 +255,7 @@
       ;;
       ;; TODO: Insert a check that no values are discarded in UWP. Or,
       ;; maybe, we just don't need to create NLX-ENTRY for UWP?
-      (when (and (eq (component-head (block-component block))
-                     (first (block-pred block)))
-                 (not (bind-p (block-start-node block))))
+      (when (nle-block-p block)
         (let* ((nlx-info (nle-block-nlx-info block))
                (cleanup (nlx-info-cleanup nlx-info)))
           (unless (eq (cleanup-kind cleanup) :unwind-protect)
@@ -401,7 +446,7 @@
         (discard end-stack pruned-start-stack)
         (dummy-allocations pruned-start-stack start-stack)
         (when (cleanup-code)
-          (let* ((block (insert-cleanup-code block1 block2
+          (let* ((block (insert-cleanup-code (list block1) block2
                                              (block-start-node block2)
                                              `(progn ,@(cleanup-code))))
                  (2block (make-ir2-block block)))

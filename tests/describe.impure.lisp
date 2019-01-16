@@ -11,22 +11,23 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(load "assertoid.lisp")
-(load "test-util.lisp")
-(use-package "ASSERTOID")
-(use-package "TEST-UTIL")
-
 (defmacro assert-non-empty-output (&body forms)
   `(assert (plusp (length (with-output-to-string (*standard-output*)
                             ,@forms)))))
 
 (defstruct to-be-described a b)
+
 (defclass forward-describe-class (forward-describe-ref) (a))
+
+(defclass non-standard-generic-function (generic-function) ()
+  (:metaclass sb-mop:funcallable-standard-class))
+(defmethod sb-mop:generic-function-name ((generic-function non-standard-generic-function))
+  'name)
 
 (with-test (:name (describe :empty-gf))
   (assert-no-signal
    (assert-non-empty-output
-    (describe (make-instance 'generic-function)))
+    (describe (make-instance 'non-standard-generic-function)))
    warning)
   (assert-signal
    (assert-non-empty-output
@@ -111,6 +112,18 @@
   (assert (search "Argument precedence order"
                   (with-output-to-string (stream)
                     (describe #'add-method stream)))))
+
+(defun lottafun (x y z &rest r &key ((:wat w)) glup)
+  (declare (dynamic-extent glup z r w x))
+  (declare (ignore x y z r w glup))
+  (print 'hi))
+
+(with-test (:name (describe :fun-dx-args))
+  ;; though R is DX, it is not useful information to show,
+  ;; because the caller doesn't decide how to allocate the &rest list.
+  (assert (search "Dynamic-extent arguments: positional=(0 2), keyword=(:WAT :GLUP)"
+                  (with-output-to-string (stream)
+                    (describe #'lottafun stream)))))
 
 (with-test (:name (describe sb-kernel:funcallable-instance))
   (assert (search "Slots with :INSTANCE allocation"

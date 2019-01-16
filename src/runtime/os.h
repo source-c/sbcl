@@ -20,11 +20,7 @@
 #include "sbcl.h"
 #include "runtime.h"
 
-#ifdef LISP_FEATURE_RELOCATABLE_HEAP
-extern uword_t DYNAMIC_SPACE_START;
-extern uword_t IMMOBILE_SPACE_START, IMMOBILE_VARYOBJ_SUBSPACE_START;
-#endif
-#define IMMOBILE_SPACE_END (IMMOBILE_SPACE_START+IMMOBILE_SPACE_SIZE)
+#include <inttypes.h>
 
 #if defined(LISP_FEATURE_GENCGC) && !defined(ENABLE_PAGE_PROTECTION)
 /* Should we use page protection to help avoid the scavenging of pages
@@ -70,6 +66,13 @@ extern uword_t IMMOBILE_SPACE_START, IMMOBILE_VARYOBJ_SUBSPACE_START;
 
 extern os_vm_size_t os_vm_page_size;
 
+#if (defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)) \
+  || defined(LISP_FEATURE_LINUX)
+boolean os_preinit(char *argv[], char *envp[]);
+#else
+#define os_preinit(dummy1,dummy2) (0)
+#endif
+
 /* Do anything we need to do when starting up the runtime environment
  * in this OS. */
 extern void os_init(char *argv[], char *envp[]);
@@ -92,10 +95,14 @@ extern void os_zero(os_vm_address_t addr, os_vm_size_t length);
 
 /* Allocate 'len' bytes at 'addr',
  * or at an OS-chosen address if 'addr' is zero.
- * If 'movable' then 'addr' is a preference, not a requirement. */
-#define NOT_MOVABLE 0
-#define MOVABLE 1
-#define MOVABLE_LOW 2
+ * If 'movable' then 'addr' is a preference, not a requirement.
+ * These are discrete bits, not opaque enumerated values.
+ * i.e. the consuming code might test via either (x & bit)
+ * or (x == bit) depending on the use-case */
+#define NOT_MOVABLE      0
+#define MOVABLE          1
+#define MOVABLE_LOW      2
+#define IS_THREAD_STRUCT 4
 extern os_vm_address_t os_validate(int movable,
                                    os_vm_address_t addr,
                                    os_vm_size_t len);
@@ -129,7 +136,9 @@ extern void os_protect(os_vm_address_t addr,
 
 /* Return true for an address (with or without lowtag bits) within
  * any range of memory understood by the garbage collector. */
-extern boolean gc_managed_addr_p(lispobj test);
+extern boolean gc_managed_addr_p(lispobj addr);
+/* As for above, but consider only the heap spaces, not stacks */
+extern boolean gc_managed_heap_space_p(lispobj addr);
 
 /* Given a signal context, return the address for storage of the
  * register, of the specified offset, for that context. The offset is
@@ -172,18 +181,13 @@ sigset_t *os_context_sigmask_addr(os_context_t *context);
 extern os_vm_address_t os_allocate(os_vm_size_t len);
 extern void os_deallocate(os_vm_address_t addr, os_vm_size_t len);
 
-/* FIXME: The os_trunc_foo(..) and os_round_foo(..) macros here could
- * be functions. */
-
-#define os_trunc_to_page(addr) \
-    (os_vm_address_t)(((uword_t)(addr))&~(os_vm_page_size-1))
-#define os_round_up_to_page(addr) \
-    os_trunc_to_page((addr)+(os_vm_page_size-1))
+#define os_trunc_to_page(addr) PTR_ALIGN_DOWN(addr, os_vm_page_size)
+#define os_round_up_to_page(addr) PTR_ALIGN_UP(addr, os_vm_page_size)
 
 #define os_trunc_size_to_page(size) \
-    (os_vm_size_t)(((uword_t)(size))&~(os_vm_page_size-1))
+    (os_vm_size_t)ALIGN_DOWN((uword_t)size, os_vm_page_size)
 #define os_round_up_size_to_page(size) \
-    os_trunc_size_to_page((size)+(os_vm_page_size-1))
+    (os_vm_size_t)ALIGN_UP((uword_t)size, os_vm_page_size)
 
 /* KLUDGE: The errno error reporting system is an ugly nonreentrant
  * botch which nonetheless wasn't too painful in the old days.
@@ -205,18 +209,8 @@ extern char *os_get_runtime_executable_path(int external_path);
 
 /* Write platforms specific ones when necessary. This is to get us off
  * the ground. */
-#if N_WORD_BITS == 32
-# define OS_VM_SIZE_FMT "u"
-# define OS_VM_SIZE_FMTX "x"
-#else
-#if defined(LISP_FEATURE_SB_WIN32)
-# define OS_VM_SIZE_FMT "Iu"
-# define OS_VM_SIZE_FMTX "Ix"
-#else
-# define OS_VM_SIZE_FMT "lu"
-# define OS_VM_SIZE_FMTX "lx"
-#endif
-#endif
+#define OS_VM_SIZE_FMT PRIuPTR
+#define OS_VM_SIZE_FMTX PRIxPTR
 
 #ifdef LISP_FEATURE_SB_THREAD
 #  ifndef CANNOT_USE_POSIX_SEM_T

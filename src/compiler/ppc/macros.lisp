@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; Instruction-like macros.
 
@@ -42,7 +42,7 @@
                                           "SYMBOL-"
                                           (string slot)
                                           "-SLOT")
-                             (find-package "SB!VM"))))
+                             (find-package "SB-VM"))))
          `(progn
             (defmacro ,loader (reg symbol)
               `(inst lwz ,reg null-tn
@@ -209,7 +209,7 @@
               (move ,temp-tn ,size)))
 
        #!-sb-thread
-       (inst lr ,flag-tn (make-fixup "boxed_region" :foreign))
+       (inst lr ,flag-tn (make-fixup "gc_alloc_region" :foreign))
        #!-sb-thread
        (inst lwz ,result-tn ,flag-tn 0)
        #!+sb-thread
@@ -218,7 +218,7 @@
 
        ;; we can optimize this to only use one fixup here, once we get
        ;; it working
-       ;; (inst lr ,flag-tn (make-fixup "boxed_region" :foreign 4))
+       ;; (inst lr ,flag-tn (make-fixup "gc_alloc_region" :foreign 4))
        ;; (inst lwz ,flag-tn ,flag-tn 0)
        #!-sb-thread
        (inst lwz ,flag-tn ,flag-tn 4)
@@ -247,7 +247,7 @@
          ;; #!-sb-thread three #!+sb-thread one machine instruction.
          ;; The lr of a fixup counts as two instructions.
          #!-sb-thread
-         (inst lr ,flag-tn (make-fixup "boxed_region" :foreign))
+         (inst lr ,flag-tn (make-fixup "gc_alloc_region" :foreign))
          #!-sb-thread
          (inst stw ,result-tn ,flag-tn 0)
          #!+sb-thread
@@ -304,19 +304,15 @@
   (assemble ()
     (when vop
       (note-this-location vop :internal-error))
-    (inst unimp kind)
-    (inst byte code)
-    (encode-internal-error-args values)
+    (emit-internal-error kind code values
+                         :trap-emitter (lambda (tramp-number)
+                                         (inst unimp tramp-number)))
     (emit-alignment word-shift)))
-
-(defun error-call (vop error-code &rest values)
-  "Cause an error.  ERROR-CODE is the error to cause."
-  (emit-error-break vop error-trap (error-number-or-lose error-code) values))
 
 (defun generate-error-code (vop error-code &rest values)
   "Generate-Error-Code Error-code Value*
   Emit code for an error with the specified Error-Code and context Values."
-  (assemble (*elsewhere*)
+  (assemble (:elsewhere)
     (let ((start-lab (gen-label)))
       (emit-label start-lab)
       (emit-error-break vop error-trap (error-number-or-lose error-code) values)
@@ -360,4 +356,4 @@
 
 #!+sb-safepoint
 (defun emit-safepoint ()
-  (inst lwz zero-tn null-tn (- (+ 4096 4 other-pointer-lowtag))))
+  (inst lwz zero-tn null-tn (- (+ gc-safepoint-trap-offset n-word-bytes other-pointer-lowtag))))

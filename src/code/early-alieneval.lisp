@@ -7,9 +7,11 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!ALIEN")
+(in-package "SB-ALIEN")
 
 (defglobal *alien-type-classes* (make-hash-table :test 'eq))
+
+(!define-thread-local *saved-fp* nil)
 
 (defvar *new-auxiliary-types* nil)
 
@@ -30,12 +32,15 @@
 (defvar *default-c-string-external-format* nil)
 
 (defmacro define-alien-type-translator (name lambda-list &body body)
-  (let ((defun-name (symbolicate "ALIEN-" name "-TYPE-TRANSLATOR")))
-    `(eval-when (:compile-toplevel :load-toplevel :execute)
-       (setf (symbol-function ',defun-name)
-             ,(make-macro-lambda defun-name lambda-list body
-                                 'define-alien-type-translator name))
-       (%define-alien-type-translator ',name #',defun-name))))
+  (let ((defun-name (symbolicate "ALIEN-" name "-TYPE-TRANSLATOR"))
+        (macro-lambda
+         (make-macro-lambda nil lambda-list body
+                            'define-alien-type-translator name)))
+    `(progn
+       (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
+         (defun ,defun-name ,(second macro-lambda) ,@(cddr macro-lambda)))
+       (eval-when (:compile-toplevel :load-toplevel :execute)
+         (%define-alien-type-translator ',name #',defun-name)))))
 
 ;;; Process stuff in a new scope.
 (defmacro with-auxiliary-alien-types (env &body body)
@@ -54,9 +59,9 @@
       `(eval-when (:compile-toplevel :load-toplevel :execute)
          ,@(when *new-auxiliary-types*
              `((%def-auxiliary-alien-types ',*new-auxiliary-types*
-                                           (sb!c:source-location))))
+                                           (sb-c:source-location))))
          ,@(when name
-             `((%define-alien-type ',name ',alien-type (sb!c:source-location))))))))
+             `((%define-alien-type ',name ',alien-type (sb-c:source-location))))))))
 
 (defstruct (alien-type-class (:copier nil))
   (name nil :type symbol)

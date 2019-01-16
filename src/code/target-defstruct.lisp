@@ -7,29 +7,18 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 (/show0 "target-defstruct.lisp 12")
 
 ;;;; structure frobbing primitives
 
-;;; Allocate a new instance with LENGTH data slots.
-(defun %make-instance (length)
-  (declare (type index length))
-  (%make-instance length))
-
-;;; Given an instance, return its length.
-(defun %instance-length (instance)
-  (declare (type instance instance))
-  (%instance-length instance))
-
 ;;; Return the value from the INDEXth slot of INSTANCE. This is SETFable.
+;;; This is used right away in warm compile by MAKE-LOAD-FORM-SAVING-SLOTS,
+;;; so without it already defined, you can't define it, because you can't dump
+;;; debug info structures. Were it not for that, this would go in 'stubs'.
 (defun %instance-ref (instance index)
   (%instance-ref instance index))
-
-;;; Set the INDEXth slot of INSTANCE to NEW-VALUE.
-(defun %instance-set (instance index new-value)
-  (setf (%instance-ref instance index) new-value))
 
 ;;; Normally IR2 converted, definition needed for interpreted structure
 ;;; constructors only.
@@ -43,7 +32,7 @@
       (destructuring-bind (kind raw-type . index) spec
         (if (eq kind :unbound)
             (setf (%instance-ref instance index)
-                  (sb!sys:%primitive make-unbound-marker))
+                  (sb-sys:%primitive make-unbound-marker))
             (macrolet ((make-case ()
                            `(ecase raw-type
                               ((t)
@@ -59,35 +48,12 @@
                   (incf value-index)
                   (make-case))))))))
 
-(defun %instance-layout (instance)
-  (%instance-layout instance))
-
-(defun %set-instance-layout (instance new-value)
-  (%set-instance-layout instance new-value))
-
-(defun %make-funcallable-instance (len)
-  (%make-funcallable-instance len))
-
-(defun funcallable-instance-p (x)
-  (funcallable-instance-p x))
-
-(defun %funcallable-instance-info (fin i)
-  (%funcallable-instance-info fin i))
-
-(defun %set-funcallable-instance-info (fin i new-value)
-  (%set-funcallable-instance-info fin i new-value))
-
-(defun funcallable-instance-fun (fin)
-  (%funcallable-instance-function fin))
-
-(defun (setf funcallable-instance-fun) (new-value fin)
-  (setf (%funcallable-instance-function fin) new-value))
 
 ;;;; target-only parts of the DEFSTRUCT top level code
 
 ;;; A list of hooks designating functions of one argument, the
 ;;; classoid, to be called when a defstruct is evaluated.
-(!defvar *defstruct-hooks* nil)
+(!define-load-time-global *defstruct-hooks* nil)
 
 ;;; the part of %DEFSTRUCT which makes sense only on the target SBCL
 ;;;
@@ -98,7 +64,7 @@
   (progn (write `(%target-defstruct ,(dd-name dd))) (terpri))
 
   (when (dd-doc dd)
-    (setf (fdocumentation (dd-name dd) 'structure)
+    (setf (documentation (dd-name dd) 'structure)
           (dd-doc dd)))
 
   (let* ((classoid (find-classoid (dd-name dd)))
@@ -122,21 +88,21 @@
               (let ((comparators
                      ;; If data-start is 1, subtract 1 because we don't need
                      ;; a comparator for the LAYOUT slot.
-                     (make-array (- (dd-length dd) sb!vm:instance-data-start)
+                     (make-array (- (dd-length dd) sb-vm:instance-data-start)
                                  :initial-element nil)))
                 (dolist (slot (dd-slots dd) comparators)
                   ;; -1 because LAYOUT (slot index 0) has no comparator stored.
                   (setf (aref comparators
-                              (- (dsd-index slot) sb!vm:instance-data-start))
+                              (- (dsd-index slot) sb-vm:instance-data-start))
                         (let ((rsd (dsd-raw-slot-data slot)))
                           (if (not rsd)
                               0 ; means recurse using EQUALP
-                              (raw-slot-data-comparer rsd))))))))
+                              (raw-slot-data-comparator rsd))))))))
 
     (dolist (fun *defstruct-hooks*)
       (funcall fun classoid)))
 
-  (values))
+  (dd-name dd))
 
 ;;; Copy any old kind of structure.
 (defun copy-structure (structure)
@@ -160,7 +126,7 @@
         ;; On backends which don't segregate descriptor vs. non-descriptor
         ;; registers, we could speed up this code in an obvious way.
         (macrolet ((copy-loop (tagged-p &optional step)
-                     `(do ((i sb!vm:instance-data-start (1+ i)))
+                     `(do ((i sb-vm:instance-data-start (1+ i)))
                           ((>= i len))
                         (declare (index i))
                         (if ,tagged-p
@@ -185,10 +151,12 @@
 ;;; - it works even if the user clobbered an accessor
 ;;; - it works if the slot fails a type-check and the reader was SAFE-P,
 ;;    i.e. was required to perform a check. This is a feature, not a bug.
-(macrolet ((access-fn (dsd)
-             `(acond ((dsd-raw-slot-data ,dsd)
-                      (symbol-function (raw-slot-data-accessor-name it)))
-                     (t #'%instance-ref))))
+(macrolet ((access (dsd)
+             `(let ((i (dsd-index ,dsd)))
+                (acond ((dsd-raw-slot-data ,dsd)
+                        (funcall (raw-slot-data-accessor-fun it) structure i))
+                       (t
+                        (%instance-ref structure i))))))
 
 (defun %default-structure-pretty-print (structure stream name dd)
   (pprint-logical-block (stream nil :prefix "#S(" :suffix ")")
@@ -204,8 +172,7 @@
                 (output-symbol (dsd-name slot) *keyword-package* stream)
                 (write-char #\space stream)
                 (pprint-newline :miser stream)
-                (output-object (funcall (access-fn slot) structure (dsd-index slot))
-                               stream)
+                (output-object (access slot) stream)
                 (when (null remaining-slots)
                   (return))
                 (write-char #\space stream)
@@ -226,8 +193,7 @@
       (let ((slot (first remaining-slots)))
         (output-symbol (dsd-name slot) *keyword-package* stream)
         (write-char #\space stream)
-        (output-object (funcall (access-fn slot) structure (dsd-index slot))
-                       stream)))))
+        (output-object (access slot) stream)))))
 ) ; end MACROLET
 
 (defun default-structure-print (structure stream depth)
@@ -263,5 +229,24 @@
 
 (defmethod print-object ((x structure-object) stream)
   (default-structure-print x stream *current-level-in-print*))
+
+;;; Used internally, but it would be nice to provide something
+;;; like this for users as well.
+(defmacro define-structure-slot-addressor (name &key structure slot)
+  (let* ((dd (find-defstruct-description structure t))
+         (slotd (or (and dd (find slot (dd-slots dd) :key #'dsd-name))
+                    (error "Slot ~S not found in ~S." slot structure)))
+         (index (dsd-index slotd)))
+    `(progn
+       (declaim (inline ,name))
+       (defun ,name (instance)
+         (declare (type ,structure instance) (optimize speed))
+         (truly-the
+          word
+          (+ (get-lisp-obj-address instance)
+             ,(+ (- sb-vm:instance-pointer-lowtag)
+                 (* (+ sb-vm:instance-slots-offset index)
+                    sb-vm:n-word-bytes))))))))
+
 
 (/show0 "target-defstruct.lisp end of file")

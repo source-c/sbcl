@@ -9,8 +9,6 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(load "assertoid.lisp")
-(use-package '#:assertoid)
 
 ;;;; Helpers
 
@@ -332,7 +330,7 @@
               :final)))
 
 (with-test (:name (:late-deprecated-fun-doc :bug-1439151)
-                  :skipped-on '(not :sb-doc))
+                  :skipped-on (not :sb-doc))
   (assert (string= (documentation 'you-cant-use-this 'function)
                    (documentation #'you-cant-use-this 'function)))
   (assert (string= (documentation 'function.defun.late 'function)
@@ -344,7 +342,7 @@
   (let ((source "load-test.tmp") fasl)
     (with-open-file (f source :direction :output
                        :if-does-not-exist :create :if-exists :supersede)
-      (write-string "(defun a () (quit))" f)
+      (write-string "(defun a () (sb-unix:unix-exit))" f)
       ;; a full warning even though the PLEASE-DONT- function is only :early
       (write-string "(defun b () (please-dont-use-this 1) (really-dont-do-it 2))" f)
       (write-string "(defun c () (you-cant-use-this 3))" f))

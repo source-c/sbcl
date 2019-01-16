@@ -9,10 +9,9 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
-(declaim (simple-vector **policy-primary-qualities**))
-(!defglobal **policy-primary-qualities**
+(defconstant-eqx +policy-primary-qualities+
         #(;; ANSI standard qualities
           compilation-speed
           debug
@@ -27,10 +26,11 @@
           ;; optimization-related notes, which is already mostly the
           ;; behavior, and should probably become the exact behavior.
           ;; Perhaps INHIBIT-NOTES?
-          inhibit-warnings))
+          inhibit-warnings)
+    #'equalp)
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (defconstant n-policy-primary-qualities (length **policy-primary-qualities**))
+  (defconstant n-policy-primary-qualities (length +policy-primary-qualities+))
   ;; 1 bit per quality is stored to indicate whether it was explicitly given
   ;; a value in a lexical policy. In addition to the 5 ANSI-standard qualities,
   ;; SBCL defines one more "primary" quality and 16 dependent qualities.
@@ -41,7 +41,8 @@
 ;; The POLICY struct represents a set of policies in an order-insensitive way
 ;; that facilitates quicker lookup than scanning an alist.
 (defstruct (policy (:constructor make-policy
-                                 (primary-qualities &optional presence-bits)))
+                       (primary-qualities &optional
+                                          presence-bits dependent-qualities)))
   ;; Mask with a 1 for each quality that has an explicit value in this policy.
   ;; Primary qualities fill the mask from left-to-right and dependent qualities
   ;; from right-to-left.
@@ -79,13 +80,15 @@
                     (default-structure-print lexenv stream depth))))
              (:copier nil)
              (:constructor make-null-lexenv ())
-             (:constructor make-almost-null-lexenv (%policy handled-conditions))
+             (:constructor make-almost-null-lexenv (%policy handled-conditions
+                                                    flushable))
              (:constructor make-package-lock-lexenv
                            (disabled-package-locks %policy
                             &aux (handled-conditions nil)))
              (:constructor internal-make-lexenv
                            (funs vars blocks tags
                             type-restrictions
+                            flushable
                             lambda cleanup handled-conditions
                             disabled-package-locks %policy user-data
                             parent)))
@@ -140,7 +143,12 @@
   ;; Cache of all visible variables, including the ones coming from
   ;; (call-lexenv lambda)
   ;; Used for LEAF-VISIBLE-TO-DEBUGGER-P
-  (var-cache nil :type (or null hash-table)))
+  (var-cache nil :type (or null hash-table))
+  ;; A list of functions that can be removed when unused.
+  ;; Similar to the FLUSHABLE attribute in DEFKNOWN, but can applied
+  ;; locally to things that are generally not flushable but can be
+  ;; flushed in some circumstances.
+  (flushable nil :type list))
 
 ;;; the lexical environment we are currently converting in
 (defvar *lexenv*)

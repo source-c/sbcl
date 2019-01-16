@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; register specs
 
@@ -30,14 +30,11 @@
                     ;; (in the same file) depends on compile-time evaluation
                     ;; of the DEFCONSTANT. -- AL 20010224
                 (defconstant ,(symbolicate name "-OFFSET") ,offset)))
-           ;; FIXME: It looks to me as though DEFREGSET should also
-           ;; define the related *FOO-REGISTER-NAMES* variable.
            (defregset (name &rest regs)
-             `(eval-when (:compile-toplevel :load-toplevel :execute)
-                (defparameter ,name
+             `(defglobal ,name
                   (list ,@(mapcar (lambda (name)
                                     (symbolicate name "-OFFSET"))
-                                  regs))))))
+                                  regs)))))
 
   ;; byte registers
   ;;
@@ -98,6 +95,7 @@
 
 ;;;; SB definitions
 
+(!define-storage-bases
 ;;; Despite the fact that there are only 8 different registers, we consider
 ;;; them 16 in order to describe the overlap of byte registers. The only
 ;;; thing we need to represent is what registers overlap. Therefore, we
@@ -118,10 +116,12 @@
 (define-storage-base constant :non-packed)
 (define-storage-base immediate-constant :non-packed)
 (define-storage-base noise :unbounded :size 2)
+)
 
 ;;;; SC definitions
 
-(!define-storage-classes
+(eval-when (:compile-toplevel :execute)
+(defparameter *storage-class-defs* '(
 
   ;; non-immediate constants in the constant pool
   (constant constant)
@@ -283,9 +283,8 @@
                     :alternate-scs (complex-long-stack))
 
   (catch-block stack :element-size catch-block-size)
-  (unwind-block stack :element-size unwind-block-size))
+  (unwind-block stack :element-size unwind-block-size)))
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
 (defparameter *byte-sc-names*
   '(#!-sb-unicode character-reg byte-reg #!-sb-unicode character-stack))
 (defparameter *word-sc-names* '(word-reg))
@@ -300,23 +299,29 @@
 (defparameter *float-sc-names* '(single-reg))
 (defparameter *double-sc-names* '(double-reg double-stack))
 ) ; EVAL-WHEN
+(!define-storage-classes
+  . #.(mapcar (lambda (class-spec)
+                (let ((size
+                       (case (car class-spec)
+                         (#.*dword-sc-names*   :dword)
+                         (#.*word-sc-names*    :word)
+                         (#.*byte-sc-names*    :byte)
+                         (#.*float-sc-names*   :float)
+                         (#.*double-sc-names*  :double))))
+                  (append class-spec (if size (list :operand-size size)))))
+              *storage-class-defs*))
 
 ;;;; miscellaneous TNs for the various registers
 
 (macrolet ((def-misc-reg-tns (sc-name &rest reg-names)
              (collect ((forms))
-                      (dolist (reg-name reg-names)
-                        (let ((tn-name (symbolicate reg-name "-TN"))
-                              (offset-name (symbolicate reg-name "-OFFSET")))
-                          ;; FIXME: It'd be good to have the special
-                          ;; variables here be named with the *FOO*
-                          ;; convention.
-                          (forms `(defparameter ,tn-name
-                                    (make-random-tn :kind :normal
-                                                    :sc (sc-or-lose ',sc-name)
-                                                    :offset
-                                                    ,offset-name)))))
-                      `(progn ,@(forms)))))
+               (dolist (reg-name reg-names `(progn ,@(forms)))
+                 (let ((tn-name (symbolicate reg-name "-TN"))
+                       (offset-name (symbolicate reg-name "-OFFSET")))
+                   (forms `(defglobal ,tn-name
+                             (make-random-tn :kind :normal
+                                             :sc (sc-or-lose ',sc-name)
+                                             :offset ,offset-name))))))))
 
   (def-misc-reg-tns unsigned-reg eax ebx ecx edx ebp esp edi esi)
   (def-misc-reg-tns word-reg ax bx cx dx bp sp di si)
@@ -342,20 +347,20 @@
 ;;; the appropriate SC number, otherwise return NIL.
 (defun immediate-constant-sc (value)
   (typecase value
-    ((or (integer #.sb!xc:most-negative-fixnum #.sb!xc:most-positive-fixnum)
+    ((or (integer #.sb-xc:most-negative-fixnum #.sb-xc:most-positive-fixnum)
          character)
-     (sc-number-or-lose 'immediate))
+     immediate-sc-number)
     (symbol
      (when (static-symbol-p value)
-       (sc-number-or-lose 'immediate)))
+       immediate-sc-number))
     (single-float
        (case value
-         ((0f0 1f0) (sc-number-or-lose 'fp-constant))
-         (t (sc-number-or-lose 'fp-single-immediate))))
+         ((0f0 1f0) fp-constant-sc-number)
+         (t fp-single-immediate-sc-number)))
     (double-float
        (case value
-         ((0d0 1d0) (sc-number-or-lose 'fp-constant))
-         (t (sc-number-or-lose 'fp-double-immediate))))
+         ((0d0 1d0) fp-constant-sc-number)
+         (t fp-double-immediate-sc-number)))
     #!+long-float
     (long-float
        (when (or (eql value 0l0) (eql value 1l0)
@@ -364,10 +369,10 @@
                  (eql value (log 2.718281828459045235360287471352662L0 2l0))
                  (eql value (log 2l0 10l0))
                  (eql value (log 2l0 2.718281828459045235360287471352662L0)))
-         (sc-number-or-lose 'fp-constant)))))
+         fp-constant-sc-number))))
 
 (defun boxed-immediate-sc-p (sc)
-  (eql sc (sc-number-or-lose 'immediate)))
+  (eql sc immediate-sc-number))
 
 ;; For an immediate TN, return its value encoded for use as a literal.
 ;; For any other TN, return the TN.  Only works for FIXNUMs,
@@ -411,8 +416,8 @@
 ;;; them or flagging them with KLUDGE might be better than nothing.
 ;;;
 ;;; names of these things seem to have changed. these aliases by jrd
-(defconstant lra-save-offset return-pc-save-offset)
 
+(defconstant nargs-offset ecx-offset)
 (defconstant cfp-offset ebp-offset)    ; pfw - needed by stuff in /code
                                         ; related to signal context stuff
 
@@ -428,18 +433,15 @@
          (offset (tn-offset tn)))
     (ecase sb
       (registers
-       (let* ((sc-name (sc-name sc))
-              (name-vec (cond ((member sc-name *byte-sc-names*)
-                               +byte-register-names+)
-                              ((member sc-name *word-sc-names*)
-                               +word-register-names+)
-                              ((member sc-name *dword-sc-names*)
-                               +dword-register-names+))))
+       (let ((name-vec (case (sb-c:sc-operand-size sc)
+                         (:byte  +byte-register-names+)
+                         (:word  +word-register-names+)
+                         (:dword +dword-register-names+))))
          (or (and name-vec
                   (< -1 offset (length name-vec))
                   (svref name-vec offset))
              ;; FIXME: Shouldn't this be an ERROR?
-             (format nil "<unknown reg: off=~W, sc=~A>" offset sc-name))))
+             (format nil "<unknown reg: off=~W, sc=~A>" offset (sc-name sc)))))
       (float-registers (format nil "FR~D" offset))
       (stack (format nil "S~D" offset))
       (constant (format nil "Const~D" offset))
@@ -447,12 +449,12 @@
       (noise (symbol-name (sc-name sc))))))
 
 (defun combination-implementation-style (node)
-  (declare (type sb!c::combination node))
+  (declare (type sb-c::combination node))
   (flet ((valid-funtype (args result)
-           (sb!c::valid-fun-use node
-                                (sb!c::specifier-type
+           (sb-c::valid-fun-use node
+                                (sb-c::specifier-type
                                  `(function ,args ,result)))))
-    (case (sb!c::combination-fun-source-name node)
+    (case (sb-c::combination-fun-source-name node)
       (logtest
        (cond
          ((valid-funtype '(fixnum fixnum) '*)
@@ -465,7 +467,7 @@
       (logbitp
        (cond
          ((and (valid-funtype '((integer 0 29) fixnum) '*)
-               (sb!c::constant-lvar-p (first (sb!c::basic-combination-args node))))
+               (sb-c::constant-lvar-p (first (sb-c::basic-combination-args node))))
           (values :transform '(lambda (index integer)
                                (%logbitp integer index))))
          ((valid-funtype '((integer 0 31) (signed-byte 32)) '*)

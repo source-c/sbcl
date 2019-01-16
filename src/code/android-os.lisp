@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!SYS")
+(in-package "SB-SYS")
 
 ;;; Check that target machine features are set up consistently with
 ;;; this file.
@@ -26,22 +26,22 @@
   if not available."
   (or *software-version*
       (setf *software-version*
-            (sb!alien:with-alien
+            (sb-alien:with-alien
                 ((ptr (* char)
-                      (sb!alien:alien-funcall
-                       (sb!alien:extern-alien "software_version"
-                                              (function (* sb!alien:char))))))
-              (and (not (sb!alien:null-alien ptr))
+                      (sb-alien:alien-funcall
+                       (sb-alien:extern-alien "software_version"
+                                              (function (* sb-alien:char))))))
+              (and (not (sb-alien:null-alien ptr))
                    (unwind-protect
-                        (sb!alien:with-alien ((c-string sb!alien:c-string ptr))
+                        (sb-alien:with-alien ((c-string sb-alien:c-string ptr))
                           c-string)
-                     (sb!alien:free-alien ptr)))))))
+                     (sb-alien:free-alien ptr)))))))
 
 ;;; Return user time, system time, and number of page faults.
 (defun get-system-info ()
   (multiple-value-bind
       (err? utime stime maxrss ixrss idrss isrss minflt majflt)
-      (sb!unix:unix-getrusage sb!unix:rusage_self)
+      (sb-unix:unix-getrusage sb-unix:rusage_self)
     (declare (ignore maxrss ixrss idrss isrss minflt))
     (unless err? ; FIXME: nonmnemonic (reversed) name for ERR?
       (error "Unix system call getrusage failed: ~A." (strerror utime)))

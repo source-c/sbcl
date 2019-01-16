@@ -250,25 +250,19 @@ bootstrapping.
 
 (defmacro defgeneric (fun-name lambda-list &body options)
   (declare (type list lambda-list))
-  (unless (legal-fun-name-p fun-name)
-    (error 'simple-program-error
-           :format-control "illegal generic function name ~S"
-           :format-arguments (list fun-name)))
+  (check-designator fun-name defgeneric)
   (with-current-source-form (lambda-list)
     (check-gf-lambda-list lambda-list))
   (let ((initargs ())
         (methods ()))
     (flet ((duplicate-option (name)
-             (error 'simple-program-error
-                    :format-control "The option ~S appears more than once."
-                    :format-arguments (list name)))
+             (%program-error "The option ~S appears more than once." name))
            (expand-method-definition (qab) ; QAB = qualifiers, arglist, body
              (let* ((arglist-pos (position-if #'listp qab))
                     (arglist (elt qab arglist-pos))
                     (qualifiers (subseq qab 0 arglist-pos))
                     (body (nthcdr (1+ arglist-pos) qab)))
-               `(push (defmethod ,fun-name ,@qualifiers ,arglist ,@body)
-                      (generic-function-initial-methods (fdefinition ',fun-name))))))
+               `(defmethod ,fun-name ,@qualifiers ,arglist ,@body))))
       (macrolet ((initarg (key) `(getf initargs ,key)))
         (dolist (option options)
           (let ((car-option (car option)))
@@ -276,10 +270,9 @@ bootstrapping.
               (declare
                (dolist (spec (cdr option))
                  (unless (consp spec)
-                   (error 'simple-program-error
-                          :format-control "~@<Invalid declaration specifier in ~
-                                           DEFGENERIC: ~S~:@>"
-                          :format-arguments (list spec)))
+                   (%program-error "~@<Invalid declaration specifier in ~
+                                    DEFGENERIC: ~S~:@>"
+                                   spec))
                  (when (member (first spec)
                                ;; FIXME: this list is slightly weird.
                                ;; ANSI (on the DEFGENERIC page) in one
@@ -292,10 +285,9 @@ bootstrapping.
                                ;; Very strange.  -- CSR, 2002-10-21
                                '(declaration ftype function
                                  inline notinline special))
-                   (error 'simple-program-error
-                          :format-control "The declaration specifier ~S ~
-                                         is not allowed inside DEFGENERIC."
-                          :format-arguments (list spec)))
+                   (%program-error "The declaration specifier ~S is ~
+                                    not allowed inside DEFGENERIC."
+                                  spec))
                  (if (or (eq 'optimize (first spec))
                          (info :declaration :recognized (first spec)))
                      (push spec (initarg :declarations))
@@ -305,26 +297,22 @@ bootstrapping.
                (when (initarg car-option)
                  (duplicate-option car-option))
                (unless (symbolp (cadr option))
-                 (error 'simple-program-error
-                        :format-control "METHOD-COMBINATION name not a ~
-                                         symbol: ~S"
-                        :format-arguments (list (cadr option))))
+                 (%program-error "METHOD-COMBINATION name not a symbol: ~
+                                  ~S"
+                                (cadr option)))
                (setf (initarg car-option)
                      `',(cdr option)))
               (:argument-precedence-order
                (let* ((required (nth-value 1 (parse-lambda-list lambda-list)))
                       (supplied (cdr option)))
                  (unless (= (length required) (length supplied))
-                   (error 'simple-program-error
-                          :format-control "argument count discrepancy in ~
-                                           :ARGUMENT-PRECEDENCE-ORDER clause."
-                          :format-arguments nil))
+                   (%program-error "argument count discrepancy in ~
+                                    :ARGUMENT-PRECEDENCE-ORDER clause."))
                  (when (set-difference required supplied)
-                   (error 'simple-program-error
-                          :format-control "unequal sets for ~
-                                           :ARGUMENT-PRECEDENCE-ORDER clause: ~
-                                           ~S and ~S"
-                          :format-arguments (list required supplied)))
+                   (%program-error "unequal sets for ~
+                                    :ARGUMENT-PRECEDENCE-ORDER clause: ~
+                                    ~S and ~S"
+                                   required supplied))
                  (setf (initarg car-option)
                        `',(cdr option))))
               ((:documentation :generic-function-class :method-class)
@@ -334,13 +322,11 @@ bootstrapping.
                    (duplicate-option car-option)
                    (setf (initarg car-option) `',(cadr option))))
               (:method
-               (push (cdr option) methods))
+                  (push (cdr option) methods))
               (t
                ;; ANSI requires that unsupported things must get a
                ;; PROGRAM-ERROR.
-               (error 'simple-program-error
-                      :format-control "unsupported option ~S"
-                      :format-arguments (list option))))))
+               (%program-error "unsupported option ~S" option)))))
 
         (when (initarg :declarations)
           (setf (initarg :declarations)
@@ -350,8 +336,14 @@ bootstrapping.
            (compile-or-load-defgeneric ',fun-name))
          (load-defgeneric ',fun-name ',lambda-list
                           (sb-c:source-location) ,@initargs)
-         ,@(mapcar #'expand-method-definition methods)
+         ,@(when methods
+             `((set-initial-methods (list ,@(mapcar #'expand-method-definition methods))
+                                    (fdefinition ',fun-name))))
          (fdefinition ',fun-name)))))
+
+(defun set-initial-methods (methods gf)
+  (sb-thread::with-recursive-system-lock ((gf-lock gf))
+    (setf (generic-function-initial-methods gf) methods)))
 
 (defun compile-or-load-defgeneric (fun-name)
   (proclaim-as-fun-name fun-name)
@@ -372,13 +364,14 @@ bootstrapping.
           :new-location source-location)
     (let ((fun (fdefinition fun-name)))
       (when (generic-function-p fun)
-        (loop for method in (generic-function-initial-methods fun)
-              do (remove-method fun method))
-        (setf (generic-function-initial-methods fun) '()))))
+        (sb-thread::with-recursive-system-lock ((gf-lock fun))
+          (loop for method in (generic-function-initial-methods fun)
+                do (remove-method fun method))
+          (setf (generic-function-initial-methods fun) '())))))
   (apply #'ensure-generic-function
          fun-name
          :lambda-list lambda-list
-         :definition-source source-location
+         'source source-location
          initargs))
 
 (define-condition generic-function-lambda-list-error
@@ -432,10 +425,11 @@ bootstrapping.
   (fmakunbound 'defmethod))
 ;;; As per CLHS -
 ;;; "defmethod is not required to perform any compile-time side effects."
-;;; and we don't do much other than to make the function be defined,
+;;; and we don't do much other than to make the function known to be defined,
 ;;; which means that checking of callers' arglists can only occur after called
 ;;; methods are actually loaded.
 (defmacro defmethod (name &rest args)
+  (check-designator name defmethod)
   (multiple-value-bind (qualifiers lambda-list body)
       (parse-defmethod args)
     `(progn
@@ -525,7 +519,7 @@ bootstrapping.
 
 (defun expand-defmethod (name proto-gf proto-method qualifiers lambda-list
                          body env)
-  (binding* (;; ENV could be of type SB!INTERPRETER:BASIC-ENV but I
+  (binding* (;; ENV could be of type SB-INTERPRETER:BASIC-ENV but I
              ;; don't care to figure out what parts of PCL would have
              ;; to change to accept that, so coerce.
              (env (sb-kernel:coerce-to-lexenv env))
@@ -864,6 +858,11 @@ bootstrapping.
                               (parameter-specializer-declaration-in-defmethod
                                proto-gf proto-method par spec specials env))
                             parameters specializers))))
+             (parameter-declarations
+              `(declare
+                ,@(mapcan (lambda (parameter)
+                            (list `(%parameter ,parameter)))
+                          required-parameters)))
              (method-lambda
               ;; Remove the documentation string and insert the
               ;; appropriate class declarations. The documentation
@@ -887,6 +886,7 @@ bootstrapping.
                  ;; the old PCL behavior. -- WHN 2000-11-24
                  (declare (ignorable ,@required-parameters))
                  ,class-declarations
+                 ,parameter-declarations
                  ,@declarations
                  (block ,(fun-name-block-name generic-function-name)
                    ,@real-body)))
@@ -951,6 +951,26 @@ bootstrapping.
               ,@(when plist `(plist ,plist))
               ,@(when documentation `(:documentation ,documentation))))))
 
+(define-condition specializer-name-syntax-error (error
+                                                 reference-condition)
+  ((generic-function :initarg :generic-function
+                     :reader specializer-name-syntax-error-generic-function)
+   (specializer-name :initarg :specializer-name
+                     :reader specializer-name-syntax-error-specializer-name))
+  (:default-initargs
+   :references '((:ansi-cl :macro defmethod)
+                 (:ansi-cl :glossary "parameter specializer name")))
+  (:report
+   (lambda (condition stream)
+     (format stream "~@<~S is not a valid parameter specializer name ~
+                     for ~S.~@:>"
+             (specializer-name-syntax-error-specializer-name condition)
+             (specializer-name-syntax-error-generic-function condition)))))
+
+(defun specializer-name-syntax-error (specializer-name generic-function)
+  (error 'specializer-name-syntax-error :generic-function generic-function
+                                        :specializer-name specializer-name))
+
 (defun real-make-method-specializers-form
     (proto-generic-function proto-method specializer-names environment)
   (flet ((make-parse-form (name)
@@ -964,13 +984,8 @@ bootstrapping.
 
 (defun real-make-specializer-form-using-class/t
     (proto-generic-function proto-method specializer-name environment)
-  (declare (ignore proto-generic-function proto-method environment))
-  (error 'simple-reference-error
-         :format-control
-         "~@<~S is not a valid parameter specializer name.~@:>"
-         :format-arguments (list specializer-name)
-         :references '((:ansi-cl :macro defmethod)
-                       (:ansi-cl :glossary "parameter specializer name"))))
+  (declare (ignore proto-method environment))
+  (specializer-name-syntax-error specializer-name proto-generic-function))
 
 (defun real-make-specializer-form-using-class/specializer
     (proto-generic-function proto-method specializer-name environment)
@@ -1034,8 +1049,8 @@ bootstrapping.
                  :format-control
                  "~@<Cannot find type for specializer ~
                   ~/sb-ext:print-symbol-with-prefix/ when executing ~S ~
-                  for a ~/sb-ext:print-type-specifier/ of a ~
-                  ~/sb-ext:print-type-specifier/.~@:>"
+                  for a ~/sb-impl:print-type-specifier/ of a ~
+                  ~/sb-impl:print-type-specifier/.~@:>"
                  :format-arguments
                  (list name 'specializer-type-specifier
                        (class-name (class-of proto-method))
@@ -1172,11 +1187,29 @@ bootstrapping.
         (symbol-function 'real-specializer-type-specifier)))
 
 (defun real-parse-specializer-using-class (generic-function specializer)
-  (let ((result (specializer-from-type specializer)))
-    (if (specializerp result)
-        result
-        (error "~@<~S cannot be parsed as a specializer for ~S.~@:>"
-               specializer generic-function))))
+  ;; Avoid style-warning about compiler-macro being unavailable.
+  (declare (notinline make-instance))
+  (typecase specializer
+    (symbol
+     (find-class specializer))
+    ((cons (eql class) (cons t null))
+     (coerce-to-class (second specializer)))
+    ((cons (eql prototype) (cons t null))
+     (let ((class (coerce-to-class (second specializer))))
+       (make-instance 'class-prototype-specializer :class class)))
+    ((cons (eql class-eq) (cons t null))
+     (class-eq-specializer (coerce-to-class (second specializer))))
+    ((cons (eql eql) (cons t null))
+     (intern-eql-specializer (second specializer)))
+    ;; FIXME: do we still need this?
+    (classoid
+     (or (classoid-pcl-class specializer)
+         (ensure-non-standard-class
+          (classoid-name specializer) specializer)))
+    (specializer
+     specializer)
+    (t
+     (specializer-name-syntax-error specializer generic-function))))
 
 (unless (fboundp 'parse-specializer-using-class)
   (setf (gdefinition 'parse-specializer-using-class)
@@ -1515,21 +1548,15 @@ bootstrapping.
            (cond ((null args)
                   (if (eql nreq 0)
                       (invoke-fast-method-call emf nil)
-                      (error 'simple-program-error
-                             :format-control "invalid number of arguments: 0"
-                             :format-arguments nil)))
+                      (%program-error "invalid number of arguments: 0")))
                  ((null (cdr args))
                   (if (eql nreq 1)
                       (invoke-fast-method-call emf nil (car args))
-                      (error 'simple-program-error
-                             :format-control "invalid number of arguments: 1"
-                             :format-arguments nil)))
+                      (%program-error "invalid number of arguments: 1")))
                  ((null (cddr args))
                   (if (eql nreq 2)
                       (invoke-fast-method-call emf nil (car args) (cadr args))
-                      (error 'simple-program-error
-                             :format-control "invalid number of arguments: 2"
-                             :format-arguments nil)))
+                      (%program-error "invalid number of arguments: 2")))
                  (t
                   (apply (fast-method-call-function emf)
                          (fast-method-call-pv emf)
@@ -1541,9 +1568,7 @@ bootstrapping.
             (method-call-call-method-args emf)))
     (fixnum
      (cond ((null args)
-            (error 'simple-program-error
-                   :format-control "invalid number of arguments: 0"
-                   :format-arguments nil))
+            (%program-error "invalid number of arguments: 0"))
            ((null (cdr args))
             (let* ((slots (get-slots (car args)))
                    (value (clos-slots-ref slots emf)))
@@ -1553,14 +1578,10 @@ bootstrapping.
            ((null (cddr args))
             (setf (clos-slots-ref (get-slots (cadr args)) emf)
                   (car args)))
-           (t (error 'simple-program-error
-                     :format-control "invalid number of arguments"
-                     :format-arguments nil))))
+           (t (%program-error "invalid number of arguments"))))
     (fast-instance-boundp
      (if (or (null args) (cdr args))
-         (error 'simple-program-error
-                :format-control "invalid number of arguments"
-                :format-arguments nil)
+         (%program-error "invalid number of arguments")
          (let ((slots (get-slots (car args))))
            (not (unbound-marker-p
                  (clos-slots-ref slots (fast-instance-boundp-index emf)))))))
@@ -1744,9 +1765,8 @@ bootstrapping.
                 (.dummy0.
                  ,@(when (eq state 'optional)
                      `((unless (null ,args-tail)
-                         (error 'simple-program-error
-                                :format-control "surplus arguments: ~S"
-                                :format-arguments (list ,args-tail)))))))
+                         (%program-error "surplus arguments: ~S"
+                                         ,args-tail))))))
            (declare (ignorable ,args-tail .dummy0.))
            ,@body)))))
 
@@ -1789,11 +1809,11 @@ bootstrapping.
                         ;; done in CAN-OPTIMIZE-ACCESS1, since the
                         ;; bindings that will have that declation will
                         ;; never be SETQd.
-                        (when (var-declaration '%class var env)
+                        (when (var-declaration '%parameter var env)
                           ;; If a parameter binding is shadowed by
-                          ;; another binding it won't have a %CLASS
-                          ;; declaration anymore, and this won't get
-                          ;; executed.
+                          ;; another binding it won't have a
+                          ;; %PARAMETER declaration anymore, and this
+                          ;; won't get executed.
                           (pushnew var parameters-setqd :test #'eq))))
                     form)
                (function
@@ -1869,7 +1889,7 @@ bootstrapping.
               :qualifiers qualifiers :specializers specializers))))
   (let ((method (apply #'add-named-method
                        gf-spec qualifiers specializers lambda-list
-                       :definition-source source-location
+                       'source source-location
                        initargs)))
     (unless (or (eq method-class 'standard-method)
                 (eq (find-class method-class nil) (class-of method)))
@@ -1932,7 +1952,7 @@ bootstrapping.
   (multiple-value-bind (llks nrequired noptional keywords keyword-parameters)
       (analyze-lambda-list lambda-list)
     (declare (ignore keyword-parameters))
-    (let* ((old (proclaimed-ftype name)) ;FIXME:FDOCUMENTATION instead?
+    (let* ((old (proclaimed-ftype name))
            (old-ftype (if (fun-type-p old) old nil))
            (old-restp (and old-ftype (fun-type-rest old-ftype)))
            (old-keys (and old-ftype
@@ -1982,16 +2002,19 @@ bootstrapping.
 (defun generic-clobbers-function (fun-name)
   (cerror "Replace the function binding"
           'simple-program-error
-          :format-control "~@<~/sb-ext:print-symbol-with-prefix/ ~
+          ;; I'm too lazy to put automatic SB-FORMAT:TOKENS wrapping
+          ;; on CERROR arguments. It's one of a kind
+          :format-control (sb-format:tokens
+                           "~@<~/sb-ext:print-symbol-with-prefix/ ~
                            already names an ordinary function or a ~
-                           macro.~@:>"
+                           macro.~@:>")
           :format-arguments (list fun-name)))
 
 (define-load-time-global *sgf-wrapper*
   (!boot-make-wrapper (!early-class-size 'standard-generic-function)
                       'standard-generic-function))
 
-(defvar *sgf-slots-init*
+(define-load-time-global *sgf-slots-init*
   (mapcar (lambda (canonical-slot)
             (if (memq (getf canonical-slot :name) '(arg-info source))
                 +slot-unbound+
@@ -2134,11 +2157,10 @@ bootstrapping.
                                (early-method-lambda-list method)
                                (method-lambda-list method)))
     (flet ((lose (string &rest args)
-             (error 'simple-program-error
-                    :format-control "~@<attempt to add the method~2I~_~S~I~_~
-                                     to the generic function~2I~_~S;~I~_~
-                                     but ~?~:>"
-                    :format-arguments (list method gf string args)))
+             (%program-error "~@<attempt to add the method~2I~_~S~I~_~
+                              to the generic function~2I~_~S;~I~_ but ~
+                              ~?~:>"
+                             method gf string args))
            (comparison-description (x y)
              (if (> x y) "more" "fewer")))
       (let ((gf-nreq (arg-info-number-required arg-info))
@@ -2309,7 +2331,7 @@ bootstrapping.
                                             &key (lambda-list nil
                                                               lambda-list-p)
                                             argument-precedence-order
-                                            definition-source
+                                            ((source source))
                                             documentation
                                             &allow-other-keys)
   (declare (ignore keys))
@@ -2320,7 +2342,7 @@ bootstrapping.
         ((assoc spec *!generic-function-fixups* :test #'equal)
          (if existing
              (make-early-gf spec lambda-list lambda-list-p existing
-                            argument-precedence-order definition-source
+                            argument-precedence-order source
                             documentation)
              (bug "The function ~S is not already defined." spec)))
         (existing
@@ -2329,18 +2351,19 @@ bootstrapping.
         (t
          (pushnew spec *!early-generic-functions* :test #'equal)
          (make-early-gf spec lambda-list lambda-list-p nil
-                        argument-precedence-order definition-source
+                        argument-precedence-order source
                         documentation))))
 
-(defun make-early-gf (spec &optional lambda-list lambda-list-p
+(defun make-early-gf (name &optional lambda-list lambda-list-p
                       function argument-precedence-order source-location
                       documentation)
-  (let ((fin (allocate-standard-funcallable-instance *sgf-wrapper*)))
+  (let ((fin (allocate-standard-funcallable-instance-immobile
+              *sgf-wrapper* name)))
     (replace (fsc-instance-slots fin) *sgf-slots-init*)
     (when function
       (set-funcallable-instance-function fin function))
-    (setf (gdefinition spec) fin)
-    (!bootstrap-set-slot 'standard-generic-function fin 'name spec)
+    (setf (gdefinition name) fin)
+    (!bootstrap-set-slot 'standard-generic-function fin 'name name)
     (!bootstrap-set-slot 'standard-generic-function fin
                          'source source-location)
     (!bootstrap-set-slot 'standard-generic-function fin
@@ -2348,10 +2371,10 @@ bootstrapping.
     (let ((arg-info (make-arg-info)))
       (setf (early-gf-arg-info fin) arg-info)
       (when lambda-list-p
-        (setf (info :function :type spec)
+        (setf (info :function :type name)
               (specifier-type
-               (ftype-declaration-from-lambda-list lambda-list spec))
-              (info :function :where-from spec) :defined-method)
+               (ftype-declaration-from-lambda-list lambda-list name))
+              (info :function :where-from name) :defined-method)
         (if argument-precedence-order
             (set-arg-info fin
                           :lambda-list lambda-list
@@ -2456,8 +2479,8 @@ bootstrapping.
                (not (csubtypep gf-type (setf old-type (proclaimed-ftype fun-name)))))
       (style-warn "~@<Generic function ~
                    ~/sb-ext:print-symbol-with-prefix/ clobbers an ~
-                   earlier ~S proclamation ~/sb-ext:print-type/ for ~
-                   the same name with ~/sb-ext:print-type/.~:@>"
+                   earlier ~S proclamation ~/sb-impl:print-type/ for ~
+                   the same name with ~/sb-impl:print-type/.~:@>"
                    fun-name 'ftype old-type gf-type))
     (setf (info :function :type fun-name) gf-type
           (info :function :where-from fun-name) :defined-method)
@@ -2582,7 +2605,7 @@ bootstrapping.
 
 (defun !early-make-a-method (class qualifiers arglist specializers initargs doc
                             &key slot-name object-class method-class-function
-                            definition-source)
+                            ((source source)))
   (aver (notany #'sb-pcl::eql-specializer-p specializers))
   (binding*
       ;; Figure out whether we got class objects or class names as the
@@ -2620,14 +2643,14 @@ bootstrapping.
                (when slot-name
                  (list :slot-name slot-name :object-class object-class
                        :method-class-function method-class-function))
-               (list :definition-source definition-source)))))
+               (list 'source source)))))
     (initialize-method-function initargs result)
     result))
 
 (defun real-make-a-method
        (class qualifiers lambda-list specializers initargs doc
         &rest args &key slot-name object-class method-class-function
-        definition-source)
+                        ((source source)))
   (if method-class-function
       (let* ((object-class (if (classp object-class) object-class
                                (find-class object-class)))
@@ -2643,7 +2666,7 @@ bootstrapping.
           (apply #'make-instance
                  (apply method-class-function object-class slot-definition
                         initargs)
-                 :definition-source definition-source
+                 'source source
                  initargs)))
       (apply #'make-instance class :qualifiers qualifiers
              :lambda-list lambda-list :specializers specializers
@@ -2703,7 +2726,7 @@ bootstrapping.
 
 (defun !early-add-named-method (generic-function-name qualifiers
                                specializers arglist &rest initargs
-                               &key documentation definition-source
+                               &key documentation ((source source))
                                &allow-other-keys)
   (let* (;; we don't need to deal with the :generic-function-class
          ;; argument here because the default,
@@ -2719,7 +2742,7 @@ bootstrapping.
           (make-method-spec gf qualifiers specializers))
     (let ((new (make-a-method 'standard-method qualifiers arglist
                               specializers initargs documentation
-                              :definition-source definition-source)))
+                              'source source)))
       (when existing (remove-method gf existing))
       (add-method gf new))))
 
@@ -2863,7 +2886,7 @@ bootstrapping.
                          (make-a-method
                           'standard-method
                           qualifiers lambda-list specializers initargs nil
-                          :definition-source (translate-source-location fun))))))
+                          'source (translate-source-location fun))))))
             (setf (generic-function-method-class gf)
                   *the-class-standard-method*
                   (generic-function-method-combination gf)
@@ -2955,45 +2978,53 @@ bootstrapping.
 ;;; it's not needed any more? Hunt down what it was used for and see.
 
 (defun extract-the (form)
-  (cond ((and (consp form) (eq (car form) 'the))
-         (aver (proper-list-of-length-p form 3))
+  (cond ((typep form '(cons (eql the) (cons t (cons t null))))
          (third form))
         (t
          form)))
 
-(defmacro with-slots (slots instance &body body)
-  (let ((in (gensym)))
-    `(let ((,in ,instance))
-       (declare (ignorable ,in))
-       ,@(let ((instance (extract-the instance)))
-           (and (symbolp instance)
-                `((declare (%variable-rebinding ,in ,instance)))))
-       ,in
-       (symbol-macrolet ,(mapcar (lambda (slot-entry)
-                                   (let ((var-name
-                                          (if (symbolp slot-entry)
-                                              slot-entry
-                                              (car slot-entry)))
-                                         (slot-name
-                                          (if (symbolp slot-entry)
-                                              slot-entry
-                                              (cadr slot-entry))))
-                                     `(,var-name
-                                       (slot-value ,in ',slot-name))))
-                                 slots)
-                        ,@body))))
+(flet ((maybe-rebinding (instance-var instance-form)
+         (let ((instance (extract-the instance-form)))
+           (when (symbolp instance)
+             `((declare (%variable-rebinding ,instance-var ,instance)))))))
 
-(defmacro with-accessors (slots instance &body body)
-  (let ((in (gensym)))
-    `(let ((,in ,instance))
-       (declare (ignorable ,in))
-       ,@(let ((instance (extract-the instance)))
-           (and (symbolp instance)
-                `((declare (%variable-rebinding ,in ,instance)))))
-       ,in
-       (symbol-macrolet ,(mapcar (lambda (slot-entry)
-                                   (let ((var-name (car slot-entry))
-                                         (accessor-name (cadr slot-entry)))
-                                     `(,var-name (,accessor-name ,in))))
-                                 slots)
-          ,@body))))
+  (defmacro with-slots (slots instance &body body)
+    (let ((in (gensym)))
+      `(let ((,in ,instance))
+         (declare (ignorable ,in))
+         ,@(maybe-rebinding in instance)
+         (symbol-macrolet
+             ,(mapcar (lambda (slot-entry)
+                        (with-current-source-form (slot-entry slots)
+                          (unless (typep slot-entry
+                                         '(or symbol
+                                           (cons symbol (cons symbol null))))
+                            (error "Malformed slot entry: ~s, should be ~
+                                  either a symbol or (variable-name ~
+                                  slot-name)"
+                                   slot-entry))
+                          (destructuring-bind
+                                (var-name &optional (slot-name var-name))
+                              (ensure-list slot-entry)
+                            `(,var-name
+                              (slot-value ,in ',slot-name)))))
+                      slots)
+           ,@body))))
+
+  (defmacro with-accessors (slots instance &body body)
+    (let ((in (gensym)))
+      `(let ((,in ,instance))
+         (declare (ignorable ,in))
+         ,@(maybe-rebinding in instance)
+         (symbol-macrolet
+             ,(mapcar (lambda (slot-entry)
+                        (with-current-source-form (slot-entry slots)
+                          (unless (proper-list-of-length-p slot-entry 2)
+                            (error "Malformed slot entry: ~s, should ~
+                                  be (variable-name accessor-name)"
+                                   slot-entry))
+                          (destructuring-bind (var-name accessor-name)
+                              slot-entry
+                            `(,var-name (,accessor-name ,in)))))
+                      slots)
+           ,@body)))))

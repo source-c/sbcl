@@ -14,6 +14,10 @@
 all: targets tags
 TARGET=sbcl
 
+# Allow using paxctl(8) or similar programs to adjust PaX permissions
+# of src/runtime/sbcl during the build.
+SBCL_PAXCTL ?= :
+
 # Defaults which might be overridden or modified by values in the
 # Config file. Most of them are same on most systems right now.
 # If you need to override one of these, do it in Config.
@@ -30,7 +34,7 @@ __LDFLAGS__ =
 
 include ../../output/prefix.def
 
-CFLAGS += -g -Wall -Wsign-compare -Wpointer-arith -O3
+CFLAGS += -g -Wall -Wundef -Wsign-compare -Wpointer-arith -O3
 ASFLAGS += $(CFLAGS)
 CPPFLAGS += -I. -DSBCL_PREFIX=\"$(SBCL_PREFIX)\"
 
@@ -59,9 +63,10 @@ LDFLAGS += -nopie
 __LDFLAGS__ += -nopie
 endif
 
-COMMON_SRC = alloc.c backtrace.c breakpoint.c coreparse.c dynbind.c     \
-	funcall.c gc-common.c globals.c hopscotch.c interr.c interrupt.c\
-	largefile.c monitor.c murmur_hash.c os-common.c parse.c print.c \
+COMMON_SRC = alloc.c backtrace.c breakpoint.c coalesce.c coreparse.c    \
+	dynbind.c funcall.c gc-common.c globals.c hopscotch.c           \
+	interr.c interrupt.c largefile.c main.c                         \
+	monitor.c murmur_hash.c os-common.c parse.c print.c             \
 	purify.c pthread-futex.c regnames.c run-program.c runtime.c     \
 	safepoint.c save.c sc-offset.c search.c thread.c time.c         \
 	validate.c var-io.c vars.c wrap.c
@@ -78,6 +83,13 @@ targets: $(TARGET) $(OBJTARGET) sbcl.nm sbcl.mk
 
 $(TARGET): $(LIBSBCL)
 	$(CC) ${LINKFLAGS} -o $@ $(USE_LIBSBCL) $(LIBS)
+	$(SBCL_PAXCTL) $@
+
+# Enable compiling gencgc with even more assertions and/or
+# data collection, with COMPILING_TESTS. Not really used yet.
+gc-unit-tests.o: CFLAGS=-DCOMPILING_TESTS
+unit-tests: gc-unit-tests.o libsbcl.a
+	cc -g -no-pie -o $@ $^ -ldl -lpthread -lm
 
 # ld -r -o sbcl.o works on Linux, but not on other platforms.
 # On macOS, it fails to keep debug sections.
@@ -87,6 +99,33 @@ sbcl.o: $(OBJS)
 
 libsbcl.a: $(OBJS)
 	rm -f $@ ; ar rcs $@ $^
+
+PIC_OBJS = $(subst .o,.pic.o,$(filter-out ldso-stubs.o,$(OBJS)))
+libsbcl.so: $(PIC_OBJS)
+	cc -shared -o $@ $^ -ldl -lpthread -lm
+# for this to work, you must have with-gcc-tls in your build features already.
+# can't define it here because then it conflicts if you have it in both places.
+%.pic.o: %.c
+	$(CC) -fPIC -c $(filter-out -fno-pie,$(CFLAGS)) $< -o $@
+%.pic.o: %.S # (-fPIC doesn't affect hand-written assembly source)
+	$(CC) -DPOSITION_INDEPENDENT_ASM -c $(CFLAGS) $< -o $@
+testmain: testmain.c libsbcl.so -ldl
+
+SHRINKWRAP_DEPS = ../../output/sbcl.core ../../tools-for-build/editcore.lisp
+shrinkwrap-sbcl.s shrinkwrap-sbcl-core.o: $(SHRINKWRAP_DEPS)
+	../../run-sbcl.sh --script ../../tools-for-build/editcore.lisp split --sizes \
+		../../output/sbcl.core shrinkwrap-sbcl.s
+pie-shrinkwrap-sbcl.s pie-shrinkwrap-sbcl-core.o: $(SHRINKWRAP_DEPS)
+	../../run-sbcl.sh --script ../../tools-for-build/editcore.lisp split --pie \
+		../../output/sbcl.core pie-shrinkwrap-sbcl.s
+comma := , # "Commas ... cannot appear in the text of an argument as written"
+shrinkwrap-sbcl: shrinkwrap-sbcl.s shrinkwrap-sbcl-core.o $(LIBSBCL)
+	$(CC) $(filter-out -Wl$(comma)--export-dynamic, $(LINKFLAGS)) \
+ $(CFLAGS) -o $@ $(filter-out ldso-stubs.o, $^) $(LIBS)
+pie-shrinkwrap-sbcl: pie-shrinkwrap-sbcl.s pie-shrinkwrap-sbcl-core.o $(PIC_OBJS)
+	$(CC) -pie -o $@ $^ $(LIBS)
+semiwrap-sbcl: shrinkwrap-sbcl.s $(LIBSBCL)
+	$(CC) $(LINKFLAGS) $(CFLAGS) -o $@ $^ $(LIBS)
 
 sbcl.mk:
 	( echo 'CC=$(CC)' ; \
@@ -115,7 +154,7 @@ sbcl.h: $(wildcard genesis/*.h)
 # ...but it's still nice to have it done by default.
 HEADERS=$(wildcard *.h genesis/*.h)
 TAGS tags: $(SRCS) $(HEADERS)
-	etags $(SRCS) $(HEADERS) || true
+	@etags $(SRCS) $(HEADERS) || true
 
 clean:
 	-rm -f *.[do] $(TARGET) sbcl.nm sbcl.h core *.tmp $(OS_CLEAN_FILES)

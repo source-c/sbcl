@@ -11,11 +11,6 @@
 ;;;; absoluely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(cl:in-package #:cl-user)
-
-(cl:use-package '#:test-util)
-(cl:use-package '#:assertoid)
-
 #-sb-thread (sb-ext:exit :code 104)
 
 (setf sb-unix::*on-dangerous-wait* :error)
@@ -34,8 +29,7 @@
   (make-join-thread (lambda () (sb-ext:gc))))
 
 (with-test (:name (:debugger-no-hang-on-session-lock-if-interrupted)
-                  :fails-on :win32)
-  #+win32 (error "user would have to touch a key interactively to proceed")
+            :broken-on :win32)
   (sb-debug::enable-debugger)
   (let ((main-thread sb-thread:*current-thread*))
     (make-join-thread

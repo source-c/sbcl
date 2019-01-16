@@ -13,7 +13,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 ;;;; float predicates and environment query
 
@@ -25,15 +25,15 @@
   "Return true if the float X is denormalized."
   (number-dispatch ((x float))
     ((single-float)
-     (and (zerop (ldb sb!vm:single-float-exponent-byte (single-float-bits x)))
+     (and (zerop (ldb sb-vm:single-float-exponent-byte (single-float-bits x)))
           (not (zerop x))))
     ((double-float)
-     (and (zerop (ldb sb!vm:double-float-exponent-byte
+     (and (zerop (ldb sb-vm:double-float-exponent-byte
                       (double-float-high-bits x)))
           (not (zerop x))))
     #!+(and long-float x86)
     ((long-float)
-     (and (zerop (ldb sb!vm:long-float-exponent-byte (long-float-exp-bits x)))
+     (and (zerop (ldb sb-vm:long-float-exponent-byte (long-float-exp-bits x)))
           (not (zerop x))))))
 
 (defmacro !define-float-dispatching-function
@@ -43,15 +43,15 @@
      (number-dispatch ((x float))
        ((single-float)
         (let ((bits (single-float-bits x)))
-          (and (> (ldb sb!vm:single-float-exponent-byte bits)
-                  sb!vm:single-float-normal-exponent-max)
+          (and (> (ldb sb-vm:single-float-exponent-byte bits)
+                  sb-vm:single-float-normal-exponent-max)
                ,single)))
        ((double-float)
         (let ((hi (double-float-high-bits x))
               (lo (double-float-low-bits x)))
           (declare (ignorable lo))
-          (and (> (ldb sb!vm:double-float-exponent-byte hi)
-                  sb!vm:double-float-normal-exponent-max)
+          (and (> (ldb sb-vm:double-float-exponent-byte hi)
+                  sb-vm:double-float-normal-exponent-max)
                ,double)))
        #!+(and long-float x86)
        ((long-float)
@@ -59,26 +59,26 @@
               (hi (long-float-high-bits x))
               (lo (long-float-low-bits x)))
           (declare (ignorable lo))
-          (and (> (ldb sb!vm:long-float-exponent-byte exp)
-                  sb!vm:long-float-normal-exponent-max)
+          (and (> (ldb sb-vm:long-float-exponent-byte exp)
+                  sb-vm:long-float-normal-exponent-max)
                ,long))))))
 
 (!define-float-dispatching-function float-infinity-p
   "Return true if the float X is an infinity (+ or -)."
-  (zerop (ldb sb!vm:single-float-significand-byte bits))
-  (and (zerop (ldb sb!vm:double-float-significand-byte hi))
+  (zerop (ldb sb-vm:single-float-significand-byte bits))
+  (and (zerop (ldb sb-vm:double-float-significand-byte hi))
        (zerop lo))
   #!+(and long-float x86)
-  (and (zerop (ldb sb!vm:long-float-significand-byte hi))
+  (and (zerop (ldb sb-vm:long-float-significand-byte hi))
        (zerop lo)))
 
 (!define-float-dispatching-function float-nan-p
   "Return true if the float X is a NaN (Not a Number)."
-  (not (zerop (ldb sb!vm:single-float-significand-byte bits)))
-  (or (not (zerop (ldb sb!vm:double-float-significand-byte hi)))
+  (not (zerop (ldb sb-vm:single-float-significand-byte bits)))
+  (or (not (zerop (ldb sb-vm:double-float-significand-byte hi)))
       (not (zerop lo)))
   #!+(and long-float x86)
-  (or (not (zerop (ldb sb!vm:long-float-significand-byte hi)))
+  (or (not (zerop (ldb sb-vm:long-float-significand-byte hi)))
       (not (zerop lo))))
 
 (!define-float-dispatching-function float-trapping-nan-p
@@ -90,20 +90,20 @@
   ;; considers infinities to be FLOAT-TRAPPING-NAN-P on most
   ;; architectures.
   #!-(or mips hppa)
-  (zerop (logand (ldb sb!vm:single-float-significand-byte bits)
-                 sb!vm:single-float-trapping-nan-bit))
+  (zerop (logand (ldb sb-vm:single-float-significand-byte bits)
+                 sb-vm:single-float-trapping-nan-bit))
   #!+(or mips hppa)
-  (not (zerop (logand (ldb sb!vm:single-float-significand-byte bits)
-                      sb!vm:single-float-trapping-nan-bit)))
+  (not (zerop (logand (ldb sb-vm:single-float-significand-byte bits)
+                      sb-vm:single-float-trapping-nan-bit)))
   #!-(or mips hppa)
-  (zerop (logand (ldb sb!vm:double-float-significand-byte hi)
-                 sb!vm:double-float-trapping-nan-bit))
+  (zerop (logand (ldb sb-vm:double-float-significand-byte hi)
+                 sb-vm:double-float-trapping-nan-bit))
   #!+(or mips hppa)
-  (not (zerop (logand (ldb sb!vm:double-float-significand-byte hi)
-                      sb!vm:double-float-trapping-nan-bit)))
+  (not (zerop (logand (ldb sb-vm:double-float-significand-byte hi)
+                      sb-vm:double-float-trapping-nan-bit)))
   #!+(and long-float x86)
-  (zerop (logand (ldb sb!vm:long-float-significand-byte hi)
-                 sb!vm:long-float-trapping-nan-bit)))
+  (zerop (logand (ldb sb-vm:long-float-significand-byte hi)
+                 sb-vm:long-float-trapping-nan-bit)))
 
 ;;; If denormalized, use a subfunction from INTEGER-DECODE-FLOAT to find the
 ;;; actual exponent (and hence how denormalized it is), otherwise we just
@@ -124,14 +124,14 @@
                        ,digits))))
     (number-dispatch ((f float))
       ((single-float)
-       (frob sb!vm:single-float-digits sb!vm:single-float-bias
+       (frob sb-vm:single-float-digits sb-vm:single-float-bias
          integer-decode-single-denorm))
       ((double-float)
-       (frob sb!vm:double-float-digits sb!vm:double-float-bias
+       (frob sb-vm:double-float-digits sb-vm:double-float-bias
          integer-decode-double-denorm))
       #!+long-float
       ((long-float)
-       (frob sb!vm:long-float-digits sb!vm:long-float-bias
+       (frob sb-vm:long-float-digits sb-vm:long-float-bias
          integer-decode-long-denorm)))))
 
 (defun float-sign (float1 &optional (float2 (float 1 float1)))
@@ -150,20 +150,20 @@
 
 (defun float-format-digits (format)
   (ecase format
-    ((short-float single-float) sb!vm:single-float-digits)
-    ((double-float #!-long-float long-float) sb!vm:double-float-digits)
+    ((short-float single-float) sb-vm:single-float-digits)
+    ((double-float #!-long-float long-float) sb-vm:double-float-digits)
     #!+long-float
-    (long-float sb!vm:long-float-digits)))
+    (long-float sb-vm:long-float-digits)))
 
 #!-sb-fluid (declaim (inline float-digits float-radix))
 
 (defun float-digits (f)
   (declare (explicit-check))
   (number-dispatch ((f float))
-    ((single-float) sb!vm:single-float-digits)
-    ((double-float) sb!vm:double-float-digits)
+    ((single-float) sb-vm:single-float-digits)
+    ((double-float) sb-vm:double-float-digits)
     #!+long-float
-    ((long-float) sb!vm:long-float-digits)))
+    ((long-float) sb-vm:long-float-digits)))
 
 (defun float-radix (x)
   "Return (as an integer) the radix b of its floating-point argument."
@@ -172,6 +172,9 @@
 
 ;;;; INTEGER-DECODE-FLOAT and DECODE-FLOAT
 
+(defconstant-eqx float-decoding-error "Can't decode NaN or infinity: ~S."
+  #'string=)
+
 #!-sb-fluid
 (declaim (maybe-inline integer-decode-single-float
                        integer-decode-double-float))
@@ -179,66 +182,65 @@
 ;;; Handle the denormalized case of INTEGER-DECODE-FLOAT for SINGLE-FLOAT.
 (defun integer-decode-single-denorm (x)
   (declare (type single-float x))
-  (let* ((bits (single-float-bits (abs x)))
-         (sig (ash (ldb sb!vm:single-float-significand-byte bits) 1))
+  (let* ((bits (single-float-bits x))
+         (sig (ash (ldb sb-vm:single-float-significand-byte bits) 1))
          (extra-bias 0))
     (declare (type (unsigned-byte 24) sig)
              (type (integer 0 23) extra-bias))
     (loop
-      (unless (zerop (logand sig sb!vm:single-float-hidden-bit))
+      (unless (zerop (logand sig sb-vm:single-float-hidden-bit))
         (return))
       (setq sig (ash sig 1))
       (incf extra-bias))
     (values sig
-            (- (- sb!vm:single-float-bias)
-               sb!vm:single-float-digits
+            (- (- sb-vm:single-float-bias)
+               sb-vm:single-float-digits
                extra-bias)
-            (if (minusp (float-sign x)) -1 1))))
+            (if (minusp bits) -1 1))))
 
 ;;; Handle the single-float case of INTEGER-DECODE-FLOAT. If an infinity or
 ;;; NaN, error. If a denorm, call i-d-s-DENORM to handle it.
 (defun integer-decode-single-float (x)
   (declare (single-float x))
-  (let* ((bits (single-float-bits (abs x)))
-         (exp (ldb sb!vm:single-float-exponent-byte bits))
-         (sig (ldb sb!vm:single-float-significand-byte bits))
-         (sign (if (minusp (float-sign x)) -1 1))
-         (biased (- exp sb!vm:single-float-bias sb!vm:single-float-digits)))
-    (declare (fixnum biased))
-    (unless (<= exp sb!vm:single-float-normal-exponent-max)
-      (error "can't decode NaN or infinity: ~S" x))
-    (cond ((and (zerop exp) (zerop sig))
-           (values 0 biased sign))
-          ((< exp sb!vm:single-float-normal-exponent-min)
+  (let* ((bits (single-float-bits x))
+         (exp (ldb sb-vm:single-float-exponent-byte bits)))
+    (cond ((zerop (ldb (byte 31 0) bits))
+           (values 0 0 (if (minusp bits) -1 1)))
+          ((< exp sb-vm:single-float-normal-exponent-min)
            (integer-decode-single-denorm x))
+          ((> exp sb-vm:single-float-normal-exponent-max)
+           (error float-decoding-error x))
           (t
-           (values (logior sig sb!vm:single-float-hidden-bit) biased sign)))))
+           (values (logior (ldb sb-vm:single-float-significand-byte bits)
+                           sb-vm:single-float-hidden-bit)
+                   (- exp sb-vm:single-float-bias sb-vm:single-float-digits)
+                   (if (minusp bits) -1 1))))))
 
 ;;; like INTEGER-DECODE-SINGLE-DENORM, only doubly so
 (defun integer-decode-double-denorm (x)
   (declare (type double-float x))
-  (let* ((high-bits (double-float-high-bits (abs x)))
-         (sig-high (ldb sb!vm:double-float-significand-byte high-bits))
+  (let* ((high-bits (double-float-high-bits x))
+         (sig-high (ldb sb-vm:double-float-significand-byte high-bits))
          (low-bits (double-float-low-bits x))
-         (sign (if (minusp (float-sign x)) -1 1))
-         (biased (- (- sb!vm:double-float-bias) sb!vm:double-float-digits)))
+         (sign (if (minusp high-bits) -1 1))
+         (biased (- (- sb-vm:double-float-bias) sb-vm:double-float-digits)))
     (if (zerop sig-high)
         (let ((sig low-bits)
-              (extra-bias (- sb!vm:double-float-digits 33))
+              (extra-bias (- sb-vm:double-float-digits 33))
               (bit (ash 1 31)))
           (declare (type (unsigned-byte 32) sig) (fixnum extra-bias))
           (loop
             (unless (zerop (logand sig bit)) (return))
             (setq sig (ash sig 1))
             (incf extra-bias))
-          (values (ash sig (- sb!vm:double-float-digits 32))
+          (values (ash sig (- sb-vm:double-float-digits 32))
                   (truly-the fixnum (- biased extra-bias))
                   sign))
         (let ((sig (ash sig-high 1))
               (extra-bias 0))
           (declare (type (unsigned-byte 32) sig) (fixnum extra-bias))
           (loop
-            (unless (zerop (logand sig sb!vm:double-float-hidden-bit))
+            (unless (zerop (logand sig sb-vm:double-float-hidden-bit))
               (return))
             (setq sig (ash sig 1))
             (incf extra-bias))
@@ -249,53 +251,71 @@
 ;;; like INTEGER-DECODE-SINGLE-FLOAT, only doubly so
 (defun integer-decode-double-float (x)
   (declare (double-float x))
-  (let* ((abs (abs x))
-         (hi (double-float-high-bits abs))
-         (lo (double-float-low-bits abs))
-         (exp (ldb sb!vm:double-float-exponent-byte hi))
-         (sig (ldb sb!vm:double-float-significand-byte hi))
-         (sign (if (minusp (float-sign x)) -1 1))
-         (biased (- exp sb!vm:double-float-bias sb!vm:double-float-digits)))
-    (declare (fixnum biased))
-    (unless (<= exp sb!vm:double-float-normal-exponent-max)
-      (error "Can't decode NaN or infinity: ~S." x))
-    (cond ((and (zerop exp) (zerop sig) (zerop lo))
-           (values 0 biased sign))
-          ((< exp sb!vm:double-float-normal-exponent-min)
+  #!-64-bit ; treat high and low bits separately until the end
+  (let* ((hi (double-float-high-bits x))
+         (lo (double-float-low-bits x))
+         (exp (ldb sb-vm:double-float-exponent-byte hi)))
+    (cond ((zerop (logior (ldb (byte 31 0) hi) lo))
+           (values 0 0 (if (minusp hi) -1 1)))
+          ((< exp sb-vm:double-float-normal-exponent-min)
            (integer-decode-double-denorm x))
+          ((> exp sb-vm:double-float-normal-exponent-max)
+           (error float-decoding-error x))
           (t
-           (values
-            (logior (ash (logior (ldb sb!vm:double-float-significand-byte hi)
-                                 sb!vm:double-float-hidden-bit)
-                         32)
-                    lo)
-            biased sign)))))
+           (values (logior (ash (logior (ldb sb-vm:double-float-significand-byte hi)
+                                        sb-vm:double-float-hidden-bit)
+                                32)
+                           lo)
+                   (- exp sb-vm:double-float-bias sb-vm:double-float-digits)
+                   (if (minusp hi) -1 1)))))
+  #!+64-bit ; don't split the high and low bits
+  (let* ((bits (double-float-bits x))
+         ;; It's unfortunate that the implied meaning of EXPONENT-BYTE and
+         ;; SIGNIFICAND-BYTE for double-floats assumes refererence to the high half
+         ;; and not the entire word.  Because knowledge of the splitup is imparted here
+         ;; and elsewhere such as SB-BIGNUM:DOUBLE-FLOAT-FROM-BITS, it isn't really
+         ;; up to the backend parms to impart meaning, appearances to the contrary.
+         (exp (ldb (byte (byte-size sb-vm:double-float-exponent-byte)
+                         (+ 32 (byte-position sb-vm:double-float-exponent-byte)))
+                   bits)))
+    (cond ((zerop (ldb (byte 63 0) bits))
+           (values 0 0 (if (minusp bits) -1 1)))
+          ((< exp sb-vm:double-float-normal-exponent-min)
+           (integer-decode-double-denorm x))
+          ((> exp sb-vm:double-float-normal-exponent-max)
+           (error float-decoding-error x))
+          (t
+           ;; the count of digits [sic] includes a hidden bit
+           (values (logior (ldb (byte (1- sb-vm:double-float-digits) 0) bits)
+                           (ash sb-vm:double-float-hidden-bit 32))
+                   (- exp sb-vm:double-float-bias sb-vm:double-float-digits)
+                   (if (minusp bits) -1 1))))))
 
 #!+(and long-float x86)
 (defun integer-decode-long-denorm (x)
   (declare (type long-float x))
   (let* ((high-bits (long-float-high-bits (abs x)))
-         (sig-high (ldb sb!vm:long-float-significand-byte high-bits))
+         (sig-high (ldb sb-vm:long-float-significand-byte high-bits))
          (low-bits (long-float-low-bits x))
          (sign (if (minusp (float-sign x)) -1 1))
-         (biased (- (- sb!vm:long-float-bias) sb!vm:long-float-digits)))
+         (biased (- (- sb-vm:long-float-bias) sb-vm:long-float-digits)))
     (if (zerop sig-high)
         (let ((sig low-bits)
-              (extra-bias (- sb!vm:long-float-digits 33))
+              (extra-bias (- sb-vm:long-float-digits 33))
               (bit (ash 1 31)))
           (declare (type (unsigned-byte 32) sig) (fixnum extra-bias))
           (loop
             (unless (zerop (logand sig bit)) (return))
             (setq sig (ash sig 1))
             (incf extra-bias))
-          (values (ash sig (- sb!vm:long-float-digits 32))
+          (values (ash sig (- sb-vm:long-float-digits 32))
                   (truly-the fixnum (- biased extra-bias))
                   sign))
         (let ((sig (ash sig-high 1))
               (extra-bias 0))
           (declare (type (unsigned-byte 32) sig) (fixnum extra-bias))
           (loop
-            (unless (zerop (logand sig sb!vm:long-float-hidden-bit))
+            (unless (zerop (logand sig sb-vm:long-float-hidden-bit))
               (return))
             (setq sig (ash sig 1))
             (incf extra-bias))
@@ -309,16 +329,16 @@
   (let* ((hi (long-float-high-bits x))
          (lo (long-float-low-bits x))
          (exp-bits (long-float-exp-bits x))
-         (exp (ldb sb!vm:long-float-exponent-byte exp-bits))
+         (exp (ldb sb-vm:long-float-exponent-byte exp-bits))
          (sign (if (minusp exp-bits) -1 1))
-         (biased (- exp sb!vm:long-float-bias sb!vm:long-float-digits)))
+         (biased (- exp sb-vm:long-float-bias sb-vm:long-float-digits)))
     (declare (fixnum biased))
-    (unless (<= exp sb!vm:long-float-normal-exponent-max)
-      (error "can't decode NaN or infinity: ~S" x))
     (cond ((and (zerop exp) (zerop hi) (zerop lo))
            (values 0 biased sign))
-          ((< exp sb!vm:long-float-normal-exponent-min)
+          ((< exp sb-vm:long-float-normal-exponent-min)
            (integer-decode-long-denorm x))
+          ((> exp sb-vm:long-float-normal-exponent-max)
+           (error float-decoding-error x))
           (t
            (values (logior (ash hi 32) lo) biased sign)))))
 
@@ -349,78 +369,75 @@
   (declare (type single-float x))
   (multiple-value-bind (sig exp sign) (integer-decode-single-denorm x)
     (values (make-single-float
-             (dpb sig sb!vm:single-float-significand-byte
-                  (dpb sb!vm:single-float-bias
-                       sb!vm:single-float-exponent-byte
+             (dpb sig sb-vm:single-float-significand-byte
+                  (dpb sb-vm:single-float-bias
+                       sb-vm:single-float-exponent-byte
                        0)))
-            (truly-the fixnum (+ exp sb!vm:single-float-digits))
+            (truly-the fixnum (+ exp sb-vm:single-float-digits))
             (float sign x))))
 
 ;;; Handle the single-float case of DECODE-FLOAT. If an infinity or NaN,
 ;;; error. If a denorm, call d-s-DENORM to handle it.
 (defun decode-single-float (x)
   (declare (single-float x))
-  (let* ((bits (single-float-bits (abs x)))
-         (exp (ldb sb!vm:single-float-exponent-byte bits))
-         (sign (float-sign x))
-         (biased (truly-the single-float-exponent
-                            (- exp sb!vm:single-float-bias))))
-    (unless (<= exp sb!vm:single-float-normal-exponent-max)
-      (error "can't decode NaN or infinity: ~S" x))
-    (cond ((zerop x)
-           (values 0.0f0 biased sign))
-          ((< exp sb!vm:single-float-normal-exponent-min)
+  (let* ((bits (ldb (byte 31 0) (single-float-bits x))) ; unset the sign bit
+         (exp (ldb sb-vm:single-float-exponent-byte bits))
+         (sign (float-sign x)))
+    (cond ((zerop bits)
+           (values 0.0f0 0 sign))
+          ((< exp sb-vm:single-float-normal-exponent-min)
            (decode-single-denorm x))
+          ((> exp sb-vm:single-float-normal-exponent-max)
+           (error float-decoding-error x))
           (t
            (values (make-single-float
-                    (dpb sb!vm:single-float-bias
-                         sb!vm:single-float-exponent-byte
+                    (dpb sb-vm:single-float-bias ; set the effective exponent to 0
+                         sb-vm:single-float-exponent-byte
                          bits))
-                   biased sign)))))
+                   (truly-the single-float-exponent (- exp sb-vm:single-float-bias))
+                   sign)))))
 
 ;;; like DECODE-SINGLE-DENORM, only doubly so
 (defun decode-double-denorm (x)
   (declare (double-float x))
   (multiple-value-bind (sig exp sign) (integer-decode-double-denorm x)
     (values (make-double-float
-             (dpb (logand (ash sig -32) (lognot sb!vm:double-float-hidden-bit))
-                  sb!vm:double-float-significand-byte
-                  (dpb sb!vm:double-float-bias
-                       sb!vm:double-float-exponent-byte 0))
+             (dpb (logand (ash sig -32) (lognot sb-vm:double-float-hidden-bit))
+                  sb-vm:double-float-significand-byte
+                  (dpb sb-vm:double-float-bias
+                       sb-vm:double-float-exponent-byte 0))
              (ldb (byte 32 0) sig))
-            (truly-the fixnum (+ exp sb!vm:double-float-digits))
+            (truly-the fixnum (+ exp sb-vm:double-float-digits))
             (float sign x))))
 
 ;;; like DECODE-SINGLE-FLOAT, only doubly so
 (defun decode-double-float (x)
   (declare (double-float x))
-  (let* ((abs (abs x))
-         (hi (double-float-high-bits abs))
-         (lo (double-float-low-bits abs))
-         (exp (ldb sb!vm:double-float-exponent-byte hi))
-         (sign (float-sign x))
-         (biased (truly-the double-float-exponent
-                            (- exp sb!vm:double-float-bias))))
-    (unless (<= exp sb!vm:double-float-normal-exponent-max)
-      (error "can't decode NaN or infinity: ~S" x))
+  (let* ((hi (double-float-high-bits x))
+         (exp (ldb sb-vm:double-float-exponent-byte hi))
+         (sign (float-sign x)))
     (cond ((zerop x)
-           (values 0.0d0 biased sign))
-          ((< exp sb!vm:double-float-normal-exponent-min)
+           (values 0.0d0 0 sign))
+          ((< exp sb-vm:double-float-normal-exponent-min)
            (decode-double-denorm x))
+          ((> exp sb-vm:double-float-normal-exponent-max)
+           (error float-decoding-error x))
           (t
            (values (make-double-float
-                    (dpb sb!vm:double-float-bias
-                         sb!vm:double-float-exponent-byte hi)
-                    lo)
-                   biased sign)))))
+                    (dpb sb-vm:double-float-bias ; set the effective exponent to 0
+                         sb-vm:double-float-exponent-byte
+                         (ldb (byte 31 0) hi)) ; unset the sign bit
+                    (double-float-low-bits x))
+                   (truly-the double-float-exponent (- exp sb-vm:double-float-bias))
+                   sign)))))
 
 #!+(and long-float x86)
 (defun decode-long-denorm (x)
   (declare (long-float x))
   (multiple-value-bind (sig exp sign) (integer-decode-long-denorm x)
-    (values (make-long-float sb!vm:long-float-bias (ash sig -32)
+    (values (make-long-float sb-vm:long-float-bias (ash sig -32)
                              (ldb (byte 32 0) sig))
-            (truly-the fixnum (+ exp sb!vm:long-float-digits))
+            (truly-the fixnum (+ exp sb-vm:long-float-digits))
             (float sign x))))
 
 #!+(and long-float x86)
@@ -429,19 +446,19 @@
   (let* ((hi (long-float-high-bits x))
          (lo (long-float-low-bits x))
          (exp-bits (long-float-exp-bits x))
-         (exp (ldb sb!vm:long-float-exponent-byte exp-bits))
+         (exp (ldb sb-vm:long-float-exponent-byte exp-bits))
          (sign (if (minusp exp-bits) -1l0 1l0))
          (biased (truly-the long-float-exponent
-                            (- exp sb!vm:long-float-bias))))
-    (unless (<= exp sb!vm:long-float-normal-exponent-max)
-      (error "can't decode NaN or infinity: ~S" x))
+                            (- exp sb-vm:long-float-bias))))
     (cond ((zerop x)
            (values 0.0l0 biased sign))
-          ((< exp sb!vm:long-float-normal-exponent-min)
+          ((< exp sb-vm:long-float-normal-exponent-min)
            (decode-long-denorm x))
+          ((> exp sb-vm:long-float-normal-exponent-max)
+           (error float-decoding-error x))
           (t
            (values (make-long-float
-                    (dpb sb!vm:long-float-bias sb!vm:long-float-exponent-byte
+                    (dpb sb-vm:long-float-bias sb-vm:long-float-exponent-byte
                          exp-bits)
                     hi
                     lo)
@@ -471,22 +488,23 @@
 ;;; Handle float scaling where the X is denormalized or the result is
 ;;; denormalized or underflows to 0.
 (defun scale-float-maybe-underflow (x exp)
-  (multiple-value-bind (sig old-exp) (integer-decode-float x)
+  (multiple-value-bind (sig old-exp sign) (integer-decode-float x)
     (let* ((digits (float-digits x))
            (new-exp (+ exp old-exp digits
                        (etypecase x
-                         (single-float sb!vm:single-float-bias)
-                         (double-float sb!vm:double-float-bias))))
-           (sign (if (minusp (float-sign x)) 1 0)))
+                         (single-float sb-vm:single-float-bias)
+                         (double-float sb-vm:double-float-bias))))
+           ;; convert decoded values {-1,+1} into {1,0} respectively
+           (sign (if (minusp sign) 1 0)))
       (cond
        ((< new-exp
            (etypecase x
-             (single-float sb!vm:single-float-normal-exponent-min)
-             (double-float sb!vm:double-float-normal-exponent-min)))
-        (when (sb!vm:current-float-trap :inexact)
+             (single-float sb-vm:single-float-normal-exponent-min)
+             (double-float sb-vm:double-float-normal-exponent-min)))
+        (when (sb-vm:current-float-trap :inexact)
           (error 'floating-point-inexact :operation 'scale-float
                  :operands (list x exp)))
-        (when (sb!vm:current-float-trap :underflow)
+        (when (sb-vm:current-float-trap :underflow)
           (error 'floating-point-underflow :operation 'scale-float
                  :operands (list x exp)))
         (let ((shift (1- new-exp)))
@@ -511,25 +529,25 @@
     x)
    ((float-nan-p x)
     (when (and (float-trapping-nan-p x)
-               (sb!vm:current-float-trap :invalid))
+               (sb-vm:current-float-trap :invalid))
       (error 'floating-point-invalid-operation :operation 'scale-float
              :operands (list x exp)))
     x)
    (t
-    (when (sb!vm:current-float-trap :overflow)
+    (when (sb-vm:current-float-trap :overflow)
       (error 'floating-point-overflow :operation 'scale-float
              :operands (list x exp)))
-    (when (sb!vm:current-float-trap :inexact)
+    (when (sb-vm:current-float-trap :inexact)
       (error 'floating-point-inexact :operation 'scale-float
              :operands (list x exp)))
     (* (float-sign x)
        (etypecase x
          (single-float
           ;; SINGLE-FLOAT-POSITIVE-INFINITY
-          (single-from-bits 0 (1+ sb!vm:single-float-normal-exponent-max) 0))
+          (single-from-bits 0 (1+ sb-vm:single-float-normal-exponent-max) 0))
          (double-float
           ;; DOUBLE-FLOAT-POSITIVE-INFINITY
-          (double-from-bits 0 (1+ sb!vm:double-float-normal-exponent-max) 0)))))))
+          (double-from-bits 0 (1+ sb-vm:double-float-normal-exponent-max) 0)))))))
 
 ;;; Scale a single or double float, calling the correct over/underflow
 ;;; functions.
@@ -538,19 +556,19 @@
   (etypecase exp
     (fixnum
      (let* ((bits (single-float-bits x))
-            (old-exp (ldb sb!vm:single-float-exponent-byte bits))
+            (old-exp (ldb sb-vm:single-float-exponent-byte bits))
             (new-exp (+ old-exp exp)))
        (cond
          ((zerop x) x)
-         ((or (< old-exp sb!vm:single-float-normal-exponent-min)
-              (< new-exp sb!vm:single-float-normal-exponent-min))
+         ((or (< old-exp sb-vm:single-float-normal-exponent-min)
+              (< new-exp sb-vm:single-float-normal-exponent-min))
           (scale-float-maybe-underflow x exp))
-         ((or (> old-exp sb!vm:single-float-normal-exponent-max)
-              (> new-exp sb!vm:single-float-normal-exponent-max))
+         ((or (> old-exp sb-vm:single-float-normal-exponent-max)
+              (> new-exp sb-vm:single-float-normal-exponent-max))
           (scale-float-maybe-overflow x exp))
          (t
           (make-single-float (dpb new-exp
-                                  sb!vm:single-float-exponent-byte
+                                  sb-vm:single-float-exponent-byte
                                   bits))))))
     (unsigned-byte (scale-float-maybe-overflow x exp))
     ((integer * 0) (scale-float-maybe-underflow x exp))))
@@ -560,18 +578,18 @@
     (fixnum
      (let* ((hi (double-float-high-bits x))
             (lo (double-float-low-bits x))
-            (old-exp (ldb sb!vm:double-float-exponent-byte hi))
+            (old-exp (ldb sb-vm:double-float-exponent-byte hi))
             (new-exp (+ old-exp exp)))
        (cond
          ((zerop x) x)
-         ((or (< old-exp sb!vm:double-float-normal-exponent-min)
-              (< new-exp sb!vm:double-float-normal-exponent-min))
+         ((or (< old-exp sb-vm:double-float-normal-exponent-min)
+              (< new-exp sb-vm:double-float-normal-exponent-min))
           (scale-float-maybe-underflow x exp))
-         ((or (> old-exp sb!vm:double-float-normal-exponent-max)
-              (> new-exp sb!vm:double-float-normal-exponent-max))
+         ((or (> old-exp sb-vm:double-float-normal-exponent-max)
+              (> new-exp sb-vm:double-float-normal-exponent-max))
           (scale-float-maybe-overflow x exp))
          (t
-          (make-double-float (dpb new-exp sb!vm:double-float-exponent-byte hi)
+          (make-double-float (dpb new-exp sb-vm:double-float-exponent-byte hi)
                              lo)))))
     (unsigned-byte (scale-float-maybe-overflow x exp))
     ((integer * 0) (scale-float-maybe-underflow x exp))))
@@ -615,8 +633,8 @@
              `(defun ,name (x)
                 (number-dispatch ((x real))
                   (((foreach single-float double-float #!+long-float long-float
-                     sb!vm:signed-word
-                     ,@(and (sb!c::template-translates-arg-p '%double-float 0 'word)
+                     sb-vm:signed-word
+                     ,@(and (sb-c::template-translates-arg-p '%double-float 0 'word)
                             '(word))))
                    (coerce x ',type))
                   ((ratio)
@@ -668,12 +686,12 @@
                  (let ((sign (if plusp 0 1)))
                    (case format
                      (single-float
-                      (single-from-bits sign sb!vm:single-float-bias bits))
+                      (single-from-bits sign sb-vm:single-float-bias bits))
                      (double-float
-                      (double-from-bits sign sb!vm:double-float-bias bits))
+                      (double-from-bits sign sb-vm:double-float-bias bits))
                      #!+long-float
                      (long-float
-                      (long-from-bits sign sb!vm:long-float-bias bits))))))
+                      (long-from-bits sign sb-vm:long-float-bias bits))))))
         (loop
           (multiple-value-bind (fraction-and-guard rem)
               (truncate shifted-num den)
@@ -706,14 +724,14 @@
     (declare (single-float x) (values fixnum))
     (locally (declare (optimize (speed 3) (safety 0)))
       (let* ((bits (single-float-bits x))
-             (exp (ldb sb!vm:single-float-exponent-byte bits))
-             (frac (logior (ldb sb!vm:single-float-significand-byte bits)
-                           sb!vm:single-float-hidden-bit))
-             (shift (- exp sb!vm:single-float-digits sb!vm:single-float-bias)))
-        (when (> exp sb!vm:single-float-normal-exponent-max)
+             (exp (ldb sb-vm:single-float-exponent-byte bits))
+             (frac (logior (ldb sb-vm:single-float-significand-byte bits)
+                           sb-vm:single-float-hidden-bit))
+             (shift (- exp sb-vm:single-float-digits sb-vm:single-float-bias)))
+        (when (> exp sb-vm:single-float-normal-exponent-max)
           (error 'floating-point-invalid-operation :operator 'truncate
                  :operands (list x)))
-        (if (<= shift (- sb!vm:single-float-digits))
+        (if (<= shift (- sb-vm:single-float-digits))
             0
             (let ((res (ash frac shift)))
               (declare (type (unsigned-byte 31) res))
@@ -725,22 +743,22 @@
     (declare (double-float x) (values fixnum))
     (locally (declare (optimize (speed 3) (safety 0)))
       (let* ((hi-bits (double-float-high-bits x))
-             (exp (ldb sb!vm:double-float-exponent-byte hi-bits))
-             (frac (logior (ldb sb!vm:double-float-significand-byte hi-bits)
-                           sb!vm:double-float-hidden-bit))
-             (shift (- exp (- sb!vm:double-float-digits sb!vm:n-word-bits)
-                       sb!vm:double-float-bias)))
-        (when (> exp sb!vm:double-float-normal-exponent-max)
+             (exp (ldb sb-vm:double-float-exponent-byte hi-bits))
+             (frac (logior (ldb sb-vm:double-float-significand-byte hi-bits)
+                           sb-vm:double-float-hidden-bit))
+             (shift (- exp (- sb-vm:double-float-digits sb-vm:n-word-bits)
+                       sb-vm:double-float-bias)))
+        (when (> exp sb-vm:double-float-normal-exponent-max)
           (error 'floating-point-invalid-operation :operator 'truncate
                  :operands (list x)))
-        (if (<= shift (- sb!vm:n-word-bits sb!vm:double-float-digits))
+        (if (<= shift (- sb-vm:n-word-bits sb-vm:double-float-digits))
             0
             (let* ((res-hi (ash frac shift))
                    (res (if (plusp shift)
                             (logior res-hi
                                     (the fixnum
                                       (ash (double-float-low-bits x)
-                                           (- shift sb!vm:n-word-bits))))
+                                           (- shift sb-vm:n-word-bits))))
                             res-hi)))
               (declare (type (unsigned-byte 31) res-hi res))
               (if (minusp hi-bits)
@@ -764,9 +782,8 @@
     ((integer) number)
     ((ratio) (values (truncate (numerator number) (denominator number))))
     (((foreach single-float double-float #!+long-float long-float))
-     (if (< (float most-negative-fixnum number)
-            number
-            (float most-positive-fixnum number))
+     (if (and (<= (float most-negative-fixnum number) number)
+              (< number (float most-positive-fixnum number)))
          (truly-the fixnum (%unary-truncate number))
          (multiple-value-bind (bits exp) (integer-decode-float number)
            (let ((res (ash bits exp)))
@@ -777,9 +794,8 @@
 ;;; Specialized versions for floats.
 (macrolet ((def (type name)
              `(defun ,name (number)
-                (if (< ,(coerce sb!xc:most-negative-fixnum type)
-                       number
-                       ,(coerce sb!xc:most-positive-fixnum type))
+                (if (and (<= ,(coerce sb-xc:most-negative-fixnum type) number)
+                         (< number ,(coerce sb-xc:most-positive-fixnum type)))
                     (truly-the fixnum (,name number))
                     ;; General -- slow -- case.
                     (multiple-value-bind (bits exp) (integer-decode-float number)

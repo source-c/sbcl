@@ -50,17 +50,17 @@
 (defun type-checker (type)
   (labels
       ((get-unary-predicate (type)
-         (dolist (entry sb-c::*backend-type-predicates*)
-           ;; Slowish, because there's no hashtable for TYPE=, but better
-           ;; than the alternative of not using these at all!
-           (when (type= type (car entry))
-             (return (symbol-function (cdr entry))))))
+         (let ((pred (sb-c::backend-type-predicate type)))
+           (when pred
+             (symbol-function pred))))
        (simplify (type)
          (etypecase type
            ((or named-type numeric-type member-type classoid
                 character-set-type unknown-type hairy-type
-                alien-type-type #+sb-simd-pack simd-pack-type)
+                alien-type-type #+sb-simd-pack simd-pack-type
+                                #+sb-simd-pack-256 simd-pack-256-type)
             type)
+           (fun-designator-type (specifier-type '(or function symbol)))
            (fun-type (specifier-type 'function))
            (compound-type
             (let* ((original (compound-type-types type))
@@ -187,8 +187,3 @@
   ())
 (define-condition compiler-environment-too-complex-error (simple-error)
   ())
-
-(defun ip-error (format-control &rest format-arguments)
-  (error 'sb-int:simple-program-error
-         :format-control format-control
-         :format-arguments format-arguments))

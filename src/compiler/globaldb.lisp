@@ -32,7 +32,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 #-no-ansi-print-object
 (defmethod print-object ((x meta-info) stream)
@@ -90,16 +90,16 @@
 #-sb-xc
 (setf (get '!%define-info-type :sb-cold-funcall-handler/for-effect)
       (lambda (category kind type-spec checker validator default id)
-        ;; The SB!FASL: symbols are poor style, but the lesser evil.
+        ;; The SB-FASL: symbols are poor style, but the lesser evil.
         ;; If exported, then they'll stick around in the target image.
         ;; Perhaps SB-COLD should re-export some of these.
-        (declare (special sb!fasl::*dynamic* sb!fasl::*cold-layouts*))
-        (let ((layout (gethash 'meta-info sb!fasl::*cold-layouts*)))
-          (sb!fasl::cold-svset
-           (sb!fasl::cold-symbol-value '*info-types*)
+        (declare (special sb-fasl::*dynamic* sb-fasl::*cold-layouts*))
+        (let ((layout (gethash 'meta-info sb-fasl::*cold-layouts*)))
+          (sb-fasl::cold-svset
+           (sb-fasl::cold-symbol-value '*info-types*)
            id
-           (sb!fasl::write-slots
-            (sb!fasl::allocate-struct sb!fasl::*dynamic* layout)
+           (sb-fasl::write-slots
+            (sb-fasl::allocate-struct sb-fasl::*dynamic* layout)
             'meta-info ; give the type name in lieu of layout
             :category category :kind kind :type-spec type-spec
             :type-checker checker :validate-function validator
@@ -124,15 +124,10 @@
 ;;;  :DEFAULT (CONSTANTLY #'<a-function-name>) to adhere to the convention
 ;;; that default objects satisfying FUNCTIONP will always be funcalled.
 ;;;
-(eval-when (:compile-toplevel :execute)
-;; This convoluted idiom creates a macro that disappears from the target,
-;; kind of an alternative to the "!" name convention.
-(#+sb-xc-host defmacro
- #-sb-xc-host sb!xc:defmacro
-    define-info-type ((category kind)
-                       &key (type-spec (missing-arg))
-                            (validate-function)
-                            default)
+(defmacro define-info-type ((category kind)
+                            &key (type-spec (missing-arg))
+                                 (validate-function)
+                                 default)
   (declare (type keyword category kind))
   ;; There was formerly a remark that (COPY-TREE TYPE-SPEC) ensures repeatable
   ;; fasls. That's not true now, probably never was. A compiler is permitted to
@@ -146,7 +141,9 @@
            ;; Rationale for hardcoding here is explained at INFO-VECTOR-FDEFN.
            ,(or (and (eq category :function) (eq kind :definition)
                      +fdefn-info-num+)
-                #+sb-xc (meta-info-number (meta-info category kind))))))
+                #+sb-xc (meta-info-number (meta-info category kind)))))
+;; It's an external symbol of SB-INT so wouldn't be removed automatically
+(push '("SB-INT" define-info-type) *!removable-symbols*)
 
 
 (macrolet ((meta-info-or-lose (category kind)
@@ -216,17 +213,24 @@
   ;; from keyword-pair to object is deferred until cold-init.
   (dovector (x (the simple-vector *info-types*))
     (when x (!register-meta-info x)))
-  (setq *info-environment* (make-info-hashtable)))
+  #-sb-xc-host (setq *info-environment* (make-info-hashtable)))
 
 ;;;; GET-INFO-VALUE
 
 ;;; If non-nil, *GLOBALDB-OBSERVER*'s CAR is a bitmask over info numbers
 ;;; for which you'd like to call the function in the CDR whenever info
 ;;; of that number is queried.
-(!defvar *globaldb-observer* nil)
+(defparameter *globaldb-observer* nil)
 (declaim (type (or (cons (unsigned-byte #.(ash 1 info-number-bits)) function)
                    null) *globaldb-observer*))
 #-sb-xc-host (declaim (always-bound *globaldb-observer*))
+
+#+sb-xc-host
+(progn
+  (defun info-gethash (key table) (gethash key table))
+  (defun info-puthash (table key augmenter)
+    (let ((old (gethash key table)))
+      (setf (gethash key table) (funcall augmenter old)))))
 
 ;;; Return the value of NAME / INFO-NUMBER from the global environment,
 ;;; or return the default if there is no global info.
@@ -259,31 +263,10 @@
       (when hookp
         (funcall (truly-the function (cdr hook)) name info-number answer nil))
       (values answer nil))))
-
-;; Call FUNCTION once for each Name in globaldb that has information associated
-;; with it, passing the function the Name as its only argument.
-;;
-(defun call-with-each-globaldb-name (fun-designator)
-  (let ((function (coerce fun-designator 'function)))
-    (with-package-iterator (iter (list-all-packages) :internal :external)
-      (loop (multiple-value-bind (winp symbol access package) (iter)
-              (declare (ignore access))
-              (if (not winp) (return))
-              ;; Try to process each symbol at most once by associating it with
-              ;; a single package. If a symbol is apparently uninterned,
-              ;; always keep it since we can't know if it has been seen once.
-              (when (or (not (symbol-package symbol))
-                        (eq package (symbol-package symbol)))
-                (dolist (name (info-vector-name-list symbol))
-                  (funcall function name))))))
-    (info-maphash (lambda (name data)
-                    (declare (ignore data))
-                    (funcall function name))
-                  *info-environment*)))
 
 ;;;; ":FUNCTION" subsection - Data pertaining to globally known functions.
 
-(define-info-type (:function :definition) :type-spec (or fdefn null))
+(define-info-type (:function :definition) :type-spec (or #-sb-xc-host fdefn null))
 
 ;;; the kind of functional object being described. If null, NAME isn't
 ;;; a known functional object.
@@ -299,12 +282,17 @@
   #+sb-xc-host nil
   #-sb-xc-host (lambda (name) (if (fboundp name) :function nil)))
 
+;;; The deferred mode processor for fasteval special operators.
+;;; Immediate processors are hung directly off symbols in a dedicated slot.
+#!+sb-fasteval
+(define-info-type (:function :interpreter) :type-spec (or function null))
+
 ;;; Indicates whether the function is deprecated.
 (define-info-type (:function :deprecated)
   :type-spec (or null deprecation-info))
 
 (declaim (ftype (sfunction (t) ctype)
-                specifier-type ctype-of sb!kernel::ctype-of-array))
+                specifier-type ctype-of sb-kernel::ctype-of-array))
 
 ;;; the ASSUMED-TYPE for this function, if we have to infer the type
 ;;; due to not having a declaration or definition
@@ -335,17 +323,21 @@
   #+sb-xc-host :assumed
   #-sb-xc-host (lambda (name) (if (fboundp name) :defined :assumed)))
 
-;;; something which can be decoded into the inline expansion of the
-;;; function, or NIL if there is none
-;;;
-;;; To inline a function, we want a lambda expression, e.g.
-;;; '(LAMBDA (X) (+ X 1)).
-(define-info-type (:function :inline-expansion-designator)
-  :type-spec list)
+;;; Two kinds of hints for compiling calls as efficiently as possible:
+;;; (A) Inline expansion: To inline a function, we want a lambda
+;;; expression, e.g. '(LAMBDA (X) (+ X 1)) or a lambda-with-lexenv.
+;;; (B) List of arguments which could be dynamic-extent closures, and which
+;;; we could, under suitable compilation policy, DXify in the caller
+;;; especially when open-coding a call to this function.
+;;; If only (A) is stored, then this value is a list (the lambda expression).
+;;; If only (B) is stored, then this is a DXABLE-ARGS.
+;;; If both, this is an INLINING-DATA.
+(define-info-type (:function :inlining-data)
+    :type-spec (or list sb-c::dxable-args sb-c::inlining-data))
 
 ;;; This specifies whether this function may be expanded inline. If
 ;;; null, we don't care.
-(define-info-type (:function :inlinep) :type-spec sb!c::inlinep)
+(define-info-type (:function :inlinep) :type-spec sb-c::inlinep)
 
 ;;; Track how many times IR2 converted a call to this function as a full call
 ;;; that was not in the scope of a local or global notinline declaration.
@@ -380,7 +372,7 @@
 
 ;;; If a function is "known" to the compiler, then this is a FUN-INFO
 ;;; structure containing the info used to special-case compilation.
-(define-info-type (:function :info) :type-spec (or sb!c::fun-info null))
+(define-info-type (:function :info) :type-spec (or sb-c::fun-info null))
 
 ;;; This is a type specifier <t> such that if an argument X to the function
 ;;; does not satisfy (TYPEP x <t>) then the function definitely returns NIL.
@@ -423,15 +415,14 @@
 (define-info-type (:variable :macro-expansion) :type-spec t)
 
 (define-info-type (:variable :alien-info)
-  :type-spec (or null sb!alien-internals:heap-alien-info))
+  :type-spec (or null sb-alien-internals:heap-alien-info))
 
 (define-info-type (:variable :documentation) :type-spec (or string null))
 
 ;; :WIRED-TLS describes how SYMBOL-VALUE (implicit or not) should be compiled.
-;;  - :ALWAYS-HAS-TLS means that calls to SYMBOL-VALUE should access the TLS
-;;     with a fixed offset. The index is assigned no later than load-time of
-;;     the file containing code thus compiled. Presence of an index in the
-;;     image that performed compilation is irrelevant (for now).
+;;  - T means that SYMBOL-VALUE should access the TLS with a fixed offset,
+;;     resolved at load-time. Presence of an index in the image that performed
+;;     compilation is irrelevant (for now).
 ;;  - :ALWAYS-THREAD-LOCAL implies a fixed offset, *and* that the check for
 ;;     no-tls-value may be elided. There is currently no way to set this.
 ;;     Note that this does not affect elision of the check for unbound-marker
@@ -447,24 +438,9 @@
 ;; ever referenced by SYMBOL-VALUE or SET. Depletion should occur lazily.
 ;;
 (define-info-type (:variable :wired-tls)
-    :type-spec (or (member nil :always-has-tls :always-thread-local)
-                   fixnum) ; the actual index, for thread slots (to be done)
-    :default
-    (lambda (symbol)
-      (declare (symbol symbol))
-      (and (eq (info :variable :kind symbol) :special)
-           #-sb-xc-host
-           (eq (symbol-package symbol) *cl-package*)
-           #+sb-xc-host
-           (flet ((external-in-package-p (pkg)
-                    (and (string= (package-name (symbol-package symbol)) pkg)
-                         (eq (nth-value 1 (find-symbol (string symbol) pkg))
-                             :external))))
-             ;; I'm not worried about random extra externals in some bizarro
-             ;; host lisp. TLS assignment has no bearing on semantics at all.
-             (or (external-in-package-p "COMMON-LISP")
-                 (external-in-package-p "SB-XC")))
-           :always-has-tls)))
+    :type-spec (or (member nil t :always-thread-local)
+                   fixnum) ; the actual index, for thread slots
+    :default nil)
 
 ;;;; ":TYPE" subsection - Data pertaining to globally known types.
 
@@ -547,13 +523,13 @@
   :default :unknown)
 (define-info-type (:alien-type :translator) :type-spec (or function null))
 (define-info-type (:alien-type :definition)
-  :type-spec (or null sb!alien-internals:alien-type))
+  :type-spec (or null sb-alien-internals:alien-type))
 (define-info-type (:alien-type :struct)
-  :type-spec (or null sb!alien-internals:alien-type))
+  :type-spec (or null sb-alien-internals:alien-type))
 (define-info-type (:alien-type :union)
-  :type-spec (or null sb!alien-internals:alien-type))
+  :type-spec (or null sb-alien-internals:alien-type))
 (define-info-type (:alien-type :enum)
-  :type-spec (or null sb!alien-internals:alien-type))
+  :type-spec (or null sb-alien-internals:alien-type))
 
 ;;;; ":SETF" subsection - Data pertaining to expansion of the omnipotent macro.
 (define-info-type (:setf :documentation) :type-spec (or string null))
@@ -581,7 +557,6 @@
 (define-info-type (:source-location :constant) :type-spec t)
 (define-info-type (:source-location :typed-structure) :type-spec t)
 (define-info-type (:source-location :symbol-macro) :type-spec t)
-(define-info-type (:source-location :vop) :type-spec t)
 (define-info-type (:source-location :declaration) :type-spec t)
 (define-info-type (:source-location :alien-type) :type-spec t)
 
@@ -602,5 +577,5 @@
                  (if (not type) type-num)
                  (if type
                      (list (meta-info-category type) (meta-info-kind type))))
-         (write val :level 1)))
+         (write val :level 2)))
      sym)))

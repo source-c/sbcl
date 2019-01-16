@@ -11,101 +11,27 @@
 (load "src/cold/defun-load-or-cload-xcompiler.lisp")
 (load-or-cload-xcompiler #'host-load-stem)
 
-(let ((*features* (cons :sb-xc *features*)))
-  (load "src/cold/muffler.lisp"))
-
-;; Avoid forward-reference to an as-yet unknown type.
-;; NB: This is not how you would write this function, if you required
-;; such a thing. It should be (TYPEP X 'CODE-DELETION-NOTE).
-;; Do as I say, not as I do.
-(defun code-deletion-note-p (x)
-  (eq (type-of x) 'sb!ext:code-deletion-note))
-(setq sb!c::*handled-conditions*
-      `((,(sb!kernel:specifier-type
-           '(or (satisfies unable-to-optimize-note-p)
-                (satisfies code-deletion-note-p)))
-         . muffle-warning)))
-
-(defun proclaim-target-optimization ()
-  (let ((debug (if (position :sb-show *shebang-features*) 2 1)))
-    (sb-xc:proclaim
-     `(optimize
-       (compilation-speed 1) (debug ,debug)
-       ;; CLISP's pretty-printer is fragile and tends to cause stack
-       ;; corruption or fail internal assertions, as of 2003-04-20; we
-       ;; therefore turn off as many notes as possible.
-       (sb!ext:inhibit-warnings #-clisp 2 #+clisp 3)
-       ;; SAFETY = SPEED (and < 3) should provide reasonable safety,
-       ;; but might skip some unreasonably expensive stuff
-       ;; (e.g. %DETECT-STACK-EXHAUSTION in sbcl-0.7.2).
-       (safety 2) (space 1) (speed 2)
-       ;; sbcl-internal optimization declarations:
-       ;;
-       ;; never insert stepper conditions
-       (sb!c:insert-step-conditions 0)
-       ;; save FP and PC for alien calls -- or not
-       (sb!c:alien-funcall-saves-fp-and-pc #!+x86 3 #!-x86 0)))))
-(compile 'proclaim-target-optimization)
-
-(defun in-target-cross-compilation-mode (fun)
-  "Call FUN with everything set up appropriately for cross-compiling
-   a target file."
-  (let (;; In order to increase microefficiency of the target Lisp,
-        ;; enable old CMU CL defined-function-types-never-change
-        ;; optimizations. (ANSI says users aren't supposed to
-        ;; redefine our functions anyway; and developers can
-        ;; fend for themselves.)
-        #!-sb-fluid
-        (sb!ext:*derive-function-types* t)
-        ;; Let the target know that we're the cross-compiler.
-        (*features* (cons :sb-xc *features*))
-        ;; We need to tweak the readtable..
-        (*readtable* (copy-readtable)))
-    ;; ..in order to make backquotes expand into target code
-    ;; instead of host code.
-    ;; FIXME: Isn't this now taken care of automatically by
-    ;; toplevel forms in the xcompiler backq.lisp file?
-    (set-macro-character #\` #'sb!impl::backquote-charmacro)
-    (set-macro-character #\, #'sb!impl::comma-charmacro)
-
-    (set-dispatch-macro-character #\# #\+ #'she-reader)
-    (set-dispatch-macro-character #\# #\- #'she-reader)
-    ;; Control optimization policy.
-    (proclaim-target-optimization)
-    ;; Specify where target machinery lives.
-    (with-additional-nickname ("SB-XC" "SB!XC")
-      (funcall fun))))
-(compile 'in-target-cross-compilation-mode)
-
-
 ;; Supress function/macro redefinition warnings under clisp.
 #+clisp (setf custom:*suppress-check-redefinition* t)
 
-(setf *target-compile-file* #'sb-xc:compile-file)
-(setf *target-assemble-file* #'sb!c:assemble-file)
-(setf *in-target-compilation-mode-fn* #'in-target-cross-compilation-mode)
-
 ;;; Run the cross-compiler to produce cold fasl files.
-;; ... and since the cross-compiler hasn't seen a DEFMACRO for QUASIQUOTE,
-;; make it think it has, otherwise it fails more-or-less immediately.
-(setf (sb-xc:macro-function 'sb!int:quasiquote)
-      (lambda (form env)
-        (the sb!kernel:lexenv-designator env)
-        (sb!impl::expand-quasiquote (second form) t)))
-(setq sb!c::*track-full-called-fnames* :minimal) ; Change this as desired
+(setq sb-c::*track-full-called-fnames* :minimal) ; Change this as desired
+(setq sb-c::*static-vop-usage-counts* (make-hash-table))
 (let (fail
       variables
       functions
       types)
   (sb-xc:with-compilation-unit ()
-    (load "src/cold/compile-cold-sbcl.lisp")
+    (let ((*feature-evaluation-results* nil))
+      (load "src/cold/compile-cold-sbcl.lisp")
+      (sanity-check-feature-evaluation))
     ;; Enforce absence of unexpected forward-references to warm loaded code.
     ;; Looking into a hidden detail of this compiler seems fair game.
     #!+(or x86 x86-64 arm64) ; until all the rest are clean
-    (when sb!c::*undefined-warnings*
+    (when sb-c::*undefined-warnings*
       (setf fail t)
-      (dolist (warning sb!c::*undefined-warnings*)
-        (case (sb!c::undefined-warning-kind warning)
+      (dolist (warning sb-c::*undefined-warnings*)
+        (case (sb-c::undefined-warning-kind warning)
           (:variable (setf variables t))
           (:type (setf types t))
           (:function (setf functions t))))))
@@ -117,18 +43,32 @@
              ~:[~;functions (incomplete SB-COLD::*UNDEFINED-FUN-WHITELIST*?)~]"
             variables types functions)))
 
-(when sb!c::*track-full-called-fnames*
+#-clisp ; DO-ALL-SYMBOLS seems to kill CLISP at random
+(do-all-symbols (s)
+  (when (and (sb-int:info :function :inlinep s)
+             (eq (sb-int:info :function :where-from s) :assumed))
+      (warn "Did you forget to define ~S?" s)))
+
+;; enable this too see which vops were or weren't used
+#+nil
+(when (hash-table-p sb-c::*static-vop-usage-counts*)
+  (format t "Vops used:~%")
+  (dolist (cell (sort (sb-int:%hash-table-alist sb-c::*static-vop-usage-counts*)
+                      #'> :key #'cdr))
+    (format t "~6d ~s~%" (cdr cell) (car cell))))
+
+(when sb-c::*track-full-called-fnames*
   (let (possibly-suspicious likely-suspicious)
-    (sb!int:call-with-each-globaldb-name
+    (sb-int:call-with-each-globaldb-name
      (lambda (name)
-       (let* ((cell (sb!int:info :function :emitted-full-calls name))
-              (inlinep (eq (sb!int:info :function :inlinep name) :inline))
-              (info (sb!int:info :function :info name)))
+       (let* ((cell (sb-int:info :function :emitted-full-calls name))
+              (inlinep (eq (sb-int:info :function :inlinep name) :inline))
+              (info (sb-int:info :function :info name)))
          (if (and cell
                   (or inlinep
-                      (and info (sb!c::fun-info-templates info))
-                      (sb!int:info :function :compiler-macro-function name)
-                      (sb!int:info :function :source-transform name)))
+                      (and info (sb-c::fun-info-templates info))
+                      (sb-int:info :function :compiler-macro-function name)
+                      (sb-int:info :function :source-transform name)))
              (if inlinep
                  ;; A full call to an inline function almost always indicates
                  ;; an out-of-order definition. If not an inline function,
@@ -156,20 +96,20 @@
 ;; After cross-compiling, show me a list of types that checkgen
 ;; would have liked to use primitive traps for but couldn't.
 #+nil
-(let ((l (sb-impl::%hash-table-alist sb!c::*checkgen-used-types*)))
+(let ((l (sb-impl::%hash-table-alist sb-c::*checkgen-used-types*)))
   (format t "~&Types needed by checkgen: ('+' = has internal error number)~%")
   (setq l (sort l #'> :key #'cadr))
   (loop for (type-spec . (count . interr-p)) in l
         do (format t "~:[ ~;+~] ~5D ~S~%" interr-p count type-spec))
   (format t "~&Error numbers not used by checkgen:~%")
-  (loop for (spec symbol) across sb!c:+backend-internal-errors+
+  (loop for (spec symbol) across sb-c:+backend-internal-errors+
         when (and (not (stringp spec))
-                  (not (gethash spec sb!c::*checkgen-used-types*)))
+                  (not (gethash spec sb-c::*checkgen-used-types*)))
         do (format t "       ~S~%" spec)))
 
-;; Print some information about how well the function caches performed
-(when sb!impl::*profile-hash-cache*
-  (sb!impl::show-hash-cache-statistics))
+;; Print some information about how well the type operator caches performed
+(when sb-impl::*profile-hash-cache*
+  (sb-impl::show-hash-cache-statistics))
 #|
 Sample output
 -------------
@@ -194,12 +134,6 @@ Sample output
     10416      9492 ( 91.1%)      668 (  6.4%)  256  100.0% TYPE-NEGATION-CACHE
 |#
 
-;;; miscellaneous tidying up and saving results
-(let ((filename "output/object-filenames-for-genesis.lisp-expr"))
-  (ensure-directories-exist filename :verbose t)
-  (with-open-file (s filename :direction :output :if-exists :supersede)
-    (write *target-object-file-names* :stream s :readably t)))
-
 ;;; Let's check that the type system was reasonably sane. (It's easy
 ;;; to spend a long time wandering around confused trying to debug
 ;;; cold init if it wasn't.)
@@ -210,8 +144,9 @@ Sample output
 ;;; time to run it. The resulting core isn't used in the normal build,
 ;;; but can be handy for experimenting with the system. (See slam.sh
 ;;; for an example.)
-(when (position :sb-after-xc-core *shebang-features*)
+#+sb-after-xc-core
+(progn
   #+cmu (ext:save-lisp "output/after-xc.core" :load-init-file nil)
-  #+sbcl (sb-ext:save-lisp-and-die "output/after-xc.core")
+  #+sbcl (host-sb-ext:save-lisp-and-die "output/after-xc.core")
   #+openmcl (ccl::save-application "output/after-xc.core")
   #+clisp (ext:saveinitmem "output/after-xc.core"))

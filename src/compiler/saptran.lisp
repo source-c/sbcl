@@ -9,56 +9,57 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; DEFKNOWNs
 
 #!+linkage-table
-(deftransform foreign-symbol-address ((symbol &optional datap) (simple-string boolean)
-                                      * :important t :policy :fast-safe)
-  (if (and (constant-lvar-p symbol)
-           (constant-lvar-p datap)
-           #!+sb-dynamic-core (not (lvar-value datap)))
+(deftransform foreign-symbol-address ((symbol &optional datap)
+                                      ((constant-arg simple-string)
+                                       &optional (constant-arg boolean)))
+  (if (and #!+sb-dynamic-core
+           (not (and datap (lvar-value datap))))
       `(values (sap-int (foreign-symbol-sap symbol datap))
                (or #!+sb-dynamic-core t))
       (give-up-ir1-transform)))
 
 (deftransform foreign-symbol-sap ((symbol &optional datap)
-                                      (simple-string &optional boolean))
-    #!-linkage-table
-    (if (null datap)
-        (give-up-ir1-transform)
-        `(foreign-symbol-sap symbol))
-    #!+linkage-table
-    (if (and (constant-lvar-p symbol) (constant-lvar-p datap))
-        (let (#!-sb-dynamic-core (name (lvar-value symbol))
-              (datap (lvar-value datap)))
-          #!-sb-dynamic-core
-          (if (or #+sb-xc-host t ; only static symbols on host
-                  (not datap)
-                  (find-foreign-symbol-in-table name *static-foreign-symbols*))
-              `(foreign-symbol-sap ,name) ; VOP
-              `(foreign-symbol-dataref-sap ,name)) ; VOP
-          #!+sb-dynamic-core
-          (if datap
-              `(foreign-symbol-dataref-sap symbol)
-              `(foreign-symbol-sap symbol)))
-        (give-up-ir1-transform)))
+                                  (simple-string &optional boolean))
+  #!-linkage-table
+  (if (null datap)
+      (give-up-ir1-transform)
+      `(foreign-symbol-sap symbol))
+  #!+linkage-table
+  (if (and (constant-lvar-p symbol) (constant-lvar-p datap))
+      (let (#!-sb-dynamic-core (name (lvar-value symbol))
+            (datap (lvar-value datap)))
+        #!-sb-dynamic-core
+        (if (or #+sb-xc-host t          ; only static symbols on host
+                (not datap)
+                (find-foreign-symbol-in-table name *static-foreign-symbols*))
+            `(foreign-symbol-sap ,name)            ; VOP
+            `(foreign-symbol-dataref-sap ,name))   ; VOP
+        #!+sb-dynamic-core
+        (if datap
+            `(foreign-symbol-dataref-sap symbol)
+            `(foreign-symbol-sap symbol)))
+      (give-up-ir1-transform)))
 
 (defknown (sap< sap<= sap= sap>= sap>)
           (system-area-pointer system-area-pointer) boolean
   (movable flushable))
 
-(defknown sap+ (system-area-pointer integer) system-area-pointer
+(defknown sap+ (system-area-pointer (signed-byte #.sb-vm:n-word-bits))
+               system-area-pointer
   (movable flushable))
 (defknown sap- (system-area-pointer system-area-pointer)
-               (signed-byte #.sb!vm::n-word-bits)
+               (signed-byte #.sb-vm:n-machine-word-bits)
   (movable flushable))
 
 (defknown sap-int (system-area-pointer)
-  (unsigned-byte #.sb!vm::n-machine-word-bits)
+  (unsigned-byte #.sb-vm::n-machine-word-bits)
   (movable flushable foldable))
-(defknown int-sap ((unsigned-byte #.sb!vm::n-machine-word-bits))
+(defknown int-sap ((unsigned-byte #.sb-vm::n-machine-word-bits))
   system-area-pointer (movable))
 
 (macrolet ((defsapref (fun value-type)
@@ -82,12 +83,12 @@
   (defsapref sap-ref-16 (unsigned-byte 16))
   (defsapref sap-ref-32 (unsigned-byte 32))
   (defsapref sap-ref-64 (unsigned-byte 64))
-  (defsapref sap-ref-word (unsigned-byte #.sb!vm:n-word-bits))
+  (defsapref sap-ref-word (unsigned-byte #.sb-vm:n-word-bits))
   (defsapref signed-sap-ref-8 (signed-byte 8))
   (defsapref signed-sap-ref-16 (signed-byte 16))
   (defsapref signed-sap-ref-32 (signed-byte 32))
   (defsapref signed-sap-ref-64 (signed-byte 64))
-  (defsapref signed-sap-ref-word (signed-byte #.sb!vm:n-word-bits))
+  (defsapref signed-sap-ref-word (signed-byte #.sb-vm:n-word-bits))
   (defsapref sap-ref-sap system-area-pointer)
   (defsapref sap-ref-lispobj t)
   (defsapref sap-ref-single single-float)
@@ -131,7 +132,7 @@
                 ,(unless (and (listp value-type)
                               (or (eq (first value-type) 'unsigned-byte)
                                   (eq (first value-type) 'signed-byte))
-                              (> (second value-type) sb!vm:n-word-bits))
+                              (> (second value-type) sb-vm:n-word-bits))
                    #!+x86
                    (let ((with-offset-fun (intern (format nil "~A-WITH-OFFSET" fun))))
                      `(progn
@@ -179,7 +180,7 @@
 
 (macrolet ((def (fun args 32-bit 64-bit)
                `(deftransform ,fun (,args)
-                  (ecase sb!vm::n-word-bits
+                  (ecase sb-vm::n-word-bits
                     (32 '(,32-bit ,@args))
                     (64 '(,64-bit ,@args))))))
   (def sap-ref-word (sap offset) sap-ref-32 sap-ref-64)
@@ -193,7 +194,7 @@
 
 #!-64-bit-registers
 (progn
-#!+#.(cl:if (cl:eq :little-endian sb!c:*backend-byte-order*) '(and) '(or))
+#!+#.(cl:if (cl:eq :little-endian sb-c:*backend-byte-order*) '(and) '(or))
 (progn
   (deftransform sap-ref-64 ((sap offset) (* *))
     '(logior (sap-ref-32 sap offset)
@@ -213,7 +214,7 @@
        (%set-sap-ref-32 sap offset (logand value #xffffffff))
        (%set-signed-sap-ref-32 sap (+ offset 4) (ash value -32)))))
 
-#!+#.(cl:if (cl:eq :big-endian sb!c:*backend-byte-order*) '(and) '(or))
+#!+#.(cl:if (cl:eq :big-endian sb-c:*backend-byte-order*) '(and) '(or))
 (progn
   (deftransform sap-ref-64 ((sap offset) (* *))
     '(logior (ash (sap-ref-32 sap offset) 32)
@@ -232,4 +233,4 @@
     '(progn
        (%set-signed-sap-ref-32 sap offset (ash value -32))
        (%set-sap-ref-32 sap (+ 4 offset) (logand value #xffffffff)))))
-) ; (= 32 SB!VM:N-MACHINE-WORD-BITS)
+) ; (= 32 SB-VM:N-MACHINE-WORD-BITS)

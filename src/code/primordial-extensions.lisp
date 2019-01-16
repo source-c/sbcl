@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;; Helper for making the DX closure allocation in macros expanding
 ;;; to CALL-WITH-FOO less ugly.
@@ -27,6 +27,14 @@
                ,@(mapcar (lambda (bind) (if (listp bind) (car bind) bind))
                          bindings)))
      ,@forms))
+
+;;; like Scheme's named LET
+(defmacro named-let (name binds &body body)
+  (dolist (x binds)
+    (unless (proper-list-of-length-p x 2)
+      (error "malformed NAMED-LET variable spec: ~S" x)))
+  `(labels ((,name ,(mapcar #'first binds) ,@body))
+     (,name ,@(mapcar #'second binds))))
 
 ;; Define "exchanged subtract" So that DECF on a symbol requires no LET binding:
 ;;  (DECF I (EXPR)) -> (SETQ I (XSUBTRACT (EXPR) I))
@@ -53,7 +61,7 @@
                           (stem (if (every #'alpha-char-p symbol-name)
                                     symbol-name
                                     (string (gensymify* symbol-name "-")))))
-                     `(,symbol (sb!xc:gensym ,stem))))
+                     `(,symbol (sb-xc:gensym ,stem))))
                  symbols)
      ,@body))
 
@@ -61,24 +69,22 @@
 ;;; macros and other code-manipulating code.)
 (defun make-gensym-list (n &optional name)
   (let ((arg (if name (string name) "G")))
-    (loop repeat n collect (sb!xc:gensym arg))))
+    (loop repeat n collect (sb-xc:gensym arg))))
 
 ;;;; miscellany
 
 ;;; Lots of code wants to get to the KEYWORD package or the
-;;; COMMON-LISP package without a lot of fuss, so we cache them in
-;;; variables on the host, or use L-T-V forms on the target.
-(macrolet ((def-it (sym expr)
-             #+sb-xc-host
-             `(progn (declaim (type package ,sym))
-                     (defvar ,sym ,expr))
-             #-sb-xc-host
-             ;; We don't need to declaim the type. FIND-PACKAGE
-             ;; returns a package, and L-T-V propagates types.
-             ;; It's ugly how it achieves that, but it's a separate concern.
-             `(define-symbol-macro ,sym (load-time-value ,expr t))))
-  (def-it *cl-package* (find-package "COMMON-LISP"))
-  (def-it *keyword-package* (find-package "KEYWORD")))
+;;; COMMON-LISP package without going through FIND-PACKAGE, so we refer to them
+;;; as constants which is ever so slightly more efficient than a defglobal.
+;;; DEFINE-SYMBOL-MACRO should be ok in any host lisp. We used to distrust it,
+;;; but it is specified by CLHS, as are package constants, so there should
+;;; be no need to fear this idiom.
+(macrolet ((def-it (sym name) `(define-symbol-macro ,sym ,(find-package name))))
+  ;; *CL-PACKAGE* is always COMMON-LISP, not XC-STRICT-CL on the host, because the latter
+  ;; is just a means to avoid inheriting symbols that are not supposed to be in the CL:
+  ;; package but might be due to non-ansi-compliance of the host.
+  (def-it *cl-package* "COMMON-LISP")
+  (def-it *keyword-package* "KEYWORD"))
 
 (declaim (inline singleton-p))
 (defun singleton-p (list)
@@ -86,8 +92,8 @@
 
 (defun gensymify (x)
   (if (symbolp x)
-      (sb!xc:gensym (symbol-name x))
-      (sb!xc:gensym)))
+      (sb-xc:gensym (symbol-name x))
+      (sb-xc:gensym)))
 
 (labels ((symbol-concat (package &rest things)
            (dx-let ((strings (make-array (length things)))
@@ -171,8 +177,7 @@
           (t
            ;; We're in the undefined behavior zone. First, munge the
            ;; system back into a defined state.
-           (let ((really-package
-                  (load-time-value (find-package :cl-user) t)))
+           (let ((really-package #.(find-package :cl-user)))
              (setf *package* really-package)
              ;; Then complain.
              (error 'simple-type-error
@@ -185,25 +190,6 @@
                                                 "deleted package"
                                                 (type-of maybe-package))
                                             really-package)))))))
-
-;;; Access *DEFAULT-PATHNAME-DEFAULTS*, issuing a warning if its value
-;;; is silly. (Unlike the vaguely-analogous SANE-PACKAGE, we don't
-;;; actually need to reset the variable when it's silly, since even
-;;; crazy values of *DEFAULT-PATHNAME-DEFAULTS* don't leave the system
-;;; in a state where it's hard to recover interactively.)
-(defun sane-default-pathname-defaults ()
-  (let* ((dfd *default-pathname-defaults*)
-         (dfd-dir (pathname-directory dfd)))
-    ;; It's generally not good to use a relative pathname for
-    ;; *DEFAULT-PATHNAME-DEFAULTS*, since relative pathnames
-    ;; are defined by merging into a default pathname (which is,
-    ;; by default, *DEFAULT-PATHNAME-DEFAULTS*).
-    (when (and (consp dfd-dir)
-               (eql (first dfd-dir) :relative))
-      (warn
-       "~@<~S is a relative pathname. (But we'll try using it anyway.)~@:>"
-       '*default-pathname-defaults*))
-    dfd))
 
 ;;; Give names to elements of a numeric sequence.
 (defmacro defenum ((&key (start 0) (step 1))
@@ -218,7 +204,7 @@
                          (if (consp id)
                              (values (car id) (cdr id))
                              (values id nil))
-                       `(def!constant ,sym ,value ,@docstring))))
+                       `(defconstant ,sym ,value ,@docstring))))
                  identifiers))))
 
 ;;; a helper function for various macros which expect clauses of a
@@ -226,11 +212,8 @@
 ;;;
 ;;; Return true if X is a proper list whose length is between MIN and
 ;;; MAX (inclusive).
+;;; Running time is bounded by MAX for circular inputs.
 (defun proper-list-of-length-p (x min &optional (max min))
-  ;; FIXME: This implementation will hang on circular list
-  ;; structure. Since this is an error-checking utility, i.e. its
-  ;; job is to deal with screwed-up input, it'd be good style to fix
-  ;; it so that it can deal with circular list structure.
   (cond ((minusp max) nil)
         ((null x) (zerop min))
         ((consp x)
@@ -261,22 +244,6 @@
 (defun ensure-list (thing)
   (if (listp thing) thing (list thing)))
 
-;;; Helpers for defining error-signalling NOP's for "not supported
-;;; here" operations.
-(defmacro define-unsupported-fun (name &optional
-                                  (doc "Unsupported on this platform.")
-                                  (control
-                                   "~S is unsupported on this platform ~
-                                    (OS, CPU, whatever)."
-                                   controlp)
-                                  arguments)
-  `(defun ,name (&rest args)
-     ,doc
-     (declare (ignore args))
-     (error 'unsupported-operator
-            :format-control ,control
-            :format-arguments (if ,controlp ',arguments (list ',name)))))
-
 ;;; Anaphoric macros
 (defmacro awhen (test &body body)
   `(let ((it ,test))
@@ -296,11 +263,69 @@
                  (acond ,@rest)))))))
 
 ;; This is not an 'extension', but is needed super early, so ....
-(defmacro sb!xc:defconstant (name value &optional (doc nil docp))
+(defmacro sb-xc:defconstant (name value &optional (doc nil docp))
   "Define a global constant, saying that the value is constant and may be
   compiled into code. If the variable already has a value, and this is not
   EQL to the new value, the code is not portable (undefined behavior). The
   third argument is an optional documentation string for the variable."
+  (check-designator name defconstant)
   `(eval-when (:compile-toplevel :load-toplevel :execute)
-     (sb!c::%defconstant ',name ,value (sb!c:source-location)
+     (sb-c::%defconstant ',name ,value (sb-c:source-location)
                          ,@(and docp `(',doc)))))
+
+(defvar *!removable-symbols* nil)
+(push '("SB-INT" check-designator) *!removable-symbols*)
+
+(defun %defconstant-eqx-value (symbol expr eqx)
+  (declare (type function eqx))
+  (if (boundp symbol)
+      (let ((oldval (symbol-value symbol)))
+        ;; %DEFCONSTANT will give a choice of how to proceeed on error.
+        (if (funcall eqx oldval expr) oldval expr))
+      expr))
+
+;;; generalization of DEFCONSTANT to values which are the same not
+;;; under EQL but under e.g. EQUAL or EQUALP
+;;;
+;;; DEFCONSTANT-EQX is to be used instead of DEFCONSTANT for values
+;;; which are appropriately compared using the function given by the
+;;; EQX argument instead of EQL.
+;;;
+#+sb-xc-host
+(defmacro defconstant-eqx (symbol expr eqx &optional doc)
+  ;; CLISP needs the EVAL-WHEN here, or else the symbol defined is unavailable
+  ;; for later uses within the same file. For instance, in x86-64/vm, defining
+  ;; TEMP-REG-TN as R11-TN would get an error that R11-TN is unbound.
+  ;; We don't want that junk in our expansion, especially as our requirement
+  ;; is to separate the compile-time and load-time effect.
+  `(eval-when (:compile-toplevel :load-toplevel :execute)
+     (defconstant ,symbol (%defconstant-eqx-value ',symbol ,expr ,eqx)
+       ,@(when doc (list doc)))))
+
+;;; This is the expansion as it should be for us, but notice that this
+;;; recapitulation of the macro is actually not defined at compile-time.
+#-sb-xc-host
+(let ()
+  (defmacro defconstant-eqx (symbol expr eqx &optional doc)
+    `(defconstant ,symbol (%defconstant-eqx-value ',symbol ,expr ,eqx)
+       ,@(when doc (list doc)))))
+
+;;; Special variant at cross-compile-time. Face it: the "croak-if-not-EQx" test
+;;; is irrelevant - there can be no pre-existing value to test against.
+;;; The extra magic is that we need to discern between constants simple enough
+;;; to assigned during genesis (cold-load) from those assigned in cold-init.
+;;; This choice informs the compiler how to emit references to the symbol.
+(defvar sb-c::*!const-value-deferred* '())
+#-sb-xc-host
+(eval-when (:compile-toplevel)
+  (sb-xc:defmacro defconstant-eqx (symbol expr eqx &optional doc)
+    (let ((constp (sb-xc:constantp expr)))
+      `(progn
+         (eval-when (:compile-toplevel)
+           (sb-xc:defconstant ,symbol (%defconstant-eqx-value ',symbol ,expr ,eqx))
+           ,@(unless constp
+               `((push ',symbol sb-c::*!const-value-deferred*))))
+         (eval-when (:load-toplevel)
+           (sb-c::%defconstant ',symbol
+             ,(if constp `',(constant-form-value expr) expr)
+             (sb-c:source-location) ,@(when doc (list doc))))))))

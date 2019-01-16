@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; Move functions:
 
@@ -441,7 +441,7 @@
                   (:variant :double ,yep ,nope)))))
   (frob < :lt :ge </single-float </double-float)
   (frob > :gt :le >/single-float >/double-float)
-  (frob = :eq :ne eql/single-float eql/double-float))
+  (frob = :eq :ne =/single-float =/double-float))
 
 
 ;;;; Conversion:
@@ -690,7 +690,7 @@
 
 ;;;; Float mode hackery:
 
-(sb!xc:deftype float-modes () '(unsigned-byte 32))
+(sb-xc:deftype float-modes () '(unsigned-byte 32))
 (defknown floating-point-modes () float-modes (flushable))
 (defknown ((setf floating-point-modes)) (float-modes)
   float-modes)

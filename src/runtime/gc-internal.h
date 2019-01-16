@@ -1,15 +1,12 @@
 /*
  * garbage collection - shared definitions for modules "inside" the GC system
- * FIXME: despite the preceding remark, this header is total mashup of things
- * that are "internal to GC" vs "for all SBCL-internal C code" as opposed to
- * gc.h which is some kind of external API though it's unclear for what,
- * since hardly anything includes it.
- * We need at least 1 new header for truly private bits of the GC.
- * It's very scary that 15 other C files believe that they need this header.
- * It would be less scary if "internal" meant "stuff intended for everything
- * else internal to SBCL", and "gc-private.h" held support functions such as
- * weak_pointer_breakable_p(), though it's hard to tell for sure
- * what will work without actually doing such a refactor
+ *
+ * Despite the preceding claim, this header is a bit of a mashup of things
+ * that are "internal to strictly GC" vs "for all SBCL-internal C code"
+ * as opposed to gc.h which is some kind of external API,
+ * though it's unclear for what, since hardly anything includes it.
+ * GC-internal pieces that don't need to be revealed more widely
+ * should be declared in 'gc-private.h'
  */
 
 /*
@@ -28,11 +25,11 @@
 
 #include "genesis/code.h"
 #include "genesis/simple-fun.h"
-#include "genesis/weak-pointer.h"
 #include "thread.h"
-#include "interr.h"
+#include "interr.h" /* for lose() */
 
 extern const char *widetag_names[];
+extern struct weak_pointer *weak_pointer_chain; /* in gc-common.c */
 
 /// Enable extra debug-only checks if DEBUG
 #ifdef DEBUG
@@ -68,51 +65,36 @@ do {                                                                   \
 #include "cheneygc-internal.h"
 #endif
 
-#define CEILING(x,y) (((x) + ((y) - 1)) & (~((y) - 1)))
+#include "align.h"
 
-/* FIXME: Shouldn't this be defined in sbcl.h? */
-
+// Offset from an fdefn raw address to the underlying simple-fun,
+// if and only if it points to a simple-fun.
 #if defined(LISP_FEATURE_SPARC) || defined(LISP_FEATURE_ARM)
 #define FUN_RAW_ADDR_OFFSET 0
 #else
 #define FUN_RAW_ADDR_OFFSET (offsetof(struct simple_fun, code) - FUN_POINTER_LOWTAG)
 #endif
 
-static inline unsigned short
-#ifdef LISP_FEATURE_64_BIT
-code_n_funs(struct code* code) { return ((code)->header >> 32) & 0x7FFF; }
-#define FIRST_SIMPLE_FUN_OFFSET(code) ((code)->header >> 48)
+// For x86[-64], a simple-fun or closure's "self" slot is a fixum
+// On other backends, it is a lisp ointer.
+#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
+#define FUN_SELF_FIXNUM_TAGGED 1
 #else
-code_n_funs(struct code* code) { return fixnum_value((code)->n_entries) & 0x3FFF; }
-#define FIRST_SIMPLE_FUN_OFFSET(code) ((code)->n_entries >> 16)
+#define FUN_SELF_FIXNUM_TAGGED 0
 #endif
 
-// Iterate over the native pointers to each function in 'code_var'
-// offsets are stored as the number of bytes into the instructions
-// portion of the code object at which the simple-fun object resides.
-// We use bytes, not words, because that's what the COMPUTE-FUN vop expects.
-// But the offsets could be compressed further if we chose to use words,
-// which might allow storing them as (unsigned-byte 16),
-// as long as provision is made for ultra huge simple-funs. (~ .5MB)
-//
-// Note that the second assignment to _offset_ is OK: while it technically
-// oversteps the bounds of the indices of the fun offsets, it can not
-// run off the end of the code.
-#define for_each_simple_fun(index_var,fun_var,code_var,assertp,guts)        \
-  { int _nfuns_ = code_n_funs(code_var);                                    \
-    if (_nfuns_ > 0) {                                                      \
-      char *_insts_ = (char*)(code_var) +                                   \
-        (code_header_words((code_var)->header)<<WORD_SHIFT);                \
-      int index_var = 0;                                                    \
-      int _offset_ = FIRST_SIMPLE_FUN_OFFSET(code_var);                     \
-      do {                                                                  \
-       struct simple_fun* fun_var = (struct simple_fun*)(_insts_+_offset_); \
-       if (assertp)                                                         \
-         gc_assert(widetag_of(fun_var->header)==SIMPLE_FUN_WIDETAG);        \
-       guts ;                                                               \
-       _offset_ = ((unsigned int*)_insts_)[index_var];                      \
-      } while (++index_var < _nfuns_);                                      \
-  }}
+// Test for presence of a bit in vector's header.
+// As a special case, if 'val' is 0, then test for all bits clear.
+#define is_vector_subtype(header, val) \
+  (subtype_##val ? (HeaderValue(header) & subtype_##val) : \
+   !(HeaderValue(header) & 7))
+
+// Mask out the fullcgc mark bit when asserting header validity
+#define UNSET_WEAK_VECTOR_VISITED(v) \
+  gc_assert((v->header & 0xffff) == \
+    (((subtype_VectorWeakVisited|subtype_VectorWeak) << N_WIDETAG_BITS) \
+     | SIMPLE_VECTOR_WIDETAG)); \
+  v->header ^= subtype_VectorWeakVisited << N_WIDETAG_BITS
 
 #define SIMPLE_FUN_SCAV_START(fun_ptr) &fun_ptr->name
 #define SIMPLE_FUN_SCAV_NWORDS(fun_ptr) ((lispobj*)fun_ptr->code - &fun_ptr->name)
@@ -120,105 +102,17 @@ code_n_funs(struct code* code) { return fixnum_value((code)->n_entries) & 0x3FFF
 /* values for the *_alloc_* parameters, also see the commentary for
  * struct page in gencgc-internal.h. These constants are used in gc-common,
  * so they can't easily be made gencgc-only */
-#define FREE_PAGE_FLAG 0
-#define BOXED_PAGE_FLAG 1
-#define UNBOXED_PAGE_FLAG 2
-#define OPEN_REGION_PAGE_FLAG 4
-#define CODE_PAGE_FLAG        (BOXED_PAGE_FLAG|UNBOXED_PAGE_FLAG)
+#define FREE_PAGE_FLAG        0
+#define PAGE_TYPE_MASK        7 // mask out the 'single-object flag'
+/* Note: MAP-ALLOCATED-OBJECTS expects this value to be 1 */
+#define BOXED_PAGE_FLAG       1
+#define UNBOXED_PAGE_FLAG     2
+#define OPEN_REGION_PAGE_FLAG 8
+#define CODE_PAGE_TYPE        (BOXED_PAGE_FLAG|UNBOXED_PAGE_FLAG)
 
-// Gencgc distinguishes between "quick" and "ordinary" requests.
-// Even on cheneygc we need this flag, but it's actually just ignored.
-#define ALLOC_QUICK 1
-
-#ifdef LISP_FEATURE_GENCGC
-#include "gencgc-alloc-region.h"
-void *
-gc_alloc_with_region(sword_t nbytes,int page_type_flag, struct alloc_region *my_region,
-                     int quick_p);
-static inline void *
-gc_general_alloc(sword_t nbytes, int page_type_flag, int quick_p)
-{
-    struct alloc_region *my_region;
-#ifdef LISP_FEATURE_SEGREGATED_CODE
-    if (1 <= page_type_flag && page_type_flag <= 3) {
-        my_region = &gc_alloc_regions[page_type_flag-1];
-#else
-    if (UNBOXED_PAGE_FLAG == page_type_flag) {
-        my_region = &unboxed_region;
-    } else if (BOXED_PAGE_FLAG & page_type_flag) {
-        my_region = &boxed_region;
-#endif
-    } else {
-        lose("bad page type flag: %d", page_type_flag);
-    }
-    return gc_alloc_with_region(nbytes, page_type_flag, my_region, quick_p);
-}
-#else
-extern void *gc_general_alloc(sword_t nbytes,int page_type_flag,int quick_p);
-#endif
-
-#define CHECK_COPY_PRECONDITIONS(object, nwords) \
-    gc_dcheck(is_lisp_pointer(object)); \
-    gc_dcheck(from_space_p(object)); \
-    gc_dcheck((nwords & 0x01) == 0)
-
-#define CHECK_COPY_POSTCONDITIONS(copy, lowtag) \
-    gc_dcheck(lowtag_of(copy) == lowtag); \
-    gc_dcheck(!from_space_p(copy));
-
-#define note_transported_object(old, new) /* do nothing */
-
-static inline lispobj
-gc_general_copy_object(lispobj object, long nwords, int page_type_flag)
-{
-    lispobj *new;
-
-    CHECK_COPY_PRECONDITIONS(object, nwords);
-
-    /* Allocate space. */
-    new = gc_general_alloc(nwords*N_WORD_BYTES, page_type_flag, ALLOC_QUICK);
-
-    /* Copy the object. */
-    memcpy(new,native_pointer(object),nwords*N_WORD_BYTES);
-
-    note_transported_object(object, new);
-
-    return make_lispobj(new, lowtag_of(object));
-}
-
-extern sword_t (*scavtab[256])(lispobj *where, lispobj object);
 extern sword_t (*sizetab[256])(lispobj *where);
 #define OBJECT_SIZE(header,where) \
-  (is_cons_half(header)?2:sizetab[widetag_of(header)](where))
-
-extern struct weak_pointer *weak_pointers; /* in gc-common.c */
-extern struct hash_table *weak_hash_tables; /* in gc-common.c */
-
-extern void heap_scavenge(lispobj *start, lispobj *limit);
-extern sword_t scavenge(lispobj *start, sword_t n_words);
-extern void scavenge_interrupt_contexts(struct thread *thread);
-extern void scav_weak_hash_tables(int (*[5])(lispobj,lispobj),
-                                  void (*)(lispobj*));
-extern void scav_binding_stack(lispobj*, lispobj*, void(*)(lispobj));
-extern void scan_binding_stack(void);
-extern void scan_weak_hash_tables(int (*[5])(lispobj,lispobj));
-extern void scan_weak_pointers(void);
-extern void scav_hash_table_entries (struct hash_table *hash_table,
-                                     int (*[5])(lispobj,lispobj),
-                                     void (*)(lispobj*));
-extern int (*weak_ht_alivep_funs[5])(lispobj,lispobj);
-extern void gc_scav_pair(lispobj where[2]);
-
-lispobj  copy_large_unboxed_object(lispobj object, sword_t nwords);
-lispobj  copy_unboxed_object(lispobj object, sword_t nwords);
-lispobj  copy_large_object(lispobj object, sword_t nwords);
-lispobj  copy_object(lispobj object, sword_t nwords);
-struct simple_fun *code_fun_addr(struct code*, int);
-
-lispobj *search_read_only_space(void *pointer);
-lispobj *search_static_space(void *pointer);
-lispobj *search_immobile_space(void *pointer);
-lispobj *search_dynamic_space(void *pointer);
+  (is_cons_half(header)?2:sizetab[header_widetag(header)](where))
 
 lispobj *gc_search_space3(void *pointer, lispobj *start, void *limit);
 static inline lispobj *gc_search_space(lispobj *start, void *pointer) {
@@ -226,20 +120,9 @@ static inline lispobj *gc_search_space(lispobj *start, void *pointer) {
                             start,
                             (void*)(1+((lispobj)pointer | LOWTAG_MASK)));
 }
+
 struct vector *symbol_name(lispobj*);
 
-static inline int instruction_ptr_p(void *pointer, lispobj *start_addr)
-{
-    return widetag_of(*start_addr) == CODE_HEADER_WIDETAG &&
-        pointer >= (void*)(start_addr + code_header_words(*start_addr));
-}
-extern int properly_tagged_p_internal(lispobj pointer, lispobj *start_addr);
-static inline int properly_tagged_descriptor_p(void *pointer, lispobj *start_addr) {
-  return is_lisp_pointer((lispobj)pointer) &&
-    properly_tagged_p_internal((lispobj)pointer, start_addr);
-}
-
-extern void scavenge_control_stack(struct thread *th);
 extern void scrub_control_stack(void);
 extern void scrub_thread_control_stack(struct thread *);
 
@@ -278,10 +161,12 @@ static inline lispobj funinstance_layout(lispobj* instance_ptr) { // native ptr
     return instance_ptr[3];
 }
 // No layout in simple-fun or closure, because there are no free bits
-static inline lispobj function_layout(lispobj* fun_ptr) { // native ptr
+static inline lispobj
+function_layout(lispobj __attribute__((unused)) *fun_ptr) { // native ptr
     return 0;
 }
-static inline void set_function_layout(lispobj* fun_ptr, lispobj layout) {
+static inline void set_function_layout(lispobj __attribute__((unused)) *fun_ptr,
+                                       lispobj __attribute__((unused)) layout) {
     lose("Can't assign layout");
 }
 #endif
@@ -289,7 +174,7 @@ static inline void set_function_layout(lispobj* fun_ptr, lispobj layout) {
 #include "genesis/bignum.h"
 extern boolean positive_bignum_logbitp(int,struct bignum*);
 
-#ifndef LISP_FEATURE_IMMOBILE_SPACE
+#ifdef LISP_FEATURE_IMMOBILE_CODE
 
 /* The callee_lispobj of an fdefn is the value in the 'raw_addr' slot to which
  * control transfer occurs, but cast as a simple-fun or code component.
@@ -301,98 +186,36 @@ extern boolean positive_bignum_logbitp(int,struct bignum*);
  * a pointer lowtag because it only affects print_otherptr() and verify_space()
  * neither of which materially impact garbage collection. */
 
-static inline boolean points_to_readonly_space(uword_t ptr) {
+extern lispobj fdefn_callee_lispobj(struct fdefn *fdefn);
+extern lispobj virtual_fdefn_callee_lispobj(struct fdefn *fdefn,uword_t);
+
+#else
+
+static inline lispobj points_to_asm_routine_p(uword_t ptr) {
+# if defined(LISP_FEATURE_IMMOBILE_SPACE)
+    extern uword_t asm_routines_start, asm_routines_end;
+    // Lisp assembly routines are in varyobj space, not readonly space
+    return asm_routines_start <= ptr && ptr < asm_routines_end;
+# else
     return READ_ONLY_SPACE_START <= ptr && ptr < READ_ONLY_SPACE_END;
+# endif
 }
 static inline lispobj fdefn_callee_lispobj(struct fdefn *fdefn) {
-    return (lispobj)
-        (fdefn->raw_addr -
-         (points_to_readonly_space((uword_t)fdefn->raw_addr) ? 0 : FUN_RAW_ADDR_OFFSET));
+    return (lispobj)fdefn->raw_addr -
+      (points_to_asm_routine_p((uword_t)fdefn->raw_addr) ? 0 : FUN_RAW_ADDR_OFFSET);
 }
 
-static inline boolean immobile_filler_p(lispobj* obj) { return 0; }
-
-#else
-
-extern void fixup_immobile_refs(lispobj (*)(lispobj), lispobj, struct code*);
-extern lispobj fdefn_callee_lispobj(struct fdefn *fdefn);
-
-static inline boolean immobile_space_p(lispobj obj)
-{
-  return IMMOBILE_SPACE_START <= obj && obj < IMMOBILE_SPACE_END;
-}
-
-typedef int low_page_index_t;
-static inline low_page_index_t find_immobile_page_index(void *addr)
-{
-  if (addr >= (void*)IMMOBILE_SPACE_START) {
-      // Must use full register size here to avoid truncation of quotient
-      // and bogus result!
-      page_index_t index =
-          ((uintptr_t)addr -
-           (uintptr_t)IMMOBILE_SPACE_START) / IMMOBILE_CARD_BYTES;
-      if (index < (int)(IMMOBILE_SPACE_SIZE/IMMOBILE_CARD_BYTES))
-          return index;
-  }
-  return -1;
-}
-int immobile_obj_younger_p(lispobj,generation_index_t);
-void enliven_immobile_obj(lispobj*,int);
-
-#define IMMOBILE_OBJ_VISITED_FLAG    0x10
-#define IMMOBILE_OBJ_GENERATION_MASK 0x0f // mask off the VISITED flag
-
-// Note: this does not work on a SIMPLE-FUN
-// because a simple-fun header does not contain a generation.
-#define __immobile_obj_generation(x) (__immobile_obj_gen_bits(x) & IMMOBILE_OBJ_GENERATION_MASK)
-
-#ifdef LISP_FEATURE_LITTLE_ENDIAN
-static inline int immobile_obj_gen_bits(lispobj* pointer) // native pointer
-{
-  if (widetag_of(*pointer) == SIMPLE_FUN_WIDETAG)
-    pointer = fun_code_header(pointer);
-  return ((generation_index_t*)pointer)[3];
-}
-// Faster way when we know that the object can't be a simple-fun,
-// such as when walking the immobile space.
-static inline int __immobile_obj_gen_bits(lispobj* pointer) // native pointer
-{
-  return ((generation_index_t*)pointer)[3];
-}
-#else
-#error "Need to define immobile_obj_gen_bits() for big-endian"
-#endif /* little-endian */
-
-static inline boolean immobile_filler_p(lispobj* obj) {
-  return *(int*)obj == (2<<N_WIDETAG_BITS | CODE_HEADER_WIDETAG);
-}
-
-#endif /* immobile space */
-
-#define WEAK_POINTER_NWORDS \
-        CEILING((sizeof(struct weak_pointer) / sizeof(lispobj)), 2)
-
-static inline boolean weak_pointer_breakable_p(struct weak_pointer *wp)
-{
-    lispobj pointee = wp->value;
-    // A broken weak-pointer's value slot has unbound-marker
-    // which does not satisfy is_lisp_pointer().
-    return is_lisp_pointer(pointee) && (from_space_p(pointee)
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-         || (immobile_space_p(pointee) &&
-             immobile_obj_gen_bits(native_pointer(pointee)) == from_space)
 #endif
-            );
-}
 
-/// Same as Lisp LOGBITP, except no negative bignums allowed.
-static inline boolean layout_bitmap_logbitp(int index, lispobj bitmap)
-{
-    if (fixnump(bitmap))
-      return (index < (N_WORD_BITS - N_FIXNUM_TAG_BITS))
-          ? (bitmap >> (index+N_FIXNUM_TAG_BITS)) & 1
-          : (sword_t)bitmap < 0;
-    return positive_bignum_logbitp(index, (struct bignum*)native_pointer(bitmap));
-}
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+#include "genesis/layout.h"
+#define LAYOUT_SIZE (sizeof (struct layout)/N_WORD_BYTES)
+/// First 4 layouts: T, STRUCTURE-OBJECT, LAYOUT, FUNCTION
+/// (These #defines ought to be emitted by genesis)
+#define LAYOUT_OF_LAYOUT   ((FIXEDOBJ_SPACE_START+2*LAYOUT_ALIGN)|INSTANCE_POINTER_LOWTAG)
+#define LAYOUT_OF_FUNCTION ((FIXEDOBJ_SPACE_START+3*LAYOUT_ALIGN)|INSTANCE_POINTER_LOWTAG)
+#endif
+
+boolean valid_widetag_p(unsigned char widetag);
 
 #endif /* _GC_INTERNAL_H_ */

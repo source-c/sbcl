@@ -198,6 +198,10 @@ should_branch(os_context_t *context, unsigned int orig_inst)
                       !(((cr >> (31-bi_field)) ^ (bo_field >> 3)) & 1));
 }
 
+static sword_t sign_extend(uword_t word, int n_bits) {
+  return (sword_t)(word<<(N_WORD_BITS-n_bits)) >> (N_WORD_BITS-n_bits);
+}
+
 void
 arch_do_displaced_inst(os_context_t *context, unsigned int orig_inst)
 {
@@ -223,28 +227,20 @@ arch_do_displaced_inst(os_context_t *context, unsigned int orig_inst)
 
     if (op == 18) {
         /* Branch  I-form */
-        unsigned int displacement = orig_inst & 0x03fffffc;
-        /* Sign extend */
-        if (displacement & 0x02000000) {
-            displacement |= 0xc0000000;
-        }
+        sword_t displacement = sign_extend(orig_inst & 0x03fffffc, 26);
         if (orig_inst & 2) { /* Absolute Address */
             next_pc = (unsigned int *)displacement;
         } else {
-            next_pc = (unsigned int *)(((unsigned int)pc) + displacement);
+            next_pc = (unsigned int *)((uword_t)pc + displacement);
         }
     } else if ((op == 16)
                && should_branch(context, orig_inst)) {
         /* Branch Conditional  B-form */
-        unsigned int displacement = orig_inst & 0x0000fffc;
-        /* Sign extend */
-        if (displacement & 0x00008000) {
-            displacement |= 0xffff0000;
-        }
+        sword_t displacement = sign_extend(orig_inst & 0x0000fffc, 16);
         if (orig_inst & 2) { /* Absolute Address */
             next_pc = (unsigned int *)displacement;
         } else {
-            next_pc = (unsigned int *)(((unsigned int)pc) + displacement);
+            next_pc = (unsigned int *)((uword_t)pc + displacement);
         }
     } else if ((op == 19) && (sub_op == 16)
                && should_branch(context, orig_inst)) {
@@ -264,6 +260,7 @@ arch_do_displaced_inst(os_context_t *context, unsigned int orig_inst)
     os_flush_icache((os_vm_address_t)next_pc, sizeof(unsigned int));
 }
 
+#define INLINE_ALLOC_DEBUG 0
 #ifdef LISP_FEATURE_GENCGC
 /*
  * Return non-zero if the current instruction is an allocation trap
@@ -286,7 +283,7 @@ allocation_trap_p(os_context_t * context)
     pc = (unsigned int *) (*os_context_pc_addr(context));
     inst = *pc;
 
-#if 0
+#if INLINE_ALLOC_DEBUG
     fprintf(stderr, "allocation_trap_p at %p:  inst = 0x%08x\n", pc, inst);
 #endif
 
@@ -303,7 +300,7 @@ allocation_trap_p(os_context_t * context)
         unsigned int add_inst;
 
         add_inst = pc[-1];
-#if 0
+#if INLINE_ALLOC_DEBUG
         fprintf(stderr, "   add inst at %p:  inst = 0x%08x\n",
                 pc - 1, add_inst);
 #endif
@@ -321,7 +318,9 @@ allocation_trap_p(os_context_t * context)
     return 0;
 }
 
-extern struct alloc_region boxed_region;
+#ifndef boxed_region
+#define boxed_region gc_alloc_region[0]
+#endif
 
 void
 handle_allocation_trap(os_context_t * context)
@@ -329,7 +328,7 @@ handle_allocation_trap(os_context_t * context)
     unsigned int *pc;
     unsigned int inst;
     unsigned int target;
-    unsigned int __attribute__((unused)) target_ptr, end_addr;
+    uword_t __attribute__((unused)) target_ptr, end_addr;
     unsigned int opcode;
     int size;
     boolean were_in_lisp;
@@ -338,7 +337,7 @@ handle_allocation_trap(os_context_t * context)
     target = 0;
     size = 0;
 
-#if 0
+#if INLINE_ALLOC_DEBUG
     fprintf(stderr, "In handle_allocation_trap\n");
 #endif
 
@@ -367,19 +366,17 @@ handle_allocation_trap(os_context_t * context)
 
     target_ptr = *os_context_register_addr(context, target);
 
-#if 0
+#if INLINE_ALLOC_DEBUG
     fprintf(stderr, "handle_allocation_trap at %p:\n", pc);
     fprintf(stderr, "boxed_region.free_pointer: %p\n", boxed_region.free_pointer);
     fprintf(stderr, "boxed_region.end_addr: %p\n", boxed_region.end_addr);
-    fprintf(stderr, "target reg: %d, end_addr reg: %d\n", target, end_addr);
-    fprintf(stderr, "target: %x\n", *os_context_register_addr(context, target));
-    fprintf(stderr, "end_addr: %x\n", *os_context_register_addr(context, end_addr));
-#endif
-
-#if 0
-    fprintf(stderr, "handle_allocation_trap at %p:\n", pc);
-    fprintf(stderr, "  trap inst = 0x%08x\n", inst);
-    fprintf(stderr, "  target reg = %s\n", lisp_register_names[target]);
+    fprintf(stderr, "target reg: %d, end_addr reg: %ld\n", target, end_addr);
+    fprintf(stderr, "target: %"OBJ_FMTX"\n",
+            (uword_t)*os_context_register_addr(context, target));
+    fprintf(stderr, "end_addr: %"OBJ_FMTX"\n",
+            (uword_t)*os_context_register_addr(context, end_addr));
+    fprintf(stderr, "trap inst = 0x%08x\n", inst);
+    fprintf(stderr, "target reg = %s\n", lisp_register_names[target]);
 #endif
 
     /*
@@ -389,7 +386,7 @@ handle_allocation_trap(os_context_t * context)
      */
     inst = pc[-1];
     opcode = inst >> 26;
-#if 0
+#if INLINE_ALLOC_DEBUG
     fprintf(stderr, "  add inst  = 0x%08x, opcode = %d\n", inst, opcode);
 #endif
     if (opcode == 14) {
@@ -408,31 +405,24 @@ handle_allocation_trap(os_context_t * context)
         int reg;
 
         reg = (inst >> 11) & 0x1f;
-#if 0
+#if INLINE_ALLOC_DEBUG
         fprintf(stderr, "  add, reg = %s\n", lisp_register_names[reg]);
 #endif
         size = *os_context_register_addr(context, reg);
 
     }
 
-#if 0
-    fprintf(stderr, "Alloc %d to %s\n", size, lisp_register_names[target]);
-#endif
-
 #if INLINE_ALLOC_DEBUG
-    if ((((unsigned long)boxed_region.end_addr + size) / PAGE_SIZE) ==
-        (((unsigned long)boxed_region.end_addr) / PAGE_SIZE)) {
+    fprintf(stderr, "Alloc %d to %s\n", size, lisp_register_names[target]);
+    if ((((unsigned long)boxed_region.end_addr + size) / GENCGC_CARD_BYTES) ==
+        (((unsigned long)boxed_region.end_addr) / GENCGC_CARD_BYTES)) {
       fprintf(stderr,"*** possibly bogus trap allocation of %d bytes at %p\n",
-              size, target_ptr);
+              size, (void*)target_ptr);
       fprintf(stderr, "    dynamic_space_free_pointer: %p, boxed_region.end_addr %p\n",
               dynamic_space_free_pointer, boxed_region.end_addr);
     }
-#endif
-
-#if 0
     fprintf(stderr, "Ready to alloc\n");
-    fprintf(stderr, "free_pointer = 0x%08x\n",
-            dynamic_space_free_pointer);
+    fprintf(stderr, "free_pointer = %p\n", dynamic_space_free_pointer);
 #endif
 
     /*
@@ -446,10 +436,6 @@ handle_allocation_trap(os_context_t * context)
     /*    dynamic_space_free_pointer =
         (lispobj *) ((long) dynamic_space_free_pointer - size);
     */
-#if 0
-    fprintf(stderr, "free_pointer = 0x%08x new\n",
-            dynamic_space_free_pointer);
-#endif
 
     {
         extern lispobj* alloc(sword_t);
@@ -460,10 +446,9 @@ handle_allocation_trap(os_context_t * context)
         data->allocation_trap_context = 0;
     }
 
-#if 0
+#if INLINE_ALLOC_DEBUG
     fprintf(stderr, "alloc returned %p\n", memory);
-    fprintf(stderr, "free_pointer = 0x%08x\n",
-            dynamic_space_free_pointer);
+    fprintf(stderr, "free_pointer = %p\n", dynamic_space_free_pointer);
 #endif
 
     /*
@@ -472,7 +457,7 @@ handle_allocation_trap(os_context_t * context)
      */
     memory += size;
 
-#if 0
+#if INLINE_ALLOC_DEBUG
     fprintf(stderr, "object end at %p\n", memory);
 #endif
 
@@ -495,9 +480,9 @@ handle_allocation_trap(os_context_t * context)
      * instructions when threading is enabled and four instructions
      * otherwise. */
 #ifdef LISP_FEATURE_SB_THREAD
-    (*os_context_pc_addr(context)) = (unsigned int)(pc + 2);
+    (*os_context_pc_addr(context)) = (uword_t)(pc + 2);
 #else
-    (*os_context_pc_addr(context)) = (unsigned int)(pc + 4);
+    (*os_context_pc_addr(context)) = (uword_t)(pc + 4);
 #endif
 
 }
@@ -512,8 +497,7 @@ arch_handle_breakpoint(os_context_t *context)
 void
 arch_handle_fun_end_breakpoint(os_context_t *context)
 {
-    *os_context_pc_addr(context)
-        =(int)handle_fun_end_breakpoint(context);
+    *os_context_pc_addr(context) = (uword_t)handle_fun_end_breakpoint(context);
 }
 
 void
@@ -534,7 +518,7 @@ void
 arch_handle_single_step_trap(os_context_t *context, int trap)
 {
     unsigned int code = *((u32 *)(*os_context_pc_addr(context)));
-    int register_offset = code >> 5 & 0x1f;
+    int register_offset = code >> 8 & 0x1f;
     handle_single_step_trap(context, trap, register_offset);
     arch_skip_instruction(context);
 }
@@ -566,15 +550,13 @@ sigtrap_handler(int signal, siginfo_t *siginfo, os_context_t *context)
 
     if ((code >> 16) == ((3 << 10) | (6 << 5))) {
         /* twllei reg_ZERO,N will always trap if reg_ZERO = 0 */
-        int trap = code & 0x1f;
+        int trap = code & 0xff;
         handle_trap(context,trap);
         return;
     }
     /* twi :ne ... or twi ... nargs */
     if (((code >> 26) == 3) && (((code >> 21) & 31) == 24
-#ifdef LISP_FEATURE_PRECISE_ARG_COUNT_ERROR
                                 || ((code >> 16) & 31) == reg_NARGS
-#endif
         )) {
         interrupt_internal_error(context, 0);
         return;
@@ -593,7 +575,7 @@ void arch_install_interrupt_handlers()
 void
 ppc_flush_icache(os_vm_address_t address, os_vm_size_t length)
 {
-  os_vm_address_t end = (os_vm_address_t) ((int)(address+length+(32-1)) &~(32-1));
+  os_vm_address_t end = PTR_ALIGN_UP(address+length, 32);
   extern void ppc_flush_cache_line(os_vm_address_t);
 
   while (address < end) {
@@ -624,8 +606,12 @@ ppc_flush_icache(os_vm_address_t address, os_vm_size_t length)
  * Insert the necessary jump instructions at the given address.
  */
 void
-arch_write_linkage_table_jmp(char *reloc_addr, void *target_addr)
+arch_write_linkage_table_entry(char *reloc_addr, void *target_addr, int datap)
 {
+  if (datap) {
+    *(unsigned long *)reloc_addr = (unsigned long)target_addr;
+    return;
+  }
   /*
    * Make JMP to function entry.
    *
@@ -644,10 +630,6 @@ arch_write_linkage_table_jmp(char *reloc_addr, void *target_addr)
 
   inst_ptr = (int*) reloc_addr;
 
-  /*
-   * Split the target address into hi and lo parts for the sethi
-   * instruction.  hi is the top 22 bits.  lo is the low 10 bits.
-   */
   hi = (unsigned long) target_addr;
   lo = hi & 0xffff;
   hi >>= 16;
@@ -682,11 +664,4 @@ arch_write_linkage_table_jmp(char *reloc_addr, void *target_addr)
 
   os_flush_icache((os_vm_address_t) reloc_addr, (char*) inst_ptr - reloc_addr);
 }
-
-void
-arch_write_linkage_table_ref(void * reloc_addr, void *target_addr)
-{
-    *(unsigned long *)reloc_addr = (unsigned long)target_addr;
-}
-
 #endif

@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!DYNCOUNT")
+(in-package "SB-DYNCOUNT")
 
 #|
 comments from CMU CL:
@@ -29,7 +29,7 @@ comments from CMU CL:
 (defun make-hash-table-like (table)
   "Make a hash-table with the same test as table."
   (declare (type hash-table table))
-  (make-hash-table :test (sb!impl::hash-table-kind table)))
+  (make-hash-table :test (sb-impl::hash-table-kind table)))
 
 (defun hash-difference (table1 table2)
   "Return a hash-table containing only the entries in Table1 whose key is not
@@ -161,7 +161,7 @@ comments from CMU CL:
   (dohash ((k v) *backend-template-names* :locked t)
     (declare (ignore v))
     (remprop k 'vop-stats))
-  (sb!vm::map-allocated-objects
+  (sb-vm::map-allocated-objects
          (lambda (object type-code size)
            (declare (ignore type-code size))
            (when (dyncount-info-p object)
@@ -176,7 +176,7 @@ comments from CMU CL:
   "Return a hash-table mapping string VOP names to VOP-STATS structures
    describing the VOPs executed. If clear is true, then reset all counts to
    zero as a side effect."
-  (sb!vm::map-allocated-objects
+  (sb-vm::map-allocated-objects
          (lambda (object type-code size)
            (declare (ignore type-code size))
            (when (dyncount-info-p object)
@@ -199,9 +199,9 @@ comments from CMU CL:
 (defun find-info-for (function)
   (declare (type function function))
   (let* ((function (%primitive closure-fun function))
-         (component (sb!di::fun-code-header function)))
+         (component (sb-di::fun-code-header function)))
     (do ((end (code-header-words component))
-         (i sb!vm:code-constants-offset (1+ i)))
+         (i sb-vm:code-constants-offset (1+ i)))
         ((= end i))
       (let ((constant (code-header-ref component i)))
         (when (dyncount-info-p constant)
@@ -226,7 +226,7 @@ comments from CMU CL:
   "Return a hash-table mapping string VOP names to the cost recorded in the
    generator for all VOPs which are also the names of assembly routines."
   (let ((res (make-hash-table :test 'equal)))
-     (dohash ((name v) *assembler-routines* :locked t)
+     (dohash ((name v) (car (%code-debug-info *assembler-routines*)))
        (declare (ignore v))
        (let ((vop (gethash name *backend-template-names*)))
          (when vop

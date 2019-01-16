@@ -10,13 +10,13 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;; Unbound outside package lock context, inside either list of
 ;;; packages for which locks are ignored, T when locks for
 ;;; all packages are ignored, and :invalid outside package-lock
-;;; context. FIXME: This needs to be rebound for each thread.
-(!defvar *ignored-package-locks* :invalid)
+;;; context.
+(!define-thread-local *ignored-package-locks* :invalid)
 
 ;; This proclamation avoids a ton of style warnings due to so many calls
 ;; that get cross-compiled prior to compiling "target-package.lisp"
@@ -25,10 +25,6 @@
 
 (defmacro with-single-package-locked-error ((&optional kind thing &rest format)
                                             &body body)
-  #!-sb-package-locks (declare (ignore kind thing format))
-  #!-sb-package-locks
-  `(progn ,@body)
-  #!+sb-package-locks
   (with-unique-names (topmost)
     `(progn
        (let ((,topmost nil))
@@ -55,5 +51,5 @@
 (defmacro without-package-locks (&body body)
   "Ignores all runtime package lock violations during the execution of
 body. Body can begin with declarations."
-  `(let (#!+sb-package-locks (*ignored-package-locks* t))
+  `(let ((*ignored-package-locks* t))
     ,@body))

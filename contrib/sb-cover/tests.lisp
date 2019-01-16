@@ -18,14 +18,14 @@
 (defun report ()
   (handler-case
       (sb-cover:report *output-directory*)
-    (warning ()
-      (error "Unexpected warning"))))
+    (warning (condition)
+      (error "Unexpected warning: ~A" condition))))
 
 (defun report-expect-failure ()
   (handler-case
       (progn
         (sb-cover:report *output-directory*)
-        (error "Should've raised a warning"))
+        (error "Should've signaled a warning"))
     (warning ())))
 
 
@@ -106,7 +106,8 @@
 
 ;; Check for presence of constant coalescing bugs
 (compile-load "test-data-3")
-(test-2)
+(let ((*standard-output* (make-broadcast-stream)))
+  (test-2))
 
 ;;; Another file, with some branches
 (compile-load "test-data-branching-forms")

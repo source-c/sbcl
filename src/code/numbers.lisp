@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 ;;;; the NUMBER-DISPATCH macro
 
@@ -47,15 +47,16 @@
 
 ;;; our guess for the preferred order in which to do type tests
 ;;; (cheaper and/or more probable first.)
-(defparameter *type-test-ordering*
+(defconstant-eqx +type-test-ordering+
   '(fixnum single-float double-float integer #!+long-float long-float
-    sb!vm:signed-word word bignum
-    complex ratio))
+    sb-vm:signed-word word bignum
+    complex ratio)
+  #'equal)
 
 ;;; Should TYPE1 be tested before TYPE2?
 (defun type-test-order (type1 type2)
-  (let ((o1 (position type1 *type-test-ordering*))
-        (o2 (position type2 *type-test-ordering*)))
+  (let ((o1 (position type1 +type-test-ordering+))
+        (o2 (position type2 +type-test-ordering+)))
     (cond ((not o1) nil)
           ((not o2) t)
           (t
@@ -161,7 +162,7 @@
           (error-tags tag)
           (errors tag)
           (errors
-           (sb!c::internal-type-error-call var type))))
+           (sb-c::internal-type-error-call var type))))
 
       `(block ,block
          (tagbody
@@ -395,9 +396,7 @@
   (declare (explicit-check))
   (1- number))
 
-(eval-when (:compile-toplevel)
-
-(sb!xc:defmacro two-arg-+/- (name op big-op)
+(defmacro two-arg-+/- (name op big-op)
   `(defun ,name (x y)
      (number-dispatch ((x number) (y number))
        (bignum-cross-fixnum ,op ,big-op)
@@ -438,8 +437,6 @@
                                 (t3 (truncate dy g2))
                                 (nd (if (eql t2 1) t3 (* t2 t3))))
                            (if (eql nd 1) nn (%make-ratio nn nd))))))))))))
-
-) ; EVAL-WHEN
 
 (two-arg-+/- two-arg-+ + add-bignums)
 (two-arg-+/- two-arg-- - subtract-bignum)
@@ -1037,12 +1034,15 @@ and the number of 0 bits if INTEGER is negative."
   (declare (explicit-check))
   (etypecase integer
     (fixnum
-     (logcount (truly-the (integer 0
-                                   #.(max sb!xc:most-positive-fixnum
-                                          (lognot sb!xc:most-negative-fixnum)))
+     (logcount #!-x86-64
+               (truly-the (integer 0
+                                   #.(max sb-xc:most-positive-fixnum
+                                          (lognot sb-xc:most-negative-fixnum)))
                           (if (minusp (truly-the fixnum integer))
                               (lognot (truly-the fixnum integer))
-                              integer))))
+                              integer))
+               ;; The VOP handles that case better
+               #!+x86-64 integer))
     (bignum
      (bignum-logcount integer))))
 
@@ -1053,7 +1053,7 @@ and the number of 0 bits if INTEGER is negative."
 (defun logbitp (index integer)
   "Predicate returns T if bit index of integer is a 1."
   (number-dispatch ((index integer) (integer integer))
-    ((fixnum fixnum) (if (< index sb!vm:n-positive-fixnum-bits)
+    ((fixnum fixnum) (if (< index sb-vm:n-positive-fixnum-bits)
                          (not (zerop (logand integer (ash 1 index))))
                          (minusp integer)))
     ((fixnum bignum) (bignum-logbitp index integer))
@@ -1072,10 +1072,10 @@ and the number of 0 bits if INTEGER is negative."
               (declare (fixnum length count))
               (cond ((and (plusp count)
                           (>= (+ length count)
-                              sb!vm:n-word-bits))
+                              sb-vm:n-word-bits))
                      (bignum-ashift-left-fixnum integer count))
                     (t
-                     (truly-the (signed-byte #.sb!vm:n-word-bits)
+                     (truly-the (signed-byte #.sb-vm:n-word-bits)
                                 (ash (truly-the fixnum integer) count))))))
            ((minusp count)
             (if (minusp integer) -1 0))
@@ -1136,9 +1136,9 @@ and the number of 0 bits if INTEGER is negative."
   ;; The naive algorithm is horrible in the general case.
   ;; Consider (LDB (BYTE 1 2) (SOME-GIANT-BIGNUM)) which has to shift the
   ;; input rightward 2 bits, consing a new bignum just to read 1 bit.
-  (if (and (<= 0 size sb!vm:n-positive-fixnum-bits)
+  (if (and (<= 0 size sb-vm:n-positive-fixnum-bits)
            (typep integer 'bignum))
-      (sb!bignum::ldb-bignum=>fixnum size posn integer)
+      (sb-bignum::ldb-bignum=>fixnum size posn integer)
       (logand (ash integer (- posn))
               (1- (ash 1 size)))))
 
@@ -1158,7 +1158,7 @@ and the number of 0 bits if INTEGER is negative."
     (logior (logand newbyte mask)
             (logand integer (lognot mask)))))
 
-(defun sb!c::mask-signed-field (size integer)
+(defun sb-c::mask-signed-field (size integer)
   "Extract SIZE lower bits from INTEGER, considering them as a
 2-complement SIZE-bits representation of a signed integer."
   (macrolet ((msf (size integer)
@@ -1167,18 +1167,18 @@ and the number of 0 bits if INTEGER is negative."
                     (ldb (byte (1- ,size) 0) ,integer))))
     (typecase size
       ((eql 0) 0)
-      ((integer 1 #.sb!vm:n-fixnum-bits)
+      ((integer 1 #.sb-vm:n-fixnum-bits)
        (number-dispatch ((integer integer))
          ((fixnum) (msf size integer))
-         ((bignum) (let ((fix (sb!c::mask-signed-field #.sb!vm:n-fixnum-bits (%bignum-ref integer 0))))
-                     (if (= size #.sb!vm:n-fixnum-bits)
+         ((bignum) (let ((fix (sb-c::mask-signed-field #.sb-vm:n-fixnum-bits (%bignum-ref integer 0))))
+                     (if (= size #.sb-vm:n-fixnum-bits)
                          fix
                          (msf size fix))))))
-      ((integer (#.sb!vm:n-fixnum-bits) #.sb!vm:n-word-bits)
+      ((integer (#.sb-vm:n-fixnum-bits) #.sb-vm:n-word-bits)
        (number-dispatch ((integer integer))
          ((fixnum) integer)
-         ((bignum) (let ((word (sb!c::mask-signed-field #.sb!vm:n-word-bits (%bignum-ref integer 0))))
-                     (if (= size #.sb!vm:n-word-bits)
+         ((bignum) (let ((word (sb-c::mask-signed-field #.sb-vm:n-word-bits (%bignum-ref integer 0))))
+                     (if (= size #.sb-vm:n-word-bits)
                          word
                          (msf size word))))))
       ((unsigned-byte) (msf size integer)))))
@@ -1285,6 +1285,7 @@ and the number of 0 bits if INTEGER is negative."
 ;;; of 0 before the dispatch so that the bignum code doesn't have to worry
 ;;; about "small bignum" zeros.
 (defun two-arg-gcd (u v)
+  (declare (muffle-conditions compiler-note))
   (cond ((eql u 0) (abs v))
         ((eql v 0) (abs u))
         (t
@@ -1307,11 +1308,12 @@ and the number of 0 bits if INTEGER is negative."
                        (setq temp (- u v))
                        (when (zerop temp)
                          (let ((res (ash u k)))
-                           (declare (type sb!vm:signed-word res)
-                                    (optimize (inhibit-warnings 3)))
+                           (declare (type sb-vm:signed-word res))
+                           ;; signed word to integer coercion -> return value
+                           (declare (muffle-conditions compiler-note))
                            (return res))))))
-                (declare (type (mod #.sb!vm:n-word-bits) k)
-                         (type sb!vm:signed-word u v)))))
+                (declare (type (mod #.sb-vm:n-word-bits) k)
+                         (type sb-vm:signed-word u v)))))
            ((bignum bignum)
             (bignum-gcd u v))
            ((bignum fixnum)
@@ -1350,7 +1352,7 @@ and the number of 0 bits if INTEGER is negative."
                    (significant-half (ash ,arg (- (ash fourth-size 1))))
                    (significant-half-isqrt
                     (if-fixnum-p-truly-the
-                     (integer 1 #.(isqrt sb!xc:most-positive-fixnum))
+                     (integer 1 #.(isqrt sb-xc:most-positive-fixnum))
                      (,recurse significant-half)))
                    (zeroth-iteration (ash significant-half-isqrt
                                           fourth-size)))
@@ -1411,26 +1413,26 @@ and the number of 0 bits if INTEGER is negative."
                        (declare (integer x))
                        (etypecase x
                          ((signed-byte ,width) x)
-                         (fixnum (sb!c::mask-signed-field ,width x))
-                         (bignum (sb!c::mask-signed-field ,width x)))))
+                         (fixnum (sb-c::mask-signed-field ,width x))
+                         (bignum (sb-c::mask-signed-field ,width x)))))
                 (,name ,@(loop for arg in lambda-list
                                collect `(prepare-argument ,arg)))))))
     (flet ((do-mfuns (class)
-             (loop for infos being each hash-value of (sb!c::modular-class-funs class)
+             (loop for infos being each hash-value of (sb-c::modular-class-funs class)
                    ;; FIXME: We need to process only "toplevel" functions
                    when (listp infos)
                    do (loop for info in infos
-                            for name = (sb!c::modular-fun-info-name info)
-                            and width = (sb!c::modular-fun-info-width info)
-                            and signedp = (sb!c::modular-fun-info-signedp info)
-                            and lambda-list = (sb!c::modular-fun-info-lambda-list info)
+                            for name = (sb-c::modular-fun-info-name info)
+                            and width = (sb-c::modular-fun-info-width info)
+                            and signedp = (sb-c::modular-fun-info-signedp info)
+                            and lambda-list = (sb-c::modular-fun-info-lambda-list info)
                             if signedp
                             do (forms (signed-definition name lambda-list width))
                             else
                             do (forms (unsigned-definition name lambda-list width))))))
-      (do-mfuns sb!c::*untagged-unsigned-modular-class*)
-      (do-mfuns sb!c::*untagged-signed-modular-class*)
-      (do-mfuns sb!c::*tagged-modular-class*)))
+      (do-mfuns sb-c::*untagged-unsigned-modular-class*)
+      (do-mfuns sb-c::*untagged-signed-modular-class*)
+      (do-mfuns sb-c::*tagged-modular-class*)))
   `(progn ,@(sort (forms) #'string< :key #'cadr)))
 
 ;;; KLUDGE: these out-of-line definitions can't use the modular
@@ -1438,13 +1440,13 @@ and the number of 0 bits if INTEGER is negative."
 ;;; shifts.  See also the comment in (LOGAND OPTIMIZER) for more
 ;;; discussion of this hack.  -- CSR, 2003-10-09
 #!-64-bit-registers
-(defun sb!vm::ash-left-mod32 (integer amount)
+(defun sb-vm::ash-left-mod32 (integer amount)
   (etypecase integer
     ((unsigned-byte 32) (ldb (byte 32 0) (ash integer amount)))
     (fixnum (ldb (byte 32 0) (ash (logand integer #xffffffff) amount)))
     (bignum (ldb (byte 32 0) (ash (logand integer #xffffffff) amount)))))
 #!+64-bit-registers
-(defun sb!vm::ash-left-mod64 (integer amount)
+(defun sb-vm::ash-left-mod64 (integer amount)
   (etypecase integer
     ((unsigned-byte 64) (ldb (byte 64 0) (ash integer amount)))
     (fixnum (ldb (byte 64 0) (ash (logand integer #xffffffffffffffff) amount)))
@@ -1452,8 +1454,8 @@ and the number of 0 bits if INTEGER is negative."
                  (ash (logand integer #xffffffffffffffff) amount)))))
 
 #!+(or x86 x86-64 arm arm64)
-(defun sb!vm::ash-left-modfx (integer amount)
-  (let ((fixnum-width (- sb!vm:n-word-bits sb!vm:n-fixnum-tag-bits)))
+(defun sb-vm::ash-left-modfx (integer amount)
+  (let ((fixnum-width (- sb-vm:n-word-bits sb-vm:n-fixnum-tag-bits)))
     (etypecase integer
-      (fixnum (sb!c::mask-signed-field fixnum-width (ash integer amount)))
-      (integer (sb!c::mask-signed-field fixnum-width (ash (sb!c::mask-signed-field fixnum-width integer) amount))))))
+      (fixnum (sb-c::mask-signed-field fixnum-width (ash integer amount)))
+      (integer (sb-c::mask-signed-field fixnum-width (ash (sb-c::mask-signed-field fixnum-width integer) amount))))))

@@ -7,12 +7,9 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
-;;; the size of the chunks returned by RANDOM-CHUNK
-(def!constant n-random-chunk-bits 32)
-
-(sb!xc:defstruct (random-state (:constructor %make-random-state
+(sb-xc:defstruct (random-state (:constructor %make-random-state
                                    (state))
                                ;; Needed for reading #S(random-state)
                                (:constructor %%make-random-state)

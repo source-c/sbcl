@@ -1,4 +1,4 @@
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 (defcas car (cons) %compare-and-swap-car)
 (defcas cdr (cons) %compare-and-swap-cdr)
@@ -43,15 +43,13 @@
 ;; of +-MODFX, --MODFX were defined generically.
 (macrolet ((modular (fun a b)
              #!+(or x86 x86-64)
-             `(,(let ((*package* (find-package "SB!VM")))
-                  (symbolicate fun "-MODFX"))
-                ,a ,b)
+             `(,(package-symbolicate "SB-VM" fun "-MODFX") ,a ,b)
              #!-(or x86 x86-64)
              ;; algorithm of https://graphics.stanford.edu/~seander/bithacks
              `(let ((res (logand (,fun ,a ,b)
-                                 (ash sb!ext:most-positive-word
-                                      (- sb!vm:n-fixnum-tag-bits))))
-                    (m (ash 1 (1- sb!vm:n-fixnum-bits))))
+                                 (ash sb-ext:most-positive-word
+                                      (- sb-vm:n-fixnum-tag-bits))))
+                    (m (ash 1 (1- sb-vm:n-fixnum-bits))))
                 (- (logxor res m) m))))
 
   ;; Atomically frob the CAR or CDR of a cons, or a symbol-value.

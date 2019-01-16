@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; allocator for the array header
 
@@ -34,7 +34,7 @@
     (inst shl header n-widetag-bits)
     (inst or  header type)
     (inst shr header 2)
-    (pseudo-atomic
+    (pseudo-atomic ()
      (allocation result bytes node nil other-pointer-lowtag)
      (storew header result 0 other-pointer-lowtag))))
 
@@ -54,7 +54,7 @@
            (header (logior (ash header-size
                                 n-widetag-bits)
                            type)))
-     (pseudo-atomic
+     (pseudo-atomic ()
       (allocation result bytes node nil other-pointer-lowtag)
       (storew header result 0 other-pointer-lowtag)))))
 
@@ -79,68 +79,82 @@
     (inst sub res (1- array-dimensions-offset))))
 
 ;;;; bounds checking routine
-
-;;; Note that the immediate SC for the index argument is disabled
-;;; because it is not possible to generate a valid error code SC for
-;;; an immediate value.
-;;;
-;;; FIXME: As per the KLUDGE note explaining the :IGNORE-FAILURE-P
-;;; flag in build-order.lisp-expr, compiling this file causes warnings
-;;;    Argument FOO to VOP CHECK-BOUND has SC restriction
-;;;    DESCRIPTOR-REG which is not allowed by the operand type:
-;;;      (:OR POSITIVE-FIXNUM)
-;;; CSR's message "format ~/ /" on sbcl-devel 2002-03-12 contained
-;;; a possible patch, described as
-;;;   Another patch is included more for information than anything --
-;;;   removing the descriptor-reg SCs from the CHECK-BOUND vop in
-;;;   x86/array.lisp seems to allow that file to compile without error[*],
-;;;   and build; I haven't tested rebuilding capability, but I'd be
-;;;   surprised if there were a problem.  I'm not certain that this is the
-;;;   correct fix, though, as the restrictions on the arguments to the VOP
-;;;   aren't the same as in the sparc and alpha ports, where, incidentally,
-;;;   the corresponding file builds without error currently.
-;;; Since neither of us (CSR or WHN) was quite sure that this is the
-;;; right thing, I've just recorded the patch here in hopes it might
-;;; help when someone attacks this problem again:
-;;;   diff -u -r1.7 array.lisp
-;;;   --- src/compiler/x86/array.lisp 11 Oct 2001 14:05:26 -0000      1.7
-;;;   +++ src/compiler/x86/array.lisp 12 Mar 2002 12:23:37 -0000
-;;;   @@ -76,10 +76,10 @@
-;;;      (:translate %check-bound)
-;;;      (:policy :fast-safe)
-;;;      (:args (array :scs (descriptor-reg))
-;;;   -        (bound :scs (any-reg descriptor-reg))
-;;;   -        (index :scs (any-reg descriptor-reg #+nil immediate) :target result))
-;;;   +        (bound :scs (any-reg))
-;;;   +        (index :scs (any-reg #+nil immediate) :target result))
-;;;      (:arg-types * positive-fixnum tagged-num)
-;;;   -  (:results (result :scs (any-reg descriptor-reg)))
-;;;   +  (:results (result :scs (any-reg)))
-;;;      (:result-types positive-fixnum)
-;;;      (:vop-var vop)
-;;;      (:save-p :compute-only)
 (define-vop (check-bound)
   (:translate %check-bound)
   (:policy :fast-safe)
-  (:args (array :scs (descriptor-reg))
-         (bound :scs (any-reg))
-         (index :scs (any-reg descriptor-reg #+nil immediate)))
-  (:arg-types * positive-fixnum *)
+  (:args (array :scs (descriptor-reg constant))
+         (bound :scs (any-reg descriptor-reg)
+                :load-if (not (and (sc-is bound immediate)
+                                   (typep (tn-value bound)
+                                          'sc-offset)
+                                   (not (sc-is index immediate)))))
+         (index :scs (any-reg descriptor-reg)
+                :load-if (not (and (sc-is index immediate)
+                                   (typep (tn-value index)
+                                          'sc-offset)))))
+  (:variant-vars %test-fixnum)
+  (:variant t)
   (:vop-var vop)
   (:save-p :compute-only)
-  (:generator 5
+  (:generator 6
     (let ((error (generate-error-code vop 'invalid-array-index-error
                                       array bound index))
+          (bound (if (sc-is bound immediate)
+                     (let ((value (tn-value bound)))
+                       (cond ((and %test-fixnum
+                                   (power-of-two-limit-p (1- value)))
+                              (lognot (fixnumize (1- value))))
+                             ((sc-is index any-reg descriptor-reg)
+                              (fixnumize value))
+                             (t
+                              value)))
+                     bound))
           (index (if (sc-is index immediate)
-                     (fixnumize (tn-value index))
+                     (let ((value (tn-value index)))
+                       (if (sc-is bound any-reg descriptor-reg)
+                           (fixnumize value)
+                           value))
                      index)))
-      (unless (integerp index)
-        (%test-fixnum index error t))
-      (inst cmp bound index)
-      ;; We use below-or-equal even though it's an unsigned test,
-      ;; because negative indexes appear as large unsigned numbers.
-      ;; Therefore, we get the <0 and >=bound test all rolled into one.
-      (inst jmp :be error))))
+      (cond ((typep bound '(integer * -1))
+             ;; Power of two bound, can be checked for fixnumness at
+             ;; the same time as it always occupies a consecutive bit
+             ;; range, everything else, including the tag, has to be
+             ;; zero.
+             (inst test index (if (eql bound -1)
+                                  index ;; zero?
+                                  bound))
+             (inst jmp :ne error))
+            (t
+             (when (and %test-fixnum (not (integerp index)))
+               (%test-fixnum index nil error t))
+             (cond ((integerp bound)
+                    (inst cmp index bound)
+                    (inst jmp :nb error))
+                   (t
+                    (inst cmp bound index)
+                    (inst jmp :be error))))))))
+
+(define-vop (check-bound/fast check-bound)
+  (:policy :fast)
+  (:variant nil)
+  (:variant-cost 4))
+
+(define-vop (check-bound/fixnum check-bound)
+  (:args (array)
+         (bound)
+         (index :scs (any-reg)))
+  (:arg-types * * tagged-num)
+  (:variant nil)
+  (:variant-cost 4))
+
+(define-vop (check-bound/untagged check-bound)
+  (:args (array)
+         (bound :scs (unsigned-reg signed-reg))
+         (index :scs (unsigned-reg signed-reg)))
+  (:arg-types * (:or unsigned-num signed-num)
+                (:or unsigned-num signed-num))
+  (:variant nil)
+  (:variant-cost 5))
 
 ;;;; accessors/setters
 
@@ -764,8 +778,7 @@
   (:results (result :scs (unsigned-reg)))
   (:result-types unsigned-num)
   (:generator 4
-    (inst xadd (make-ea :dword :base array
-                        :scale 1 :index index
+    (inst xadd (make-ea :dword :base array :index index
                         :disp (- (* vector-data-offset n-word-bytes)
                                  other-pointer-lowtag))
           diff :lock)

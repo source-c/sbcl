@@ -9,11 +9,10 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!THREAD")
+(in-package "SB-THREAD")
 
-;;; FIXME: most of this file looks like it's supposed to be :not-host.
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (sb!xc:proclaim '(sb!ext:always-bound *current-thread*)))
+(!define-thread-local *current-thread* nil
+      "Bound in each thread to the thread itself.")
 
 (defstruct (foreign-thread
              (:copier nil)
@@ -39,12 +38,11 @@ stale value, use MUTEX-OWNER instead."
   "Test whether the current thread is holding MUTEX."
   ;; This is about the only use for which a stale value of owner is
   ;; sufficient.
-  (eq sb!thread:*current-thread* (mutex-%owner mutex)))
+  (eq sb-thread:*current-thread* (mutex-%owner mutex)))
 
 (defsetf mutex-value set-mutex-value)
 
-#-sb-xc-host
-(declaim (sb!ext:deprecated :final ("SBCL" "1.2.15") #'set-mutex-value))
+(declaim (sb-ext:deprecated :final ("SBCL" "1.2.15") #'set-mutex-value))
 
 ;;; SPINLOCK no longer exists as a type -- provided for backwards compatibility.
 
@@ -52,8 +50,7 @@ stale value, use MUTEX-OWNER instead."
   "Spinlock type."
   'mutex)
 
-#-sb-xc-host
-(declaim (sb!ext:deprecated
+(declaim (sb-ext:deprecated
           :late ("SBCL" "1.0.53.11") (type spinlock :replacement mutex)))
 
 (define-deprecated-function :early "1.0.53.11" make-spinlock make-mutex (&key name)
@@ -65,33 +62,29 @@ stale value, use MUTEX-OWNER instead."
 (define-deprecated-function :early "1.0.53.11" (setf spinlock-name) (setf mutex-name) (name lock)
   (setf (mutex-name lock) name))
 
-#-sb-xc-host ; Mutex is not a type on the host.
 (define-deprecated-function :early "1.0.53.11" spinlock-value mutex-owner (lock)
   (mutex-owner lock))
 
-#-sb-xc-host ; Mutex is not a type on the host.
 (define-deprecated-function :early "1.0.53.11" get-spinlock grab-mutex (lock)
   (grab-mutex lock))
 
-#-sb-xc-host ; Mutex is not a type on the host.
 (define-deprecated-function :early "1.0.53.11" release-spinlock release-mutex (lock)
   (release-mutex lock))
 
-(sb!xc:defmacro with-recursive-spinlock ((lock) &body body)
+(defmacro with-recursive-spinlock ((lock) &body body)
   `(with-recursive-lock (,lock)
      ,@body))
 
-(sb!xc:defmacro with-spinlock ((lock) &body body)
+(defmacro with-spinlock ((lock) &body body)
   `(with-mutex (,lock)
      ,@body))
 
-#-sb-xc-host
-(declaim (sb!ext:deprecated
+(declaim (sb-ext:deprecated
           :early ("SBCL" "1.0.53.11")
           (function with-recursive-spinlock :replacement with-recursive-lock)
           (function with-spinlock :replacement with-mutex)))
 
-(sb!xc:defmacro without-thread-waiting-for ((&key already-without-interrupts) &body body)
+(defmacro without-thread-waiting-for ((&key already-without-interrupts) &body body)
   (with-unique-names (thread prev)
     (let ((without (if already-without-interrupts
                        'progn
@@ -118,7 +111,7 @@ stale value, use MUTEX-OWNER instead."
                     (barrier (:write)))))
                (exec)))))))
 
-(sb!xc:defmacro with-mutex ((mutex &key (wait-p t) timeout value)
+(defmacro with-mutex ((mutex &key (wait-p t) timeout value)
                             &body body)
   "Acquire MUTEX for the dynamic scope of BODY. If WAIT-P is true (the default),
 and the MUTEX is not immediately available, sleep until it is available.
@@ -144,20 +137,7 @@ current thread."
       ,wait-p
       ,timeout)))
 
-(sb!xc:defmacro with-system-mutex ((mutex
-                                    &key without-gcing allow-with-interrupts)
-                                   &body body)
-  `(dx-flet ((with-system-mutex-thunk () ,@body))
-     (,(cond (without-gcing
-               'call-with-system-mutex/without-gcing)
-             (allow-with-interrupts
-              'call-with-system-mutex/allow-with-interrupts)
-             (t
-              'call-with-system-mutex))
-       #'with-system-mutex-thunk
-       ,mutex)))
-
-(sb!xc:defmacro with-recursive-lock ((mutex &key (wait-p t) timeout) &body body)
+(defmacro with-recursive-lock ((mutex &key (wait-p t) timeout) &body body)
   "Acquire MUTEX for the dynamic scope of BODY.
 
 If WAIT-P is true (the default), and the MUTEX is not immediately available or
@@ -181,22 +161,11 @@ held mutex, WITH-RECURSIVE-LOCK allows recursive lock attempts to succeed."
       ,wait-p
       ,timeout)))
 
-(sb!xc:defmacro with-recursive-system-lock ((lock
-                                             &key without-gcing)
-                                            &body body)
-  `(dx-flet ((with-recursive-system-lock-thunk () ,@body))
-     (,(cond (without-gcing
-              'call-with-recursive-system-lock/without-gcing)
-             (t
-              'call-with-recursive-system-lock))
-      #'with-recursive-system-lock-thunk
-       ,lock)))
-
-#-sb-xc-host ; Mutex is not a type on the host.
 (macrolet ((def (name &optional variant)
              `(defun ,(if variant (symbolicate name "/" variant) name)
                   (function mutex)
                 (declare (function function))
+                (declare (dynamic-extent function))
                 (flet ((%call-with-system-mutex ()
                          (dx-let (got-it)
                            (unwind-protect
@@ -217,7 +186,7 @@ held mutex, WITH-RECURSIVE-LOCK allows recursive lock attempts to succeed."
   (def call-with-system-mutex :without-gcing)
   (def call-with-system-mutex :allow-with-interrupts))
 
-#!+(and (host-feature sb-xc) (not sb-thread))
+#!-sb-thread
 (progn
   (defun call-with-mutex (function mutex value waitp timeout)
     (declare (ignore mutex waitp timeout)
@@ -242,13 +211,14 @@ held mutex, WITH-RECURSIVE-LOCK allows recursive lock attempts to succeed."
     (without-gcing
       (funcall function))))
 
-#!+(and (host-feature sb-xc) sb-thread)
+#!+sb-thread
 ;;; KLUDGE: These need to use DX-LET, because the cleanup form that
 ;;; closes over GOT-IT causes a value-cell to be allocated for it --
 ;;; and we prefer that to go on the stack since it can.
 (progn
   (defun call-with-mutex (function mutex value waitp timeout)
     (declare (function function))
+    (declare (dynamic-extent function))
     (unless (or (null value) (eq *current-thread* value))
       (error "~S called with non-nil :VALUE that isn't the current thread."
              'with-mutex))
@@ -264,6 +234,7 @@ held mutex, WITH-RECURSIVE-LOCK allows recursive lock attempts to succeed."
 
   (defun call-with-recursive-lock (function mutex waitp timeout)
     (declare (function function))
+    (declare (dynamic-extent function))
     (dx-let ((inner-lock-p (eq (mutex-%owner mutex) *current-thread*))
              (got-it nil))
       (without-interrupts
@@ -279,6 +250,7 @@ held mutex, WITH-RECURSIVE-LOCK allows recursive lock attempts to succeed."
                `(defun ,(if variant (symbolicate name "/" variant) name)
                     (function lock)
                   (declare (function function))
+                  (declare (dynamic-extent function))
                   (flet ((%call-with-recursive-system-lock ()
                            (dx-let ((inner-lock-p
                                      (eq *current-thread* (mutex-owner lock)))

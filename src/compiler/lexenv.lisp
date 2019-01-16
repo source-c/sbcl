@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; support for the idiom (in MACROEXPAND and elsewhere) that NIL is
 ;;; to be taken as a null lexical environment.
@@ -20,7 +20,7 @@
     (null (make-null-lexenv))
     (lexenv x)
     #!+(and sb-fasteval (host-feature sb-xc))
-    (sb!interpreter:basic-env (sb!interpreter:lexenv-from-env x))))
+    (sb-interpreter:basic-env (sb-interpreter:lexenv-from-env x))))
 
 ;;; Take the lexenv surrounding an inlined function and extract things
 ;;; needed for the inline expansion suitable for dumping into fasls.
@@ -67,7 +67,9 @@
                 (typecase what
                   (cons
                    (push name shadowed-funs)
-                   (push (cons name (function-lambda-expression (cdr what))) macros))
+                   (let ((expression (function-lambda-expression (cdr what))))
+                     (aver expression)
+                     (push (cons name expression) macros)))
                   ;; FIXME: Is there a good reason for this not to be
                   ;; DEFINED-FUN (which :INCLUDEs GLOBAL-VAR, in case
                   ;; you're wondering how this ever worked :-)? Maybe
@@ -125,8 +127,8 @@
              ((reconstruct-lexenv lexenv)
               `(lambda-with-lexenv ,it ,@(cdr lambda))))))
    #!+(and sb-fasteval (host-feature sb-xc))
-   (sb!interpreter:basic-env
-    (awhen (sb!interpreter::reconstruct-syntactic-closure-env lexenv)
+   (sb-interpreter:basic-env
+    (awhen (sb-interpreter::reconstruct-syntactic-closure-env lexenv)
       `(lambda-with-lexenv ,it ,@(cdr lambda))))
    #!+sb-fasteval
    (null lambda))) ; trivial case. Never occurs in the compiler.

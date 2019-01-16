@@ -1,6 +1,6 @@
 ;;;; FOP definitions
 
-(in-package "SB!FASL")
+(in-package "SB-FASL")
 
 ;;; Bind STACK-VAR and PTR-VAR to the start of a subsequence of
 ;;; the fop stack of length COUNT, then execute BODY.
@@ -11,7 +11,7 @@
   `(macrolet ((fop-stack-ref (i)
                 `(locally
                      #-sb-xc-host
-                     (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+                     (declare (optimize (sb-c::insert-array-bounds-checks 0)))
                    (svref ,',stack-var (truly-the index ,i)))))
      (let* (,@(when stack-expr
                 (list `(,stack-var (the simple-vector ,stack-expr))))
@@ -60,41 +60,31 @@
                  (error ,(format nil "Not-host fop invoked: ~A" name)))))
        (!%define-fop ',name ,fop-code ,(length operands) ,(if pushp 1 0)))))
 
-(defun !%define-fop (name base-opcode n-operands pushp)
+(defun !%define-fop (name opcode n-operands pushp)
   (declare (type (mod 4) n-operands))
-  ;; If at least one non-stack operand is present, the same fop function
-  ;; appears in 4 consecutive cells in the fop table, with the low 2 bits
-  ;; of the fopcode determining the number of additional bytes to read
-  ;; for the first operand. The second and third operands are varint-encoded.
-  (let ((n-slots (if (plusp n-operands) 4 1)))
-    (unless (zerop (mod base-opcode n-slots))
-      (error "Opcode for fop ~S must be a multiple of ~D" name n-slots))
-    (loop for opcode from base-opcode below (+ base-opcode n-slots)
-          for function = (svref **fop-funs** opcode)
-          when (functionp function)
-          do (let ((oname (nth-value 2 (function-lambda-expression function))))
-               (when (and oname (not (eq oname name)))
-                 (error "fop ~S with opcode ~D conflicts with fop ~S."
-                        name opcode oname))))
+  (let ((function (svref **fop-funs** opcode)))
+    (when (functionp function)
+      (let ((oname (nth-value 2 (function-lambda-expression function))))
+        (when (and oname (not (eq oname name)))
+          (error "fop ~S with opcode ~D conflicts with fop ~S."
+                 name opcode oname))))
     (let ((existing-opcode (get name 'opcode)))
-      (when (and existing-opcode (/= existing-opcode base-opcode))
+      (when (and existing-opcode (/= existing-opcode opcode))
         (error "multiple codes for fop name ~S: ~D and ~D"
-               name base-opcode existing-opcode)))
-    (setf (get name 'opcode) base-opcode)
-    ;; The low 2 bits of the opcode comprise the length modifier if there is
-    ;; at least one non-stack integer operand.
-    ;; If there is more than 1, they follow, using varint encoding.
-    (dotimes (j n-slots)
-      (let ((opcode (+ base-opcode j)))
-        (setf (svref **fop-funs** opcode) (symbol-function name)
-              (aref (car **fop-signatures**) opcode) n-operands
-              (sbit (cdr **fop-signatures**) opcode) pushp))))
+               name opcode existing-opcode)))
+    (setf (get name 'opcode) opcode
+          (svref **fop-funs** opcode) (symbol-function name)
+          (aref (car **fop-signatures**) opcode) n-operands
+          (sbit (cdr **fop-signatures**) opcode) pushp))
   name)
 
-;;; a helper function for reading string values from FASL files: sort
+;;; helper functions for reading string values from FASL files: sort
 ;;; of like READ-SEQUENCE specialized for files of (UNSIGNED-BYTE 8),
 ;;; with an automatic conversion from (UNSIGNED-BYTE 8) into CHARACTER
 ;;; for each element read
+
+;;; Variation 1: character string, transfer elements of type (unsigned-byte 8)
+;;: [Can we eliminate this one?]
 (defun read-string-as-bytes (stream string &optional (length (length string)))
   (declare (type (simple-array character (*)) string)
            (type index length)
@@ -102,8 +92,9 @@
   (with-fast-read-byte ((unsigned-byte 8) stream)
     (dotimes (i length)
       (setf (aref string i)
-            (sb!xc:code-char (fast-read-byte)))))
+            (sb-xc:code-char (fast-read-byte)))))
   string)
+;;; Variation 2: base-string, transfer elements of type (unsigned-byte 8)
 (defun read-base-string-as-bytes (stream string &optional (length (length string)))
   (declare (type (simple-array base-char (*)) string)
            (type index length)
@@ -111,40 +102,33 @@
   (with-fast-read-byte ((unsigned-byte 8) stream)
     (dotimes (i length)
       (setf (aref string i)
-            (sb!xc:code-char (fast-read-byte)))))
+            (sb-xc:code-char (fast-read-byte)))))
   string)
-#!+(and sb-unicode (host-feature sb-xc))
-(defun read-string-as-unsigned-byte-32
+;;; Variation 3: character-string, transfer elements of type varint
+(defun read-char-string-as-varints
     (stream string &optional (length (length string)))
   (declare (type (simple-array character (*)) string)
            (type index length)
            (optimize speed))
   (with-fast-read-byte ((unsigned-byte 8) stream)
-    (dotimes (i length)
-      (setf (aref string i)
-            (sb!xc:code-char (fast-read-u-integer 4)))))
+    ;; OAOO violation- This repeats code in DEFINE-READ-VAR-INTEGER in 'debug-var-io'
+    ;; but there isn't a good expansion of that macro that would operate on a stream
+    ;; (which is ok in itself) but also that would entail only a single wrapping of
+    ;; WITH-FAST-READ-BYTE for all work.
+    ;; i.e. we don't want to update the stream slots after each varint.
+    (flet ((read-varint ()
+             (loop for shift :of-type (integer 0 28) from 0 by 7 ; position in integer
+                   for octet = (fast-read-byte)
+                   for accum :of-type (mod #.sb-xc:char-code-limit)
+                     = (logand octet #x7F)
+                     then (logior (ash (logand octet #x7F) shift) accum)
+                   unless (logbitp 7 octet) return accum)))
+      (dotimes (i length)
+        (setf (aref string i)
+              (sb-xc:code-char (read-varint))))))
   string)
 
 ;;;; miscellaneous fops
-
-;;; Setting this variable causes execution of a FOP-NOP4 to produce
-;;; output to *DEBUG-IO*. This can be handy when trying to follow the
-;;; progress of FASL loading.
-#!+sb-show
-(defvar *show-fop-nop4-p* nil)
-
-;;; CMU CL had a single no-op fop, FOP-NOP, with fop code 0. Since 0
-;;; occurs disproportionately often in fasl files for other reasons,
-;;; FOP-NOP is less than ideal for writing human-readable patterns
-;;; into fasl files for debugging purposes. There's no shortage of
-;;; unused fop codes, so we add this second NOP, which reads 4
-;;; arbitrary bytes and discards them.
-(!define-fop 137 (fop-nop4 () nil)
-  (let ((arg (read-arg 4 (fasl-input-stream))))
-    (declare (ignorable arg))
-    #!+sb-show
-    (when *show-fop-nop4-p*
-      (format *debug-io* "~&/FOP-NOP4 ARG=~W=#X~X~%" arg arg))))
 
 (!define-fop 0 (fop-nop () nil))
 (!define-fop 1 (fop-pop (x) nil) (push-fop-table x (fasl-input)))
@@ -166,13 +150,13 @@
 (!define-fop 48 :not-host (fop-struct ((:operands size) layout))
   (let ((res (%make-instance size)) ; number of words excluding header
         ;; Discount the layout from number of user-visible words.
-        (n-data-words (- size sb!vm:instance-data-start)))
+        (n-data-words (- size sb-vm:instance-data-start)))
     (setf (%instance-layout res) layout)
     (with-fop-stack ((stack (operand-stack)) ptr n-data-words)
       (declare (type index ptr))
       (let ((bitmap (layout-bitmap layout)))
         ;; Values on the stack are in the same order as in the structure itself.
-        (do ((i sb!vm:instance-data-start (1+ i)))
+        (do ((i sb-vm:instance-data-start (1+ i)))
             ((>= i size))
           (declare (type index i))
           (let ((val (fop-stack-ref ptr)))
@@ -253,7 +237,7 @@
                      (svref buffer base-p) string))
              (funcall (if (eql base-p 1)
                           'read-base-string-as-bytes
-                          'read-string-as-unsigned-byte-32)
+                          'read-char-string-as-varints)
                       (%fasl-input-stream fasl-input) string namelen)
              (values string namelen elt-type)))
          (aux-fop-intern (length+flag package fasl-input)
@@ -301,8 +285,7 @@
 
 (!define-fop 156 :not-host (fop-named-package-save ((:operands length)) nil)
   (let ((package-name (make-string length)))
-    #!-sb-unicode (read-string-as-bytes (fasl-input-stream) package-name)
-    #!+sb-unicode (read-string-as-unsigned-byte-32 (fasl-input-stream) package-name)
+    (read-char-string-as-varints (fasl-input-stream) package-name)
     (push-fop-table
      (handler-case (find-undeleted-package-or-lose package-name)
        (simple-package-error (c)
@@ -314,7 +297,8 @@
 ;;; Load a signed integer LENGTH bytes long from FASL-INPUT-STREAM.
 (defun load-s-integer (length fasl-input-stream)
   (declare (fixnum length)
-           (optimize speed))
+           (optimize speed)
+           #-sb-xc-host (muffle-conditions compiler-note))
   (with-fast-read-byte ((unsigned-byte 8) fasl-input-stream)
     (do* ((index length (1- index))
           (byte 0 (fast-read-byte))
@@ -331,7 +315,7 @@
 
 (!define-fop 34 (fop-word-integer)
   (with-fast-read-byte ((unsigned-byte 8) (fasl-input-stream))
-    (fast-read-s-integer #.sb!vm:n-word-bytes)))
+    (fast-read-s-integer #.sb-vm:n-word-bytes)))
 
 (!define-fop 35 (fop-byte-integer)
   ;; FIXME: WITH-FAST-READ-BYTE for exactly 1 byte is not really faster/better
@@ -371,11 +355,20 @@
     (define-float-fop 52 fop-long-float long-float)))
 
 #!+sb-simd-pack
-(!define-fop 88 (fop-simd-pack)
+(!define-fop 88 :not-host (fop-simd-pack)
   (with-fast-read-byte ((unsigned-byte 8) (fasl-input-stream))
-    (%make-simd-pack (fast-read-s-integer 8)
-                     (fast-read-u-integer 8)
-                     (fast-read-u-integer 8))))
+    (let ((tag (fast-read-s-integer 8)))
+      (cond #!+sb-simd-pack-256
+            ((logbitp 2 tag)
+             (%make-simd-pack-256 (logand tag #b11)
+                                  (fast-read-u-integer 8)
+                                  (fast-read-u-integer 8)
+                                  (fast-read-u-integer 8)
+                                  (fast-read-u-integer 8)))
+            (t
+             (%make-simd-pack tag
+                              (fast-read-u-integer 8)
+                              (fast-read-u-integer 8)))))))
 
 ;;;; loading lists
 
@@ -431,13 +424,9 @@
    (read-base-string-as-bytes (fasl-input-stream)
                               (make-string length :element-type 'base-char))))
 
-;; FIXME: can save space by UTF-8 encoding, or use 1 bit to indicate pure ASCII
-;; in the fasl even though the result will be a non-base string.
-#!+sb-unicode
 (!define-fop 160 :not-host (fop-character-string ((:operands length)))
   (logically-readonlyize
-   (read-string-as-unsigned-byte-32 (fasl-input-stream)
-                                    (make-string length))))
+   (read-char-string-as-varints (fasl-input-stream) (make-string length))))
 
 (!define-fop 92 (fop-vector ((:operands size)))
   (if (zerop size)
@@ -453,25 +442,25 @@
 (!define-fop 89 :not-host (fop-array (vec))
   (let* ((rank (read-word-arg (fasl-input-stream)))
          (length (length vec))
-         (res (make-array-header sb!vm:simple-array-widetag rank)))
+         (res (make-array-header sb-vm:simple-array-widetag rank)))
     (declare (simple-array vec)
-             (type (unsigned-byte #.(- sb!vm:n-word-bits sb!vm:n-widetag-bits)) rank))
+             (type (unsigned-byte #.(- sb-vm:n-word-bits sb-vm:n-widetag-bits)) rank))
     (set-array-header res vec length nil 0
                       (fop-list-from-stack (operand-stack) rank)
                       nil t)
     res))
 
 (defglobal **saetp-bits-per-length**
-    (let ((array (make-array (1+ sb!vm:widetag-mask)
+    (let ((array (make-array (1+ sb-vm:widetag-mask)
                              :element-type '(unsigned-byte 8)
                              :initial-element 255)))
-      (loop for saetp across sb!vm:*specialized-array-element-type-properties*
+      (loop for saetp across sb-vm:*specialized-array-element-type-properties*
             do
-            (setf (aref array (sb!vm:saetp-typecode saetp))
-                  (sb!vm:saetp-n-bits saetp)))
+            (setf (aref array (sb-vm:saetp-typecode saetp))
+                  (sb-vm:saetp-n-bits saetp)))
       array)
     "255 means bad entry.")
-(declaim (type (simple-array (unsigned-byte 8) (#.(1+ sb!vm:widetag-mask)))
+(declaim (type (simple-array (unsigned-byte 8) (#.(1+ sb-vm:widetag-mask)))
                **saetp-bits-per-length**))
 
 ;; No ALLOCATE-VECTOR on host (nor READ-N-BYTES)
@@ -481,9 +470,9 @@
          (bits-per-length (aref **saetp-bits-per-length** widetag))
          (bits (progn (aver (< bits-per-length 255))
                       (* length bits-per-length)))
-         (bytes (ceiling bits sb!vm:n-byte-bits))
-         (words (ceiling bytes sb!vm:n-word-bytes))
-         (vector (if (and (= widetag sb!vm:simple-vector-widetag)
+         (bytes (ceiling bits sb-vm:n-byte-bits))
+         (words (ceiling bytes sb-vm:n-word-bytes))
+         (vector (if (and (= widetag sb-vm:simple-vector-widetag)
                           (= words 0))
                      #()
                      (logically-readonlyize
@@ -566,10 +555,31 @@
 ;;; fasl file header.)
 
 ;; Cold-load calls COLD-LOAD-CODE instead
-(!define-fop #xE0 :not-host (fop-code ((:operands n-code-bytes n-boxed-words nfuns)))
-  ;; add 1 word for the toplevel-p flag and one for the debug-info
-  (with-fop-stack ((stack (operand-stack)) ptr (+ n-boxed-words 2))
-    (load-code nfuns n-boxed-words n-code-bytes stack ptr (fasl-input))))
+(!define-fop #xE0 :not-host (fop-load-code ((:operands immobile-p
+                                                       n-boxed-words
+                                                       n-code-bytes)))
+  (let ((n-constants (- n-boxed-words sb-vm:code-constants-offset)))
+    ;; stack has (at least) N-CONSTANTS words plus debug-info
+    (with-fop-stack ((stack (operand-stack)) ptr (1+ n-constants))
+      (let* ((debug-info-index (+ ptr n-constants))
+             (n-boxed-words (+ sb-vm:code-constants-offset n-constants))
+             (code (sb-c:allocate-code-object
+                    (if (eql immobile-p 1) :immobile :dynamic)
+                    (align-up n-boxed-words sb-c::code-boxed-words-align)
+                    n-code-bytes)))
+        (setf (%code-debug-info code) (svref stack debug-info-index))
+        (loop for i of-type index from sb-vm:code-constants-offset
+              for j of-type index from ptr below debug-info-index
+              do (setf (code-header-ref code i) (svref stack j)))
+        (with-pinned-objects (code)
+          (read-n-bytes (fasl-input-stream) (code-instructions code) 0 n-code-bytes)
+          (sb-c::apply-fasl-fixups stack code))
+        #-sb-xc-host
+        (when (typep (code-header-ref code (1- n-boxed-words))
+                     '(cons (eql sb-c::coverage-map)))
+          ;; Record this in the global list of coverage-instrumented code.
+          (atomic-push (make-weak-pointer code) (cdr *code-coverage-info*)))
+        code))))
 
 ;; this gets you an #<fdefn> object, not the result of (FDEFINITION x)
 ;; cold-loader uses COLD-FDEFINITION-OBJECT instead.
@@ -582,11 +592,6 @@
 (!define-fop 65 :not-host (fop-known-fun (name))
   (%coerce-name-to-fun name))
 
-#!-(or x86 (and x86-64 (not immobile-space)))
-(!define-fop 61 :not-host (fop-sanctify-for-execution (component))
-  (sb!vm:sanctify-for-execution component)
-  component)
-
 ;;; Modify a slot in a CONSTANTS object.
 (!define-fop 140 :not-host (fop-alter-code ((:operands index) code value) nil)
   (setf (code-header-ref code index) value)
@@ -598,7 +603,7 @@
     (setf (%simple-fun-name fun) name)
     (setf (%simple-fun-arglist fun) arglist)
     (setf (%simple-fun-type fun) type)
-    (setf (%simple-fun-info fun) info)
+    (apply #'set-simple-fun-info fun info)
     fun))
 
 ;;;; Some Dylan FOPs used to live here. By 1 November 1998 the code
@@ -617,84 +622,6 @@
 
 (!define-fop 144 (fop-assembler-code)
   (error "cannot load assembler code except at cold load"))
-
-(!define-fop 145 (fop-assembler-routine)
-  (error "cannot load assembler code except at cold load"))
-
-(!define-fop 146 :not-host (fop-symbol-tls-fixup (code-object kind symbol))
-  (sb!vm:fixup-code-object code-object
-                           (read-word-arg (fasl-input-stream))
-                           (ensure-symbol-tls-index symbol)
-                           kind)
-  code-object)
-
-#!+immobile-space
-(progn
-  (!define-fop 133 :not-host (fop-layout-fixup (code-object kind obj))
-    (sb!vm:fixup-code-object code-object
-                             (read-word-arg (fasl-input-stream))
-                             (get-lisp-obj-address (find-layout obj))
-                             kind :immobile-object)
-    code-object)
-  (!define-fop 134 :not-host (fop-immobile-obj-fixup (code-object kind obj))
-    (sb!vm:fixup-code-object code-object
-                             (read-word-arg (fasl-input-stream))
-                             (get-lisp-obj-address obj) ; OBJ can't move
-                             kind :immobile-object)
-    code-object))
-
-#!+immobile-code
-(progn
-  (!define-fop 135 :not-host (fop-named-call-fixup (code-object kind name))
-    (sb!vm:fixup-code-object code-object
-                             (read-word-arg (fasl-input-stream))
-                             (sb!vm::fdefn-entry-address name)
-                             kind :named-call)
-    code-object)
-
-  (!define-fop 136 :not-host (fop-static-call-fixup (code-object kind name))
-    (sb!vm:fixup-code-object code-object
-                             (read-word-arg (fasl-input-stream))
-                             (sb!vm::function-raw-address name)
-                             kind :static-call)
-    code-object))
-
-(!define-fop 147 :not-host (fop-foreign-fixup (code-object kind))
-  (let* ((len (read-byte-arg (fasl-input-stream)))
-         (sym (make-string len :element-type 'base-char)))
-    (read-n-bytes (fasl-input-stream) sym 0 len)
-    (sb!vm:fixup-code-object code-object
-                             (read-word-arg (fasl-input-stream))
-                             (foreign-symbol-address sym)
-                             kind)
-    code-object))
-
-(!define-fop 148 :not-host (fop-assembler-fixup (code-object kind routine))
-  (multiple-value-bind (value found) (gethash routine *assembler-routines*)
-    (unless found
-      (error "undefined assembler routine: ~S" routine))
-    (sb!vm:fixup-code-object code-object (read-word-arg (fasl-input-stream))
-                             value kind :assembly-routine))
-  code-object)
-
-(!define-fop 149 :not-host (fop-code-object-fixup (code-object kind))
-    ;; Note: We don't have to worry about GC moving the code-object after
-    ;; the GET-LISP-OBJ-ADDRESS and before that value is deposited, because
-    ;; we can only use code-object fixups when code-objects don't move.
-  (sb!vm:fixup-code-object code-object (read-word-arg (fasl-input-stream))
-                           (get-lisp-obj-address code-object) kind)
-  code-object)
-
-#!+linkage-table
-(!define-fop 150 :not-host (fop-foreign-dataref-fixup (code-object kind))
-  (let* ((len (read-byte-arg (fasl-input-stream)))
-         (sym (make-string len :element-type 'base-char)))
-    (read-n-bytes (fasl-input-stream) sym 0 len)
-    (sb!vm:fixup-code-object code-object
-                             (read-word-arg (fasl-input-stream))
-                             (foreign-symbol-address sym t)
-                             kind)
-    code-object))
 
 ;;; FOPs needed for implementing an IF operator in a FASL
 
@@ -751,10 +678,10 @@
         (#x6d structure-object)
         (#x6e condition)
         (#x6f definition-source-location)
-        (#x70 sb!c::debug-fun)
-        (#x71 sb!c::compiled-debug-fun)
-        (#x72 sb!c::debug-info)
-        (#x73 sb!c::compiled-debug-info)
-        (#x74 sb!c::debug-source)
+        (#x70 sb-c::debug-fun)
+        (#x71 sb-c::compiled-debug-fun)
+        (#x72 sb-c::debug-info)
+        (#x73 sb-c::compiled-debug-info)
+        (#x74 sb-c::debug-source)
         (#x75 defstruct-description)
         (#x76 defstruct-slot-description)))

@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; flags for compiled debug variables
 
@@ -181,9 +181,11 @@
   (returns :fixed :type (or (simple-array * (*)) (member :standard :fixed)))
   ;; SC-OFFSETs describing where the return PC and return FP are kept.
   #!-fp-and-pc-standard-save
-  (return-pc (missing-arg) :type sc-offset)
+  (return-pc (missing-arg) :type sc+offset)
   #!-fp-and-pc-standard-save
-  (old-fp (missing-arg) :type sc-offset)
+  (return-pc-pass (missing-arg) :type sc+offset)
+  #!-fp-and-pc-standard-save
+  (old-fp (missing-arg) :type sc+offset)
   ;; An integer which contains between 2 and 4 varint-encoded fields:
   ;; START-PC -
   ;; The earliest PC in this function at which the environment is properly
@@ -194,21 +196,26 @@
   (encoded-locs (missing-arg) :type unsigned-byte :read-only t))
 
 (defun cdf-encode-locs (start-pc elsewhere-pc closure-save
-                        #!+unwind-to-frame-and-call-vop bsp-save)
-  (dx-let ((storage (make-array (* 5 4) :element-type '(unsigned-byte 8))))
-    (let ((bytes (make-array (* 5 4) :fill-pointer 0 :displaced-to storage
-                             :element-type '(unsigned-byte 8))))
-      ;; ELSEWHERE is encoded first to simplify the C backtrace logic,
-      ;; which does not need access to any of the subsequent fields.
-      (write-var-integer elsewhere-pc bytes)
-      (write-var-integer start-pc bytes)
-      #!+unwind-to-frame-and-call-vop
-      (write-var-integer (if bsp-save (1+ bsp-save) 0) bytes)
-      ;; More often the BSP-SAVE is non-null than CLOSURE-SAVE is non-null,
-      ;; so the encoding is potentially smaller with CLOSURE-SAVE being last.
-      (when closure-save
-        (write-var-integer (1+ closure-save) bytes))
-      (integer-from-octets bytes))))
+                        #!+unwind-to-frame-and-call-vop bsp-save
+                        #!-fp-and-pc-standard-save lra-saved-pc
+                        #!-fp-and-pc-standard-save cfp-saved-pc)
+  (dx-let ((bytes (make-array (* 5 4) :fill-pointer 0
+                                      :element-type '(unsigned-byte 8))))
+    ;; ELSEWHERE is encoded first to simplify the C backtrace logic,
+    ;; which does not need access to any of the subsequent fields.
+    (write-var-integer elsewhere-pc bytes)
+    (write-var-integer start-pc bytes)
+    #!+unwind-to-frame-and-call-vop
+    (write-var-integer (if bsp-save (1+ bsp-save) 0) bytes)
+    #!-fp-and-pc-standard-save
+    (progn
+      (write-var-integer lra-saved-pc bytes)
+      (write-var-integer cfp-saved-pc bytes))
+    ;; More often the BSP-SAVE is non-null than CLOSURE-SAVE is non-null,
+    ;; so the encoding is potentially smaller with CLOSURE-SAVE being last.
+    (when closure-save
+      (write-var-integer (1+ closure-save) bytes))
+    (integer-from-octets bytes)))
 
 (defun cdf-decode-locs (cdf)
   (let ((encoding (compiled-debug-fun-encoded-locs cdf))
@@ -225,18 +232,32 @@
             #!+unwind-to-frame-and-call-vop
             ;; 0 -> NULL, 1 -> 0, ...
             (bsp-save (let ((i (decode-varint))) (unless (zerop i) (1- i))))
+            #!-fp-and-pc-standard-save
+            (lra-saved-pc (decode-varint))
+            #!-fp-and-pc-standard-save
+            (cfp-saved-pc (decode-varint))
             (closure-save (let ((i (decode-varint))) (unless (zerop i) (1- i)))))
         (values start-pc elsewhere-pc closure-save
+                #!-fp-and-pc-standard-save lra-saved-pc
+                #!-fp-and-pc-standard-save cfp-saved-pc
                 #!+unwind-to-frame-and-call-vop bsp-save)))))
 
-(macrolet ((def (index name)
-             `(defun ,name (cdf)
-                (nth-value ,index (cdf-decode-locs cdf)))))
-  (def 0 compiled-debug-fun-start-pc)
-  (def 1 compiled-debug-fun-elsewhere-pc)
-  ;; Most compiled-debug-funs don't need these
-  (def 2 compiled-debug-fun-closure-save)
-  #!+unwind-to-frame-and-call-vop (def 3 compiled-debug-fun-bsp-save))
+(macrolet ((def (&rest names)
+             `(progn
+                ,@(loop
+                     for name in names
+                     for index from 0
+                     collect
+                       `(defun ,name (cdf)
+                          (nth-value ,index (cdf-decode-locs cdf)))))))
+  (def
+    compiled-debug-fun-start-pc
+    compiled-debug-fun-elsewhere-pc
+    ;; Most compiled-debug-funs don't need these
+    compiled-debug-fun-closure-save
+    #!-fp-and-pc-standard-save compiled-debug-fun-lra-saved-pc
+    #!-fp-and-pc-standard-save compiled-debug-fun-cfp-saved-pc
+    #!+unwind-to-frame-and-call-vop compiled-debug-fun-bsp-save))
 
 (def!struct (compiled-debug-fun-optional (:include compiled-debug-fun)
                                          #-sb-xc-host (:pure t)
@@ -304,11 +325,11 @@
 ;;;     If variables are dumped (level 1), then the variables are all
 ;;;     arguments (in order) with the minimal-arg bit set.
 ;;;    [If returns is specified, then the number of return values]
-;;;    [...sequence of var-length ints holding sc-offsets of the return
+;;;    [...sequence of var-length ints holding SC+OFFSETs of the return
 ;;;     value locations, if fixed return values are specified.]
-;;;    return-pc location sc-offset (as var-length int)
-;;;    old-fp location sc-offset (as var-length int)
-;;;    [nfp location sc-offset (as var-length int), if nfp flag]
+;;;    return-pc location SC+OFFSET (as var-length int)
+;;;    old-fp location SC+OFFSET (as var-length int)
+;;;    [nfp location SC+OFFSET (as var-length int), if nfp flag]
 ;;;    code-start-pc (as a var-length int)
 ;;;     This field implicitly encodes start of this function's code in the
 ;;;     function map, as a delta from the previous function's code start.
@@ -336,29 +357,24 @@
 ;;; toplevel or loaded from source.
 (def!struct (debug-source #-sb-xc-host (:pure t)
                           (:copier nil))
-  ;; (This is one of those structures where IWBNI we had multiple
-  ;; inheritance.  The first four slots describe compilation of a
-  ;; file, the fifth and sixth compilation of a form processed by
-  ;; EVAL, and the seventh and eigth all compilation units; and these
-  ;; are orthogonal concerns that can combine independently.)
-
   ;; When the DEBUG-SOURCE describes a file, the file's namestring.
   ;; Otherwise, NIL.
-  (namestring nil :type (or null string) :read-only t)
+  (namestring nil :type (or null string))
   ;; the universal time that the source was written, or NIL if
   ;; unavailable
   (created nil :type (or unsigned-byte null))
-
-  ;; For functions processed by EVAL (including EVAL-WHEN and LOAD on
-  ;; a source file), the source form.
-  (form nil :type list :read-only t)
-  ;; This is the function whose source is the form.
-  (function nil :read-only t)
-
   ;; the universal time that the source was compiled
   (compiled (missing-arg) :type unsigned-byte)
   ;; Additional information from (WITH-COMPILATION-UNIT (:SOURCE-PLIST ...))
   (plist *source-plist* :read-only t))
+(def!struct (core-debug-source #-sb-xc-host (:pure t)
+                               (:copier nil)
+                               (:include debug-source))
+  ;; Compilation to memory stores each toplevel form given to %COMPILE.
+  ;; That form can generate multiple functions, and those functions can
+  ;; be in one or more code components. They all point at the same form.
+  form
+  (function nil :read-only t))
 
 ;;;; DEBUG-INFO structures
 
@@ -381,17 +397,20 @@
   ;; are in sorted order, to allow binary search. We omit the first
   ;; and last PC, since their values are 0 and the length of the code
   ;; vector.
-  ;;
-  ;; KLUDGE: PC's can't always be represented by FIXNUMs, unless we're
-  ;; always careful to put our code in low memory. Is that how it
-  ;; works? Would this break if we used a more general memory map? --
-  ;; WHN 20000120
   (fun-map (missing-arg) :type simple-vector :read-only t)
   ;; Location contexts
-  ;; Either a simple-vector or a context if there's only one context.
+  ;; A (simple-array * (*)) or a context if there's only one context.
   (contexts nil :type t :read-only t)
-  (tlf-number nil :type (or index null))
-  (char-offset nil :type (or index null)))
+  (tlf-num+offset nil :type integer))
+
+;;; The TLF-NUMBER and CHAR-OFFSET of a compiled-debug-info can each be NIL,
+;;; but aren't often. However, to allow that, convert NIL to 0 and non-nil
+;;; value N to N+1.
+(defun pack-tlf-num+offset (tlf-number char-offset)
+  (with-adjustable-vector (v)
+    (write-var-integer (if tlf-number (1+ tlf-number) 0) v)
+    (write-var-integer (if char-offset (1+ char-offset) 0) v)
+    (integer-from-octets v)))
 
 ;;;; file reading
 ;;;;
@@ -418,8 +437,8 @@
   (external-format nil  :read-only t)
   ;; the defaulted, but not necessarily absolute file name (i.e. prior
   ;; to TRUENAME call.) Null if not a file. This is used to set
-  ;; *COMPILE-FILE-PATHNAME*, and if absolute, is dumped in the
-  ;; debug-info.
+  ;; *COMPILE-FILE-PATHNAME*, and if absolute (a harmful constraint to be sure),
+  ;; is dumped in the debug-info.
   (untruename nil :type (or pathname null) :read-only t)
   ;; the file's write date (if relevant)
   (write-date nil :type (or unsigned-byte null)  :read-only t)
@@ -465,4 +484,8 @@
   ;; if the current compilation is recursive (e.g., due to EVAL-WHEN
   ;; processing at compile-time), the invoking compilation's
   ;; source-info.
-  (parent nil :type (or source-info null) :read-only t))
+  ;; KLUDGE: expressing this as (OR NULL SOURCE-INFO) rather than
+  ;; the reverse avoids a warning from PARSE-1-DSD.
+  ;; The compiler really needs to be made more aware of
+  ;; some issues involving recursive structures.
+  (parent nil :type (or null source-info) :read-only t))

@@ -18,9 +18,7 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(in-package :cl-user)
-
-(test-util:with-test (:name :no-meta-info)
+(with-test (:name :no-meta-info)
  (assert-signal (compile nil '(lambda (x) (sb-int:info :type :nokind x)))
                 style-warning))
 
@@ -62,15 +60,11 @@
 
 (test-util:with-test (:name :bug-458015)
   ;; Make sure layouts have sane source-locations
-  (sb-int:call-with-each-globaldb-name
-   (lambda (info-name)
-     (when (and (symbolp info-name) (info :type :kind info-name))
-        (let* ((classoid (find-classoid info-name nil))
-               (layout (and classoid (classoid-layout classoid)))
-               (srcloc (and layout (sb-kernel::layout-source-location layout))))
-          (when (and layout)
-            (assert (or (sb-c::definition-source-location-p srcloc)
-                        (null srcloc)))))))))
+  (do-all-symbols (symbol)
+    (let ((classoid (find-classoid symbol nil)))
+      (when classoid
+        (assert (typep (sb-kernel::classoid-source-location classoid)
+                       '(or null sb-c::definition-source-location)))))))
 
 (test-util:with-test (:name :find-classoid-signal-error)
   ;; (EVAL ''SILLY) dumbs down the compiler for this test.
@@ -504,7 +498,7 @@
     (values n-created fdefn-result random-result)))
 
 (test-util:with-test (:name :get-info-value-initializing
-                      :skipped-on '(not :sb-thread))
+                      :skipped-on (not :sb-thread))
   ;; Precompute random generalized function names for testing, some of which
   ;; are "simple" (per the taxonomy of globaldb) and some hairy.
   (let ((work (coerce (loop repeat 10000
@@ -571,7 +565,7 @@
 ;; This test conses ~5 Megabytes on 64-bit almost entirely due
 ;; to allocation of each immutable info storage vector.
 (test-util:with-test (:name :get-info-value-updating
-                      :skipped-on '(not :sb-thread))
+                      :skipped-on (not :sb-thread))
   (flet ((run (names)
            (declare (simple-vector names))
            (let* ((n (length names))

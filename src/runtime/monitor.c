@@ -37,7 +37,7 @@
 #include "thread.h"
 #include "genesis/static-symbols.h"
 #include "genesis/primitive-objects.h"
-
+#include "gc-internal.h"
 
 
 /* When we need to do command input, we use this stream, which is not
@@ -56,8 +56,8 @@ static int ldb_in_fd = -1;
 typedef void cmd(char **ptr);
 
 static cmd dump_cmd, print_cmd, quit_cmd, help_cmd;
-static cmd flush_cmd, search_cmd, regs_cmd, exit_cmd;
-static cmd print_context_cmd;
+static cmd flush_cmd, regs_cmd, exit_cmd;
+static cmd print_context_cmd, pte_cmd;
 static cmd backtrace_cmd, purify_cmd, catchers_cmd;
 static cmd grab_sigs_cmd;
 static cmd kill_cmd;
@@ -84,10 +84,9 @@ static struct cmd {
     {"purify", "Purify. (Caveat purifier!)", purify_cmd},
     {"print", "Print object at ADDRESS.", print_cmd},
     {"p", "(an alias for print)", print_cmd},
+    {"pte", "Page table entry for address", pte_cmd},
     {"quit", "Quit.", quit_cmd},
     {"regs", "Display current Lisp registers.", regs_cmd},
-    {"search", "Search for TYPE starting at ADDRESS for a max of COUNT words.", search_cmd},
-    {"s", "(an alias for search)", search_cmd},
     {NULL, NULL, NULL}
 };
 
@@ -110,11 +109,16 @@ dump_cmd(char **ptr)
 
     char *addr = lastaddr;
     int count = lastcount, displacement;
-    int force = 0;
+    int force = 0, decode = 0;
 
     if (more_p(ptr)) {
+        // you can't both "force" and "decode" - only one or the other,
+        // or neither
         if (!strncmp(*ptr, "-f ", 3)) {
           force = 1;
+          *ptr += 3;
+        } else if (!strncmp(*ptr, "-d ", 3)) {
+          decode = 1;
           *ptr += 3;
         }
         addr = parse_addr(ptr, !force);
@@ -137,6 +141,13 @@ dump_cmd(char **ptr)
         count = -count;
     }
 
+    boolean aligned = ((uword_t)addr & LOWTAG_MASK) == 0;
+    if (decode && (!aligned || displacement < 0)) {
+        printf("Sorry, can only decode if aligned and stepping forward\n");
+        decode = 0;
+    }
+    lispobj* next_object = decode ? (lispobj*)addr : 0;
+
     while (count-- > 0) {
 #ifndef LISP_FEATURE_ALPHA
         printf("%p: ", (os_vm_address_t) addr);
@@ -152,7 +163,7 @@ dump_cmd(char **ptr)
             unsigned char *cptr = (unsigned char *)addr;
 
 #if N_WORD_BYTES == 8
-            printf("0x%016lx | %c%c%c%c%c%c%c%c\n",
+            printf("0x%016lx | %c%c%c%c%c%c%c%c",
                    lptr[0],
                    visible(cptr[0]), visible(cptr[1]),
                    visible(cptr[2]), visible(cptr[3]),
@@ -163,12 +174,36 @@ dump_cmd(char **ptr)
             printf("0x%08lx   0x%04x 0x%04x   "
                    "0x%02x 0x%02x 0x%02x 0x%02x    "
                    "%c%c"
-                   "%c%c\n",
+                   "%c%c",
                    lptr[0], sptr[0], sptr[1],
                    cptr[0], cptr[1], cptr[2], cptr[3],
                    visible(cptr[0]), visible(cptr[1]),
                    visible(cptr[2]), visible(cptr[3]));
 #endif
+#ifdef LISP_FEATURE_GENCGC
+            if (aligned) {
+                lispobj ptr = *(lispobj*)addr;
+                int gen;
+                if (is_lisp_pointer(ptr) && gc_managed_heap_space_p(ptr)
+                    && (gen = gc_gen_of(ptr, 99)) != 99) // say that static is 99
+                    if (gen != 99) printf(" | %d", gen);
+            }
+#endif
+            if (decode && addr == (char*)next_object) {
+                lispobj word = *addr;
+                // ensure validity of widetag because crashing with
+                // "no size function" would be worse than doing nothing
+                if (word != 0 && !is_lisp_pointer(word)
+                    && valid_widetag_p(header_widetag(word))) {
+                    printf(" %s", widetag_names[header_widetag(word)>>2]);
+                    next_object += sizetab[header_widetag(word)](next_object);
+                } else if (is_cons_half(word)) {
+                    next_object += 2;
+                } else { // disable decoder if weirdness observed
+                    decode = 0;
+                }
+            }
+            printf("\n");
         }
         else
             printf("invalid Lisp-level address\n");
@@ -188,6 +223,13 @@ print_cmd(char **ptr)
 }
 
 static void
+pte_cmd(char **ptr)
+{
+    extern void gc_show_pte(lispobj);
+    gc_show_pte(parse_lispobj(ptr));
+}
+
+static void
 kill_cmd(char **ptr)
 {
 #ifndef LISP_FEATURE_WIN32
@@ -196,7 +238,7 @@ kill_cmd(char **ptr)
 }
 
 static void
-regs_cmd(char **ptr)
+regs_cmd(char __attribute__((unused)) **ptr)
 {
     struct thread __attribute__((unused)) *thread=arch_os_get_current_thread();
 
@@ -231,79 +273,19 @@ regs_cmd(char **ptr)
 #endif
 }
 
-static void
-search_cmd(char **ptr)
-{
-    static int lastval = 0, lastcount = 0;
-    static lispobj *start = 0, *end = 0;
-    int val, count;
-    lispobj *addr, obj;
-
-    if (more_p(ptr)) {
-        val = parse_number(ptr);
-        if (val < 0 || val > 0xff) {
-            printf("can only search for single bytes\n");
-            return;
-        }
-        if (more_p(ptr)) {
-            addr = native_pointer((uword_t)parse_addr(ptr, 1));
-            if (more_p(ptr)) {
-                count = parse_number(ptr);
-            }
-            else {
-                /* Specified value and address, but no count. Only one. */
-                count = -1;
-            }
-        }
-        else {
-            /* Specified a value, but no address, so search same range. */
-            addr = start;
-            count = lastcount;
-        }
-    }
-    else {
-        /* Specified nothing, search again for val. */
-        val = lastval;
-        addr = end;
-        count = lastcount;
-    }
-
-    lastval = val;
-    start = end = addr;
-    lastcount = count;
-
-    printf("searching for 0x%x at %p\n", val, (void*)(uword_t)end);
-
-    while (search_for_type(val, &end, &count)) {
-        printf("found 0x%x at %p:\n", val, (void*)(uword_t)end);
-        obj = *end;
-        addr = end;
-        end += 2;
-        if (widetag_of(obj) == SIMPLE_FUN_WIDETAG) {
-            print((uword_t)addr | FUN_POINTER_LOWTAG);
-        } else if (other_immediate_lowtag_p(obj)) {
-            print((lispobj)addr | OTHER_POINTER_LOWTAG);
-        } else {
-            print((lispobj)addr);
-        } if (count == -1) {
-            return;
-        }
-    }
-}
-
 /* (There used to be call_cmd() here, to call known-at-cold-init-time
  * Lisp functions from ldb, but it bitrotted and was deleted in
  * sbcl-0.7.5.1. See older CVS versions if you want to resuscitate
  * it.) */
 
 static void
-flush_cmd(char **ptr)
+flush_cmd(char __attribute__((unused)) **ptr)
 {
     flush_vars();
 }
 
 static void
-quit_cmd(char **ptr)
+quit_cmd(char __attribute__((unused)) **ptr)
 {
     char buf[10];
 
@@ -319,7 +301,7 @@ quit_cmd(char **ptr)
 }
 
 static void
-help_cmd(char **ptr)
+help_cmd(char __attribute__((unused)) **ptr)
 {
     struct cmd *cmd;
 
@@ -331,13 +313,13 @@ help_cmd(char **ptr)
 static int done;
 
 static void
-exit_cmd(char **ptr)
+exit_cmd(char __attribute__((unused)) **ptr)
 {
     done = 1;
 }
 
 static void
-purify_cmd(char **ptr)
+purify_cmd(char __attribute__((unused)) **ptr)
 {
     purify(NIL, NIL);
 }
@@ -359,8 +341,10 @@ print_context(os_context_t *context)
     printf("DAR:\t\t 0x%08lx\n", (unsigned long)(*os_context_register_addr(context, 41)));
     printf("DSISR:\t\t 0x%08lx\n", (unsigned long)(*os_context_register_addr(context, 42)));
 #endif
+#ifndef REG_PC
     printf("PC:\t\t  0x%08lx\n",
            (unsigned long)(*os_context_pc_addr(context)));
+#endif
 }
 
 static void
@@ -379,7 +363,7 @@ print_context_cmd(char **ptr)
         if ((index >= 0) && (index < free_ici)) {
             printf("There are %d interrupt contexts.\n", free_ici);
             printf("printing context %d\n", index);
-            print_context(thread->interrupt_contexts[index]);
+            print_context(nth_interrupt_context(index, thread));
         } else {
             printf("There aren't that many/few contexts.\n");
             printf("There are %d interrupt contexts.\n", free_ici);
@@ -390,7 +374,7 @@ print_context_cmd(char **ptr)
         else {
             printf("There are %d interrupt contexts.\n", free_ici);
             printf("printing context %d\n", free_ici - 1);
-            print_context(thread->interrupt_contexts[free_ici - 1]);
+            print_context(nth_interrupt_context(free_ici - 1, thread));
         }
     }
 }
@@ -411,7 +395,7 @@ backtrace_cmd(char **ptr)
 }
 
 static void
-catchers_cmd(char **ptr)
+catchers_cmd(char __attribute__((unused)) **ptr)
 {
     struct catch_block *catch = (struct catch_block *)
         read_TLS(CURRENT_CATCH_BLOCK, arch_os_get_current_thread());
@@ -439,7 +423,7 @@ catchers_cmd(char **ptr)
 }
 
 static void
-grab_sigs_cmd(char **ptr)
+grab_sigs_cmd(char __attribute__((unused)) **ptr)
 {
     extern void sigint_init(void);
 

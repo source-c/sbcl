@@ -46,13 +46,12 @@
                                    (lambda (x)
                                      (loop repeat 50
                                            do (send-message mbox x)
-                                              (sleep #-win32 0.001
-                                                     #+win32 0)))
+                                              (sleep 0)))
                                    :arguments i)))
            (readers (loop repeat 10
                           collect (make-thread
                                    (lambda ()
-                                     (loop while (receive-message mbox :timeout 0.1)
+                                     (loop while (receive-message mbox :timeout 0.5)
                                            count t))))))
       (mapc #'join-thread writers)
       (apply #'+ (mapcar #'join-thread readers)))
@@ -63,7 +62,9 @@
 ;;; The issues don't seem to have anything to do with mailboxes
 ;;; per-se, but are rather related to our usage of signal-unsafe
 ;;; pthread functions inside signal handlers.
-#+(and sb-thread (not sunos))
+;;;
+;;; INTERRUPT-THREAD is not reliable on Windows
+#+(and sb-thread (not sunos) (not win32))
 (progn
 
 ;; Dummy struct for ATOMIC-INCF to work.
@@ -172,7 +173,6 @@
                      `(:errors   . ,errors)
                      `(:timeouts . ,timeouts))))))))
 
-#-win32
 (deftest mailbox.single-producer-single-consumer
     (test-mailbox-producers-consumers :n-senders 1
                                       :n-receivers 1
@@ -182,17 +182,15 @@
   (:errors   . 0)
   (:timeouts . 0))
 
-#-win32
 (deftest mailbox.single-producer-multiple-consumers
     (test-mailbox-producers-consumers :n-senders 1
-                                      :n-receivers 100
+                                      :n-receivers (if (> *cpus* 1) 100 50)
                                       :n-messages 1000)
   (:received . 1000)
   (:garbage  . 0)
   (:errors   . 0)
   (:timeouts . 0))
 
-#-win32
 (deftest mailbox.multiple-producers-single-consumer
     (test-mailbox-producers-consumers :n-senders 10
                                       :n-receivers 1
@@ -202,7 +200,6 @@
   (:errors   . 0)
   (:timeouts . 0))
 
-#-win32
 (deftest mailbox.multiple-producers-multiple-consumers
     (test-mailbox-producers-consumers :n-senders 50
                                       :n-receivers 50

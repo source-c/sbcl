@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;; an internal tag for marking empty slots, which needs to be defined
 ;;; no later than the compiler-macro for MAPHASH.
@@ -22,7 +22,7 @@
 
 (define-compiler-macro maphash (&whole form function-designator hash-table
                                 &environment env)
-  (when (sb!c:policy env (> space speed))
+  (when (sb-c:policy env (> space speed))
     (return-from maphash form))
   (with-unique-names (fun table size i kv-vector key value)
     `(let* ((,fun (%coerce-callable-to-fun ,function-designator))
@@ -50,7 +50,7 @@
                     ;; so (1- I) isn't checked for being an INDEX, but would
                     ;; nonetheless be checked against the array bound despite
                     ;; being obviously valid; so we force elision of the test.
-                    (locally (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+                    (locally (declare (optimize (sb-c::insert-array-bounds-checks 0)))
                       (aref ,kv-vector (1- ,i)))))
                (unless (empty-ht-slot-p ,key)
                  (funcall ,fun ,key ,value)))))))))
@@ -65,6 +65,7 @@ current key. The applies to all threads, not just the current one --
 even for synchronized hash-tables. If the table may be mutated by
 another thread during iteration, use eg. SB-EXT:WITH-LOCKED-HASH-TABLE
 to protect the MAPHASH call."
+  (declare (dynamic-extent function-designator))
   (maphash function-designator hash-table)) ; via compiler-macro
 
 (defmacro with-hash-table-iterator ((name hash-table) &body body)
@@ -101,7 +102,7 @@ for."
                             (unless (empty-ht-slot-p value)
                               (let ((key
                                      (locally
-                                      (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+                                      (declare (optimize (sb-c::insert-array-bounds-checks 0)))
                                       (aref kv-vector (1- i)))))
                                 (unless (empty-ht-slot-p key)
                                   (return (values t key value)))))))))))

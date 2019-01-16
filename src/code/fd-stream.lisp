@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; BUFFER
 ;;;;
@@ -48,7 +48,7 @@
   (tail 0 :type index))
 (declaim (freeze-type buffer))
 
-(defglobal *available-buffers* ()
+(define-load-time-global *available-buffers* ()
   "List of available buffers.")
 
 (defconstant +bytes-per-buffer+ (* 4 1024)
@@ -115,7 +115,7 @@
   ;; STREAM-ELEMENT-MODE type.
   (element-mode :bivalent :type stream-element-mode)
   ;; the Unix file descriptor
-  (fd -1 :type #!-win32 fixnum #!+win32 sb!vm:signed-word)
+  (fd -1 :type #!-win32 fixnum #!+win32 sb-vm:signed-word)
   ;; What do we know about the FD?
   (fd-type :unknown :type keyword)
   ;; controls when the output buffer is flushed
@@ -294,7 +294,7 @@
                (loop
                  (let ((length (- tail head)))
                    (multiple-value-bind (count errno)
-                       (sb!unix:unix-write (fd-stream-fd stream) (buffer-sap obuf)
+                       (sb-unix:unix-write (fd-stream-fd stream) (buffer-sap obuf)
                                            head length)
                      (flet ((queue-or-wait ()
                               (if (fd-stream-serve-events stream)
@@ -316,11 +316,11 @@
                                (setf (buffer-head obuf) head)
                                (queue-or-wait))
                               #!-win32
-                              ((eql errno sb!unix:ewouldblock)
+                              ((eql errno sb-unix:ewouldblock)
                                ;; Blocking, queue or wair.
                                (queue-or-wait))
                               ;; if interrupted on win32, just try again
-                              #!+win32 ((eql errno sb!unix:eintr))
+                              #!+win32 ((eql errno sb-unix:eintr))
                               (t
                                (simple-stream-perror +write-failed+
                                                      stream errno)))))))))))))
@@ -363,7 +363,7 @@
          (declare (index head length))
          (aver (>= length 0))
          (multiple-value-bind (count errno)
-             (sb!unix:unix-write (fd-stream-fd stream) (buffer-sap buffer)
+             (sb-unix:unix-write (fd-stream-fd stream) (buffer-sap buffer)
                                  head length)
            (cond ((eql count length)
                   ;; Complete write, see if we can do another right
@@ -392,7 +392,7 @@
                   #!+win32
                   (simple-stream-perror +write-failed+ stream errno)
                   #!-win32
-                  (if (= errno sb!unix:ewouldblock)
+                  (if (= errno sb-unix:ewouldblock)
                       (bug "Unexpected blocking in WRITE-OUTPUT-FROM-QUEUE.")
                       (simple-stream-perror +write-failed+
                                             stream errno))))))))
@@ -410,7 +410,7 @@
          (let ((length (- end start)))
            (synchronize-stream-output stream)
            (multiple-value-bind (count errno)
-               (sb!unix:unix-write (fd-stream-fd stream) thing start length)
+               (sb-unix:unix-write (fd-stream-fd stream) thing start length)
              (cond ((eql count length)
                     ;; Complete write -- done!
                     )
@@ -423,7 +423,7 @@
                     #!+win32
                     (simple-stream-perror +write-failed+ stream errno)
                     #!-win32
-                    (if (= errno sb!unix:ewouldblock)
+                    (if (= errno sb-unix:ewouldblock)
                         (buffer-output stream thing start end)
                         (simple-stream-perror +write-failed+ stream errno)))))))))
 
@@ -438,31 +438,51 @@
 
 ;;;; output routines and related noise
 
-(defvar *output-routines* ()
+(define-load-time-global *output-routines* ()
   "List of all available output routines. Each element is a list of the
   element-type output, the kind of buffering, the function name, and the number
   of bytes per element.")
 
+(defun stream-errno-to-condition (errno)
+  (case errno
+    (#!-win32 #.sb-unix:epipe
+     #!+win32 #.sb-win32::error-no-data
+     'broken-pipe)
+    (t 'simple-stream-error)))
+
 ;;; common idioms for reporting low-level stream and file problems
-(defun simple-stream-perror (note-format stream errno)
+(defun simple-stream-perror (format-control stream &optional errno &rest format-arguments)
   (declare (optimize allow-non-returning-tail-call))
-  (error 'simple-stream-error
+  (error (stream-errno-to-condition errno)
          :stream stream
-         :format-control "~@<~?: ~2I~_~A~:>"
-         :format-arguments (list note-format (list stream) (strerror errno))))
-(defun simple-file-perror (note-format pathname errno)
+         :format-control "~@<~?~@[: ~2I~_~A~]~:>"
+         :format-arguments (list format-control
+                                 (list* stream format-arguments)
+                                 (when errno (strerror errno)))))
+(defun file-perror (condition format-control pathname &optional errno &rest format-arguments)
   (declare (optimize allow-non-returning-tail-call))
-  (error 'simple-file-error
+  (error condition
          :pathname pathname
-         :format-control "~@<~?: ~2I~_~A~:>"
-         :format-arguments
-         (list note-format (list pathname) (strerror errno))))
+         :format-control "~@<~?~@[: ~2I~_~A~]~:>"
+         :format-arguments (list format-control
+                                 (list* pathname format-arguments)
+                                 (when errno (strerror errno)))))
+
+(defun simple-file-perror (format-control pathname &optional errno &rest format-arguments)
+  (apply #'file-perror 'simple-file-error format-control pathname errno format-arguments))
 
 (defun c-string-encoding-error (external-format code)
   (declare (optimize allow-non-returning-tail-call))
   (error 'c-string-encoding-error
          :external-format external-format
          :code code))
+
+(macrolet ((sap-ref-octets (sap offset count)
+             `(let ((.buffer.
+                     (make-array (the fixnum ,count) :element-type '(unsigned-byte 8))))
+                (%byte-blt ,sap ,offset .buffer. 0 ,count)
+                .buffer.)))
+
 (defun c-string-decoding-error (external-format sap offset count)
   (declare (optimize allow-non-returning-tail-call))
   (error 'c-string-decoding-error
@@ -508,6 +528,7 @@
         (when (> (length string) 0)
           (setf (fd-stream-listen stream) t)))
       nil)))
+) ; end MACROLET
 
 (defun stream-encoding-error-and-handle (stream code)
   (restart-case
@@ -545,7 +566,7 @@
                (eq (fd-stream-bin stream) #'ill-bin)))
     (let ((adjust (nth-value 1 (flush-input-buffer stream))))
       (unless (eql 0 adjust)
-        (sb!unix:unix-lseek (fd-stream-fd stream) (- adjust) sb!unix:l_incr)))))
+        (sb-unix:unix-lseek (fd-stream-fd stream) (- adjust) sb-unix:l_incr)))))
 
 (defun fd-stream-output-finished-p (stream)
   (let ((obuf (fd-stream-obuf stream)))
@@ -662,19 +683,6 @@
                                            nil))
                                    (cdr buffering)))))))
             bufferings)))
-
-;;; FIXME: is this used anywhere any more?
-(def-output-routines ("OUTPUT-CHAR-~A-BUFFERED"
-                      1
-                      t
-                      (:none character)
-                      (:line character)
-                      (:full character))
-  (if (eql byte #\Newline)
-      (setf (fd-stream-output-column stream) 0)
-      (incf (fd-stream-output-column stream)))
-  (setf (sap-ref-8 (buffer-sap obuf) tail)
-        (char-code byte)))
 
 (def-output-routines ("OUTPUT-UNSIGNED-BYTE-~A-BUFFERED"
                       1
@@ -814,14 +822,14 @@
       (bytes-for-char-fun ef-entry)
       (funcall (bytes-for-char-fun ef-entry) #\x)))
 
-(defun sb!alien::string-to-c-string (string external-format)
+(defun sb-alien::string-to-c-string (string external-format)
   (declare (type simple-string string))
   (locally
       (declare (optimize (speed 3) (safety 0)))
     (let ((external-format (get-external-format-or-lose external-format)))
       (funcall (ef-write-c-string-fun external-format) string))))
 
-(defun sb!alien::c-string-to-string (sap external-format element-type)
+(defun sb-alien::c-string-to-string (sap external-format element-type)
   (declare (type system-area-pointer sap))
   (locally
       (declare (optimize (speed 3) (safety 0)))
@@ -944,7 +952,7 @@
 ;;; a list of all available input routines. Each element is a list of
 ;;; the element-type input, the function name, and the number of bytes
 ;;; per element.
-(defvar *input-routines* ())
+(define-load-time-global *input-routines* ())
 
 ;;; Return whether a primitive partial read operation on STREAM's FD
 ;;; would (probably) block.  Signal a `simple-stream-error' if the
@@ -956,9 +964,9 @@
 (defun sysread-may-block-p (stream)
   #!+win32
   ;; This answers T at EOF on win32, I think.
-  (not (sb!win32:handle-listen (fd-stream-fd stream)))
+  (not (sb-win32:handle-listen (fd-stream-fd stream)))
   #!-win32
-  (not (sb!unix:unix-simple-poll (fd-stream-fd stream) :input 0)))
+  (not (sb-unix:unix-simple-poll (fd-stream-fd stream) :input 0)))
 
 ;;; If the read would block wait (using SERVE-EVENT) till input is available,
 ;;; then fill the input buffer, and return the number of bytes read. Throws
@@ -1019,7 +1027,7 @@
                      (head (buffer-head ibuf))
                      (tail (buffer-tail ibuf)))
                 (declare (index length head tail)
-                         (inline sb!unix:unix-read))
+                         (inline sb-unix:unix-read))
                 (unless (zerop head)
                   (cond ((eql head tail)
                          ;; Buffer is empty, but not at yet reset -- make it so.
@@ -1037,11 +1045,11 @@
                                  (buffer-tail ibuf) tail)))))
                 (setf (fd-stream-listen stream) nil)
                 (setf (values count errno)
-                      (sb!unix:unix-read fd (sap+ sap tail) (- length tail)))
+                      (sb-unix:unix-read fd (sap+ sap tail) (- length tail)))
                 (cond ((null count)
                        (if (eql errno
-                                #!+win32 sb!unix:eintr
-                                #!-win32 sb!unix:ewouldblock)
+                                #!+win32 sb-unix:eintr
+                                #!-win32 sb-unix:ewouldblock)
                            (return :wait-for-input)
                            (return :read-error)))
                       ((zerop count)
@@ -1301,28 +1309,6 @@
            (sap (buffer-sap ibuf)))
       (declare (type index remaining-request head tail available))
       (declare (type index n-this-copy))
-      #!+cheneygc
-      ;; Prevent failure caused by memmove() hitting a write-protected page
-      ;; and the fault handler losing, since it thinks you're not in Lisp.
-      ;; This is wasteful, but better than being randomly broken (lp#1366263).
-      (when (> this-end this-start)
-        (typecase buffer
-          (system-area-pointer
-           (setf (sap-ref-8 buffer this-start) (sap-ref-8 buffer this-start)
-                 (sap-ref-8 buffer (1- this-end)) (sap-ref-8 buffer (1- this-end))))
-          ((simple-array (unsigned-byte 8) (*))
-           (setf (aref buffer this-start) (aref buffer this-start)
-                 (aref buffer (1- this-end)) (aref buffer (1- this-end))))
-          ((simple-array * (*))
-           ;; We might have an array of UNSIGNED-BYTE-32 here, but the
-           ;; bounding indices act as if it were UNSIGNED-BYTE-8.
-           ;; This is strange, and in direct contradiction to what %BYTE-BLT
-           ;; believes it accepts. i.e. according to the comments,
-           ;; it's for want of error checking that this works at all.
-           (with-pinned-objects (buffer)
-             (let ((sap (vector-sap buffer)))
-               (setf (sap-ref-8 sap this-start) (sap-ref-8 sap this-start)
-                     (sap-ref-8 sap (1- this-end)) (sap-ref-8 sap (1- this-end))))))))
       ;; Copy data from stream buffer into user's buffer.
       (%byte-blt sap head buffer this-start this-end)
       (incf (buffer-head ibuf) n-this-copy)
@@ -1795,7 +1781,7 @@
     (when input-p
       (flet ((no-input-routine ()
                (error "could not find any input routine for ~
-                        ~/sb!impl:print-type-specifier/"
+                        ~/sb-impl:print-type-specifier/"
                       target-type)))
         (when (or (not character-stream-p) bivalent-stream-p)
           (setf (values bin-routine bin-type bin-size read-n-characters
@@ -1899,8 +1885,8 @@
                 ((subtypep output-type input-type)
                  output-type)
                 (t
-                 (error "Input type (~/sb!impl:print-type-specifier/) and
-                         output type (~/sb!impl:print-type-specifier/) ~
+                 (error "Input type (~/sb-impl:print-type-specifier/) and
+                         output type (~/sb-impl:print-type-specifier/) ~
                          are unrelated?"
                         input-type output-type))))))
 
@@ -1917,7 +1903,7 @@
         ;; us with a dangling finalizer (that would close the same
         ;; --possibly reassigned-- FD again), or a stream with a closed
         ;; FD that appears open.
-        (sb!unix:unix-close (fd-stream-fd fd-stream))
+        (sb-unix:unix-close (fd-stream-fd fd-stream))
         (set-closed-flame fd-stream)
         (cancel-finalization fd-stream))
     ;; On error unwind from WITHOUT-INTERRUPTS.
@@ -1946,7 +1932,7 @@
   (flush-input-buffer stream)
   #!+win32
   (progn
-    (sb!win32:handle-clear-input (fd-stream-fd stream))
+    (sb-win32:handle-clear-input (fd-stream-fd stream))
     (setf (fd-stream-listen stream) nil))
   #!-win32
   (catch 'eof-input-catcher
@@ -1966,7 +1952,7 @@
                   (or (not (eql (buffer-head ibuf) (buffer-tail ibuf)))
                       (fd-stream-listen fd-stream)
                       #!+win32
-                      (sb!win32:handle-listen (fd-stream-fd fd-stream))
+                      (sb-win32:handle-listen (fd-stream-fd fd-stream))
                       #!-win32
                       ;; If the read can block, LISTEN will certainly return NIL.
                       (if (sysread-may-block-p fd-stream)
@@ -2018,7 +2004,7 @@
                     (unless (eq orig file)
                       ;; We have a handle on the original, just revert.
                       (multiple-value-bind (okay err)
-                          (sb!unix:unix-rename orig file)
+                          (sb-unix:unix-rename orig file)
                         ;; FIXME: Why is this a SIMPLE-STREAM-ERROR, and the
                         ;; others are SIMPLE-FILE-ERRORS? Surely they should
                         ;; all be the same?
@@ -2042,7 +2028,7 @@
                     ;; (probably bad because stream opening becomes more
                     ;; racy).
                     (multiple-value-bind (okay err)
-                        (sb!unix:unix-unlink file)
+                        (sb-unix:unix-unlink file)
                       (unless okay
                         (error 'simple-file-error
                                :pathname file
@@ -2054,7 +2040,7 @@
             (finish-fd-stream-output fd-stream)
             (let ((orig (fd-stream-original fd-stream)))
               (when (and orig (fd-stream-delete-original fd-stream))
-                (multiple-value-bind (okay err) (sb!unix:unix-unlink orig)
+                (multiple-value-bind (okay err) (sb-unix:unix-unlink orig)
                   (unless okay
                     (error 'simple-file-error
                            :pathname orig
@@ -2080,7 +2066,7 @@
      (fd-stream-external-format fd-stream))
     (:interactive-p
      (plusp (the (integer 0)
-              (sb!unix:unix-isatty (fd-stream-fd fd-stream)))))
+              (sb-unix:unix-isatty (fd-stream-fd fd-stream)))))
     (:line-length
      80)
     (:charpos
@@ -2099,7 +2085,7 @@
      #!-win32
      (multiple-value-bind (okay dev ino mode nlink uid gid rdev size
                                 atime mtime ctime blksize blocks)
-         (sb!unix:unix-fstat (fd-stream-fd fd-stream))
+         (sb-unix:unix-fstat (fd-stream-fd fd-stream))
        (declare (ignore ino nlink uid gid rdev
                         atime mtime ctime blksize blocks))
        (unless okay
@@ -2111,14 +2097,14 @@
      (let* ((handle (fd-stream-fd fd-stream))
             (element-size (fd-stream-element-size fd-stream)))
        (multiple-value-bind (got native-size)
-           (sb!win32:get-file-size-ex handle 0)
+           (sb-win32:get-file-size-ex handle 0)
          (if (zerop got)
              ;; Might be a block device, in which case we fall back to
              ;; a non-atomic workaround:
-             (let* ((here (sb!unix:unix-lseek handle 0 sb!unix:l_incr))
-                    (there (sb!unix:unix-lseek handle 0 sb!unix:l_xtnd)))
+             (let* ((here (sb-unix:unix-lseek handle 0 sb-unix:l_incr))
+                    (there (sb-unix:unix-lseek handle 0 sb-unix:l_xtnd)))
                (when (and here there)
-                 (sb!unix:unix-lseek handle here sb!unix:l_set)
+                 (sb-unix:unix-lseek handle here sb-unix:l_set)
                  (truncate there element-size)))
              (truncate native-size element-size)))))
     (:file-string-length
@@ -2153,8 +2139,8 @@
 (defun fd-stream-get-file-position (stream)
   (declare (fd-stream stream))
   (without-interrupts
-    (let ((posn (sb!unix:unix-lseek (fd-stream-fd stream) 0 sb!unix:l_incr)))
-      (declare (type (or (alien sb!unix:unix-offset) null) posn))
+    (let ((posn (sb-unix:unix-lseek (fd-stream-fd stream) 0 sb-unix:l_incr)))
+      (declare (type (or (alien sb-unix:unix-offset) null) posn))
       ;; We used to return NIL for errno==ESPIPE, and signal an error
       ;; in other failure cases. However, CLHS says to return NIL if
       ;; the position cannot be determined -- so that's what we do.
@@ -2183,7 +2169,7 @@
 (defun fd-stream-set-file-position (stream position-spec)
   (declare (fd-stream stream))
   (check-type position-spec
-              (or (alien sb!unix:unix-offset) (member nil :start :end))
+              (or (alien sb-unix:unix-offset) (member nil :start :end))
               "valid file position designator")
   (tagbody
    :again
@@ -2209,14 +2195,14 @@
          (multiple-value-bind (offset origin)
              (case position-spec
                (:start
-                (values 0 sb!unix:l_set))
+                (values 0 sb-unix:l_set))
                (:end
-                (values 0 sb!unix:l_xtnd))
+                (values 0 sb-unix:l_xtnd))
                (t
                 (values (* position-spec (fd-stream-element-size stream))
-                        sb!unix:l_set)))
-           (declare (type (alien sb!unix:unix-offset) offset))
-           (let ((posn (sb!unix:unix-lseek (fd-stream-fd stream)
+                        sb-unix:l_set)))
+           (declare (type (alien sb-unix:unix-offset) offset))
+           (let ((posn (sb-unix:unix-lseek (fd-stream-fd stream)
                                            offset origin)))
              ;; CLHS says to return true if the file-position was set
              ;; successfully, and NIL otherwise. We are to signal an error
@@ -2227,7 +2213,7 @@
              ;; FIXME: We are still liable to signal an error if flushing
              ;; output fails.
              (return-from fd-stream-set-file-position
-               (typep posn '(alien sb!unix:unix-offset))))))))
+               (typep posn '(alien sb-unix:unix-offset))))))))
 
 
 ;;;; creation routines (MAKE-FD-STREAM and OPEN)
@@ -2285,7 +2271,7 @@
          (stream (funcall constructor
                           :fd fd
                           :fd-type
-                          #!-win32 (sb!unix:fd-type fd)
+                          #!-win32 (sb-unix:fd-type fd)
                           ;; KLUDGE.
                           #!+win32 (if serve-events
                                        :unknown
@@ -2308,7 +2294,7 @@
     (when auto-close
       (finalize stream
                 (lambda ()
-                  (sb!unix:unix-close fd)
+                  (sb-unix:unix-close fd)
                   #!+sb-show
                   (format *terminal-io* "** closed file descriptor ~W **~%"
                           fd))
@@ -2325,9 +2311,9 @@
 ;;; access, since we don't want to trash unwritable files even if we
 ;;; technically can. We return true if we succeed in renaming.
 (defun rename-the-old-one (namestring original)
-  (unless (sb!unix:unix-access namestring sb!unix:w_ok)
+  (unless (sb-unix:unix-access namestring sb-unix:w_ok)
     (error "~@<The file ~2I~_~S ~I~_is not writable.~:>" namestring))
-  (multiple-value-bind (okay err) (sb!unix:unix-rename namestring original)
+  (multiple-value-bind (okay err) (sb-unix:unix-rename namestring original)
     (if okay
         t
         (error 'simple-file-error
@@ -2347,10 +2333,11 @@
                (class 'fd-stream)
                #!+win32
                (overlapped t)
-             &aux                       ; Squelch assignment warning.
-             (direction direction)
-             (if-does-not-exist if-does-not-exist)
-             (if-exists if-exists))
+               &aux                     ; Squelch assignment warning.
+               (filename filename)
+               (direction direction)
+               (if-does-not-exist if-does-not-exist)
+               (if-exists if-exists))
   "Return a stream which reads from or writes to FILENAME.
   Defined keywords:
    :DIRECTION - one of :INPUT, :OUTPUT, :IO, or :PROBE
@@ -2361,187 +2348,215 @@
   See the manual for details."
 
   ;; Calculate useful stuff.
-  (multiple-value-bind (input output mask)
-      (ecase direction
-        (:input  (values   t nil sb!unix:o_rdonly))
-        (:output (values nil   t sb!unix:o_wronly))
-        (:io     (values   t   t sb!unix:o_rdwr))
-        (:probe  (values   t nil sb!unix:o_rdonly)))
-    (declare (type index mask))
-    (let* ( ;; PATHNAME is the pathname we associate with the stream.
-           (pathname (merge-pathnames filename))
-           (physical (physicalize-pathname pathname))
-           (truename (probe-file physical))
-           ;; NAMESTRING is the native namestring we open the file with.
-           (namestring (cond (truename
-                              (native-namestring truename :as-file t))
-                             ((or (not input)
-                                  (and input (eq if-does-not-exist :create))
-                                  (and (eq direction :io)
-                                       (not if-does-not-exist-given)))
-                              (native-namestring physical :as-file t)))))
-      (flet ((open-error (format-control &rest format-arguments)
-               (declare (optimize allow-non-returning-tail-call))
-               (error 'simple-file-error
-                      :pathname pathname
-                      :format-control format-control
-                      :format-arguments format-arguments)))
-        ;; Process if-exists argument if we are doing any output.
-        (cond (output
-               (unless if-exists-given
-                 (setf if-exists
-                       (if (eq (pathname-version pathname) :newest)
-                           :new-version
-                           :error)))
-               (case if-exists
-                 ((:new-version :error nil)
-                  (setf mask (logior mask sb!unix:o_excl)))
-                 ((:rename :rename-and-delete)
-                  (setf mask (logior mask sb!unix:o_creat)))
-                 ((:supersede)
-                  (setf mask (logior mask sb!unix:o_trunc)))
-                 (:append
-                  (setf mask (logior mask sb!unix:o_append)))))
-              (t
-               (setf if-exists :ignore-this-arg)))
+  (block nil
+    (tagbody retry
+       (multiple-value-bind (input output mask)
+           (ecase direction
+             (:input  (values   t nil sb-unix:o_rdonly))
+             (:output (values nil   t sb-unix:o_wronly))
+             (:io     (values   t   t sb-unix:o_rdwr))
+             (:probe  (values   t nil sb-unix:o_rdonly)))
+         (declare (type index mask))
+         (let* (;; PATHNAME is the pathname we associate with the stream.
+                (pathname (merge-pathnames filename))
+                (physical (physicalize-pathname pathname))
+                (truename (probe-file physical))
+                ;; NAMESTRING is the native namestring we open the file with.
+                (namestring (cond (truename
+                                   (native-namestring truename :as-file t))
+                                  ((or (not input)
+                                       (and input (eq if-does-not-exist :create))
+                                       (and (eq direction :io)
+                                            (not if-does-not-exist-given)))
+                                   (native-namestring physical :as-file t)))))
+           (flet ((open-error (format-control &rest format-arguments)
+                    (declare (optimize allow-non-returning-tail-call))
+                    (error 'simple-file-error
+                           :pathname pathname
+                           :format-control format-control
+                           :format-arguments format-arguments)))
+             ;; Process if-exists argument if we are doing any output.
+             (cond (output
+                    (unless if-exists-given
+                      (setf if-exists
+                            (if (eq (pathname-version pathname) :newest)
+                                :new-version
+                                :error)))
+                    (case if-exists
+                      ((:new-version :error nil)
+                       (setf mask (logior mask sb-unix:o_excl)))
+                      ((:rename :rename-and-delete)
+                       (setf mask (logior mask sb-unix:o_creat)))
+                      ((:supersede)
+                       (setf mask (logior mask sb-unix:o_trunc)))
+                      (:append
+                       (setf mask (logior mask sb-unix:o_append)))))
+                   (t
+                    (setf if-exists :ignore-this-arg)))
 
-        (unless if-does-not-exist-given
-          (setf if-does-not-exist
-                (cond ((eq direction :input) :error)
-                      ((and output
-                            (member if-exists '(:overwrite :append)))
-                       :error)
-                      ((eq direction :probe)
-                       nil)
-                      (t
-                       :create))))
-        (cond ((and if-exists-given
-                    truename
-                    (eq if-exists :new-version))
-               (open-error "OPEN :IF-EXISTS :NEW-VERSION is not supported ~
+             (unless if-does-not-exist-given
+               (setf if-does-not-exist
+                     (cond ((eq direction :input) :error)
+                           ((and output
+                                 (member if-exists '(:overwrite :append)))
+                            :error)
+                           ((eq direction :probe)
+                            nil)
+                           (t
+                            :create))))
+             (cond ((and if-exists-given
+                         truename
+                         (eq if-exists :new-version))
+                    (open-error "OPEN :IF-EXISTS :NEW-VERSION is not supported ~
                             when a new version must be created."))
-              ((eq if-does-not-exist :create)
-               (setf mask (logior mask sb!unix:o_creat)))
-              ((not (member if-exists '(:error nil))))
-              ;; Both if-does-not-exist and if-exists now imply
-              ;; that there will be no opening of files, and either
-              ;; an error would be signalled, or NIL returned
-              ((and (not if-exists) (not if-does-not-exist))
-               (return-from open))
-              ((and if-exists if-does-not-exist)
-               (open-error "OPEN :IF-DOES-NOT-EXIST ~s ~
+                   ((eq if-does-not-exist :create)
+                    (setf mask (logior mask sb-unix:o_creat)))
+                   ((not (member if-exists '(:error nil))))
+                   ;; Both if-does-not-exist and if-exists now imply
+                   ;; that there will be no opening of files, and either
+                   ;; an error would be signalled, or NIL returned
+                   ((and (not if-exists) (not if-does-not-exist))
+                    (return-from open))
+                   ((and if-exists if-does-not-exist)
+                    (open-error "OPEN :IF-DOES-NOT-EXIST ~s ~
                                  :IF-EXISTS ~s will always signal an error."
-                           if-does-not-exist if-exists))
-              (truename
-               (if if-exists
-                   (open-error "File exists ~s." pathname)
-                   (return-from open)))
-              (if-does-not-exist
-               (open-error "File does not exist ~s." pathname))
-              (t
-               (return-from open)))
-        (let ((original (case if-exists
-                          ((:rename :rename-and-delete)
-                           (pick-backup-name namestring))
-                          ((:append :overwrite)
-                           ;; KLUDGE: Prevent CLOSE from deleting
-                           ;; appending streams when called with :ABORT T
-                           namestring)))
-              (delete-original (eq if-exists :rename-and-delete))
-              (mode #o666))
-          (when (and original (not (eq original namestring)))
-            ;; We are doing a :RENAME or :RENAME-AND-DELETE. Determine
-            ;; whether the file already exists, make sure the original
-            ;; file is not a directory, and keep the mode.
-            (let ((exists
-                    (and namestring
-                         (multiple-value-bind (okay err/dev inode orig-mode)
-                             (sb!unix:unix-stat namestring)
-                           (declare (ignore inode)
-                                    (type (or index null) orig-mode))
-                           (cond
-                             (okay
-                              (when (and output (= (logand orig-mode #o170000)
-                                                   #o40000))
-                                (error 'simple-file-error
-                                       :pathname pathname
-                                       :format-control
-                                       "can't open ~S for output: is a directory"
-                                       :format-arguments (list namestring)))
-                              (setf mode (logand orig-mode #o777))
-                              t)
-                             ((eql err/dev sb!unix:enoent)
-                              nil)
-                             (t
-                              (simple-file-perror "can't find ~S"
-                                                  namestring
-                                                  err/dev)))))))
-              (unless (and exists
-                           (rename-the-old-one namestring original))
-                (setf original nil)
-                (setf delete-original nil)
-                ;; In order to use :SUPERSEDE instead, we have to make
-                ;; sure SB!UNIX:O_CREAT corresponds to
-                ;; IF-DOES-NOT-EXIST. SB!UNIX:O_CREAT was set before
-                ;; because of IF-EXISTS being :RENAME.
-                (unless (eq if-does-not-exist :create)
-                  (setf mask
-                        (logior (logandc2 mask sb!unix:o_creat)
-                                sb!unix:o_trunc)))
-                (setf if-exists :supersede))))
+                                if-does-not-exist if-exists))
+                   (truename
+                    (if if-exists
+                        (open-error "File exists ~s." pathname)
+                        (return-from open)))
+                   (if-does-not-exist
+                    (open-error "File does not exist ~s." pathname))
+                   (t
+                    (return-from open)))
+             (let ((original (case if-exists
+                               ((:rename :rename-and-delete)
+                                (pick-backup-name namestring))
+                               ((:append :overwrite)
+                                ;; KLUDGE: Prevent CLOSE from deleting
+                                ;; appending streams when called with :ABORT T
+                                namestring)))
+                   (delete-original (eq if-exists :rename-and-delete))
+                   (mode #o666))
+               (when (and original (not (eq original namestring)))
+                 ;; We are doing a :RENAME or :RENAME-AND-DELETE. Determine
+                 ;; whether the file already exists, make sure the original
+                 ;; file is not a directory, and keep the mode.
+                 (let ((exists
+                         (and namestring
+                              (multiple-value-bind (okay err/dev inode orig-mode)
+                                  (sb-unix:unix-stat namestring)
+                                (declare (ignore inode)
+                                         (type (or index null) orig-mode))
+                                (cond
+                                  (okay
+                                   (when (and output (= (logand orig-mode #o170000)
+                                                        #o40000))
+                                     (simple-file-perror
+                                      "can't open ~A for output: is a directory"
+                                      pathname))
+                                   (setf mode (logand orig-mode #o777))
+                                   t)
+                                  ((eql err/dev sb-unix:enoent)
+                                   nil)
+                                  (t
+                                   (simple-file-perror "can't find ~S"
+                                                       namestring
+                                                       err/dev)))))))
+                   (unless (and exists
+                                (rename-the-old-one namestring original))
+                     (setf original nil)
+                     (setf delete-original nil)
+                     ;; In order to use :SUPERSEDE instead, we have to make
+                     ;; sure SB-UNIX:O_CREAT corresponds to
+                     ;; IF-DOES-NOT-EXIST. SB-UNIX:O_CREAT was set before
+                     ;; because of IF-EXISTS being :RENAME.
+                     (unless (eq if-does-not-exist :create)
+                       (setf mask
+                             (logior (logandc2 mask sb-unix:o_creat)
+                                     sb-unix:o_trunc)))
+                     (setf if-exists :supersede))))
 
-          ;; Now we can try the actual Unix open(2).
-          (multiple-value-bind (fd errno)
-              (if namestring
-                  (sb!unix:unix-open namestring mask mode
-                                     #!+win32 :overlapped #!+win32 overlapped)
-                  (values nil #!-win32 sb!unix:enoent
-                              #!+win32 sb!win32::error_file_not_found))
-            (flet ((vanilla-open-error ()
-                     (simple-file-perror "error opening ~S" pathname errno)))
-              (cond ((numberp fd)
-                     (case direction
-                       ((:input :output :io)
-                        ;; For O_APPEND opened files, lseek returns 0 until first write.
-                        ;; So we jump ahead here.
-                        (when (eq if-exists :append)
-                          (sb!unix:unix-lseek fd 0 sb!unix:l_xtnd))
-                        (make-fd-stream fd
-                                        :class class
-                                        :input input
-                                        :output output
-                                        :element-type element-type
-                                        :external-format external-format
-                                        :file namestring
-                                        :original original
-                                        :delete-original delete-original
-                                        :pathname pathname
-                                        :dual-channel-p nil
-                                        :serve-events nil
-                                        :input-buffer-p t
-                                        :auto-close t))
-                       (:probe
-                        (let ((stream
-                                (%make-fd-stream :name namestring
-                                                 :fd fd
-                                                 :pathname pathname
-                                                 :element-type element-type)))
-                          (close stream)
-                          stream))))
-                    ((eql errno #!-win32 sb!unix:enoent
-                                #!+win32 sb!win32::error_file_not_found)
-                     (case if-does-not-exist
-                       (:error (vanilla-open-error))
-                       (:create
-                        (open-error "~@<The path ~2I~_~S ~I~_does not exist.~:>"
-                                    pathname))
-                       (t nil)))
-                    ((and (eql errno #!-win32 sb!unix:eexist
-                                     #!+win32 sb!win32::error_file_exists)
-                          (null if-exists))
-                     nil)
-                    (t
-                     (vanilla-open-error))))))))))
+               ;; Now we can try the actual Unix open(2).
+               (multiple-value-bind (fd errno)
+                   (if namestring
+                       (sb-unix:unix-open namestring mask mode
+                                          #!+win32 :overlapped #!+win32 overlapped)
+                       (values nil #!-win32 sb-unix:enoent
+                                   #!+win32 sb-win32::error_file_not_found))
+                 (flet ((vanilla-open-error (&optional (condition 'simple-file-error))
+                          (file-perror condition "Error opening ~S" pathname errno condition)))
+                   (when (numberp fd)
+                     (return (case direction
+                               ((:input :output :io)
+                                ;; For O_APPEND opened files, lseek returns 0 until first write.
+                                ;; So we jump ahead here.
+                                (when (eq if-exists :append)
+                                  (sb-unix:unix-lseek fd 0 sb-unix:l_xtnd))
+                                (make-fd-stream fd
+                                                :class class
+                                                :input input
+                                                :output output
+                                                :element-type element-type
+                                                :external-format external-format
+                                                :file namestring
+                                                :original original
+                                                :delete-original delete-original
+                                                :pathname pathname
+                                                :dual-channel-p nil
+                                                :serve-events nil
+                                                :input-buffer-p t
+                                                :auto-close t))
+                               (:probe
+                                (let ((stream
+                                        (%make-fd-stream :name namestring
+                                                         :fd fd
+                                                         :pathname pathname
+                                                         :element-type element-type)))
+                                  (close stream)
+                                  stream)))))
+                   (restart-case
+                       (cond ((eql errno #!-win32 sb-unix:enoent
+                                         #!+win32 sb-win32::error_file_not_found)
+                              (case if-does-not-exist
+                                (:error
+                                 (restart-case
+                                     (vanilla-open-error 'file-does-not-exist)
+                                   (create ()
+                                     :report "Reopen with :if-does-not-exist :create"
+                                     (setf if-does-not-exist-given t
+                                           if-does-not-exist :create))))
+                                (:create
+                                 (open-error "~@<The path ~2I~_~S ~I~_does not exist.~:>"
+                                             pathname))
+                                (t (return nil))))
+                             ((eql errno #!-win32 sb-unix:eexist
+                                         #!+win32 sb-win32::error_file_exists)
+                              (if (null if-exists)
+                                  (return nil)
+                                  (restart-case
+                                      (vanilla-open-error 'file-exists)
+                                    (supersede ()
+                                      :report "Reopen with :if-exists :supersede"
+                                      (setf if-exists-given t
+                                            if-exists :supersede))
+                                    (overwrite ()
+                                      :report "Reopen with :if-exists :overwrite"
+                                      (setf if-exists-given t
+                                            if-exists :overwrite))
+                                    (rename ()
+                                      :report "Reopen with :if-exists :rename"
+                                      (setf if-exists-given t
+                                            if-exists :rename)))))
+                             (t
+                              (vanilla-open-error)))
+                     (continue ()
+                       :report "Retry opening.")
+                     (use-value (value)
+                       :report "Try opening a different file."
+                       :interactive read-evaluated-form
+                       (setf filename (the pathname-designator value))))
+                   (go retry))))))))))
 
 ;;;; initialization
 
@@ -2574,12 +2589,14 @@
   (setq *tty* nil *stdin* nil *stdout* nil *stderr* nil)
   ;; Unbind to make sure we're not accidently dealing with it
   ;; before we're ready (or after we think it's been deinitialized).
+  ;; This uses the internal %MAKUNBOUND because the CL: function would
+  ;; rightly complain that *AVAILABLE-BUFFERS* is proclaimed always bound.
   (%makunbound '*available-buffers*))
 
 (defun stdstream-external-format (fd)
   #!-win32 (declare (ignore fd))
   (let* ((keyword (cond #!+(and win32 sb-unicode)
-                        ((sb!win32::console-handle-p fd)
+                        ((sb-win32::console-handle-p fd)
                          :ucs-2)
                         (t
                          (default-external-format))))
@@ -2590,23 +2607,25 @@
 ;;; This is called whenever a saved core is restarted.
 (defun stream-reinit (&optional init-buffers-p)
   (when init-buffers-p
-    (aver (not (boundp '*available-buffers*)))
+    ;; Use the internal %BOUNDP for similar reason to that cited above-
+    ;; BOUNDP on a known global transforms to the constant T.
+    (aver (not (%boundp '*available-buffers*)))
     (setf *available-buffers* nil))
   (with-simple-output-to-string (*error-output*)
     (multiple-value-bind (in out err)
         #!-win32 (values 0 1 2)
-        #!+win32 (sb!win32::get-std-handles)
+        #!+win32 (sb-win32::get-std-handles)
       (labels (#!+win32
                (nul-stream (name inputp outputp)
                  (let* ((nul-name #.(coerce "NUL" 'simple-base-string))
                         (nul-handle
                           (cond
                             ((and inputp outputp)
-                             (sb!win32:unixlike-open nul-name sb!unix:o_rdwr))
+                             (sb-win32:unixlike-open nul-name sb-unix:o_rdwr))
                             (inputp
-                             (sb!win32:unixlike-open nul-name sb!unix:o_rdonly))
+                             (sb-win32:unixlike-open nul-name sb-unix:o_rdonly))
                             (outputp
-                             (sb!win32:unixlike-open nul-name sb!unix:o_wronly))
+                             (sb-win32:unixlike-open nul-name sb-unix:o_wronly))
                             (t
                              ;; Not quite sure what to do in this case.
                              nil))))
@@ -2644,7 +2663,7 @@
     #!-win32
     ;; FIXME: what is this call to COERCE doing? XC can't dump non-base-strings.
     (let* ((ttyname #.(coerce "/dev/tty" 'simple-base-string))
-           (tty (sb!unix:unix-open ttyname sb!unix:o_rdwr #o666)))
+           (tty (sb-unix:unix-open ttyname sb-unix:o_rdwr #o666)))
       (setf *tty*
             (if tty
                 (make-fd-stream tty :name "the terminal"
@@ -2702,33 +2721,38 @@
   (case operation
     (:file-position
      (if arg1
-         (error 'simple-stream-error
-                :format-control "~S is not positionable"
-                :format-arguments (list stream))
+         (simple-stream-perror "~S is not positionable" stream)
          (fd-stream-get-file-position stream)))
     (t ; call next method
      (fd-stream-misc-routine stream operation arg1 arg2))))
 
-(!defglobal *!cold-stderr-buf* " ")
+(!define-load-time-global *!cold-stderr-buf* " ")
+(declaim (type (simple-base-string 1) *!cold-stderr-buf*))
 
 (defun !make-cold-stderr-stream ()
   (let ((stderr
           #!-win32 2
-          #!+win32 (sb!win32::get-std-handle-or-null sb!win32::+std-error-handle+)))
+          #!+win32 (sb-win32::get-std-handle-or-null sb-win32::+std-error-handle+)))
     (%make-fd-stream
      :out (lambda (stream ch)
             (declare (ignore stream))
-            (let ((b (truly-the (simple-base-string 1) *!cold-stderr-buf*)))
+            (let ((b *!cold-stderr-buf*))
               (setf (char b 0) ch)
-              (sb!unix:unix-write stderr b 0 1)))
+              (sb-unix:unix-write stderr b 0 1)))
      :sout (lambda (stream string start end)
              (declare (ignore stream))
              (flet ((out (s start len)
-                      (sb!unix:unix-write stderr s start len)))
+                      (when (plusp len)
+                        (setf (char *!cold-stderr-buf* 0) (char s (+ start len -1))))
+                      (sb-unix:unix-write stderr s start len)))
                (if (typep string 'simple-base-string)
                    (out string start (- end start))
                    (let ((n (- end start)))
                      ;; will croak if there is any non-BASE-CHAR in the string
                      (out (replace (make-array n :element-type 'base-char)
                                    string :start2 start) 0 n)))))
-     :misc (constantly nil))))
+     :misc (lambda (stream operation &optional arg1 arg2)
+             (declare (ignore stream arg1 arg2))
+             (case operation
+               (:charpos ; impart just enough smarts to make FRESH-LINE dtrt
+                (if (eql (char *!cold-stderr-buf* 0) #\newline) 0 1)))))))

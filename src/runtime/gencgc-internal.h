@@ -25,7 +25,6 @@
 #include "genesis/code.h"
 #include "hopscotch.h"
 
-void gc_free_heap(void);
 extern char *page_address(page_index_t);
 int gencgc_handle_wp_violation(void *);
 
@@ -39,7 +38,9 @@ int gencgc_handle_wp_violation(void *);
   //   gen               = 1
   // If bytes_used takes 4 bytes, then the above is 10 bytes which is padded to
   // 12, which is still an improvement over the 16 that it would have been.
-# define CONDENSED_PAGE_TABLE
+# define CONDENSED_PAGE_TABLE 1
+#else
+# define CONDENSED_PAGE_TABLE 0
 #endif
 
 #if GENCGC_CARD_BYTES > USHRT_MAX
@@ -52,13 +53,11 @@ int gencgc_handle_wp_violation(void *);
   typedef unsigned short page_bytes_t;
 #endif
 
-#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
-/* It is possible to enable fine-grained object pinning
- * (versus page-level pinning) for any backend using gengc.
- * The only "cost" is an extra test in from_space_p()
- * which may or may not be worth it.
- * But partial evacuation of pages is a generally nice feature */
-#  define PIN_GRANULARITY_LISPOBJ
+/* Define this as 0 on the cc invocation if you need to test without it.
+ * While the x86 requires object-based pins, the precise backends don't,
+ * though should generally prefer object pinning over page pinning */
+#ifndef PIN_GRANULARITY_LISPOBJ
+#define PIN_GRANULARITY_LISPOBJ 1
 #endif
 
 /* Note that this structure is also used from Lisp-side in
@@ -75,9 +74,9 @@ struct page {
      * of the page.  Lower values here are better, 0 is ideal.  This
      * is useful for determining where to start when scanning forward
      * through a heap page (either for conservative root validation or
-     * for scavenging).
+     * for scavenging). MUST be 0 for unallocated pages.
      */
-#ifdef CONDENSED_PAGE_TABLE
+#if CONDENSED_PAGE_TABLE
     // The low bit of the offset indicates the scale factor:
     // 0 = double-lispwords, 1 = gc cards. Large objects are card-aligned,
     // and this representation allows for a 32TB contiguous block using 32K
@@ -90,25 +89,28 @@ struct page {
 
     /* the number of bytes of this page that are used. This may be less
      * than the actual bytes used for pages within the current
-     * allocation regions. It should be 0 for all unallocated pages (not
-     * hard to achieve).
+     * allocation regions. MUST be 0 for unallocated pages.
      * When read, the low bit has to be masked off.
      */
     page_bytes_t bytes_used_;
 
+    // !!! If bit positions are changed, be sure to reflect the changes into
+    // page_extensible_p() as well as ALLOCATION-INFORMATION in sb-introspect
     unsigned char
-        /*  000 free
-         *  ?01 boxed data
-         *  ?10 unboxed data
-         *  ?11 code
-         *  1?? open region
-         *
+        /*
+         * The low 4 bits of 'type' are interpreted as:
+         *  0000 free
+         *  ?001 boxed data
+         *  ?010 unboxed data
+         *  ?011 code
+         *  1??? open region
+         * The high bit indicates that the page holds part of or the entirety
+         * of a single object and no other objects.
          * Constants for this field are defined in gc-internal.h, the
          * xxx_PAGE_FLAG definitions.
          *
-         * If the page is free the following slots are invalid, except
-         * for the bytes_used which must be zero. */
-        allocated :3,
+         * If the page is free, all the following fields are zero. */
+        type :5,
         /* This is set when the page is write-protected. This should
          * always reflect the actual write_protect status of a page.
          * (If the page is written into, we catch the exception, make
@@ -121,16 +123,7 @@ struct page {
         write_protected_cleared :1,
         /* If this page should not be moved during a GC then this flag
          * is set. It's only valid during a GC for allocated pages. */
-        dont_move :1,
-        // FIXME: this should be identical to (dont_move & !large_object),
-        // so we don't need to store it as a bit unto itself.
-        /* If this page is not a large object page and contains
-         * any objects which are pinned */
-        has_pins :1,
-        /* If the page is part of a large object then this flag is
-         * set. No other objects should be allocated to these pages.
-         * This is only valid when the page is allocated. */
-        large_object :1;
+        pinned :1;
 
     /* the generation that this page belongs to. This should be valid
      * for all pages that may have objects allocated, even current
@@ -139,84 +132,18 @@ struct page {
     generation_index_t gen;
 };
 extern struct page *page_table;
+#ifdef LISP_FEATURE_BIG_ENDIAN
+# define WP_CLEARED_FLAG      (1<<1)
+# define WRITE_PROTECTED_FLAG (1<<2)
+#else
+# define WRITE_PROTECTED_FLAG (1<<5)
+# define WP_CLEARED_FLAG      (1<<6)
+#endif
 
 struct __attribute__((packed)) corefile_pte {
   uword_t sso; // scan start offset
   page_bytes_t bytes_used;
 };
-
-#ifndef CONDENSED_PAGE_TABLE
-
-// 32-bit doesn't need magic to reduce the size of scan_start_offset.
-#define set_page_scan_start_offset(index,val) \
-  page_table[index].scan_start_offset_ = val
-#define page_scan_start_offset(index) page_table[index].scan_start_offset_
-
-#else
-
-/// A "condensed" offset reduces page table size, which improves scan locality.
-/// As stored, the offset is scaled down either by card size or double-lispwords.
-/// If the offset is the maximum, then we must check if the page pointed to by
-/// that offset is actually the start of a region, and retry if not.
-/// For debugging the iterative algorithm it helps to use a max value
-/// that is less than UINT_MAX to get a pass/fail more quickly.
-
-//#define SCAN_START_OFS_MAX 0x3fff
-#define SCAN_START_OFS_MAX UINT_MAX
-
-#define page_scan_start_offset(index) \
-  (page_table[index].scan_start_offset_ != SCAN_START_OFS_MAX \
-    ? (os_vm_size_t)(page_table[index].scan_start_offset_ & ~1) \
-       << ((page_table[index].scan_start_offset_ & 1)?(GENCGC_CARD_SHIFT-1):WORD_SHIFT) \
-    : scan_start_offset_iterated(index))
-
-static os_vm_size_t __attribute__((unused))
-scan_start_offset_iterated(page_index_t index)
-{
-    // The low bit of the MAX is the 'scale' bit. The max pages we can look
-    // backwards is therefore the max shifted right by 1 bit.
-    page_index_t tot_offset_in_pages = 0;
-    unsigned int offset;
-    do {
-        page_index_t lookback_page = index - tot_offset_in_pages;
-        offset = page_table[lookback_page].scan_start_offset_;
-        tot_offset_in_pages += offset >> 1;
-    } while (offset == SCAN_START_OFS_MAX);
-    return (os_vm_size_t)tot_offset_in_pages << GENCGC_CARD_SHIFT;
-}
-
-/// This is a macro, but it could/should be an inline function.
-/// Problem is that we need gc_assert() which is in gc-internal,
-/// and it's easy enough for GC to flip around some stuff, but then
-/// you have a different problem that more things get messed up,
-/// such as {foo}-os.c. Basically we have inclusion order issues
-/// that nobody ever bothers to deal with, in addition to the fact
-/// that a something-internal header is *directly* included by others.
-/// (Indirect inclusion should be allowed, direct should not be)
-#define set_page_scan_start_offset(index, ofs) \
-  { os_vm_size_t ofs_ = ofs; \
-    unsigned int lsb_ = ofs_!=0 && !(ofs_ & (GENCGC_CARD_BYTES-1)); \
-    os_vm_size_t scaled_ = \
-     (ofs_ >> (lsb_ ? GENCGC_CARD_SHIFT-1 : WORD_SHIFT)) | lsb_; \
-    if (scaled_ > SCAN_START_OFS_MAX) \
-     { gc_assert(lsb_ == 1); scaled_ = SCAN_START_OFS_MAX; } \
-    page_table[index].scan_start_offset_ = scaled_; }
-
-#endif
-
-/// There is some additional cleverness that could potentially be had -
-/// the "need_to_zero" bit (a/k/a "page dirty") is obviously 1 if the page
-/// contains objects. Only for an empty page must we distinguish between pages
-/// not needing be zero-filled before next use and those which must be.
-/// Thus, masking off the dirty bit could be avoided by not storing it for
-/// any in-use page. But since that's not what we do - we set the bit to 1
-/// as soon as a page is used - we do have to mask off the bit.
-#define page_bytes_used(index) (page_table[index].bytes_used_ & ~1)
-#define page_need_to_zero(index) (page_table[index].bytes_used_ & 1)
-#define set_page_bytes_used(index,val) \
-  page_table[index].bytes_used_ = (val) | page_need_to_zero(index)
-#define set_page_need_to_zero(index,val) \
-  page_table[index].bytes_used_ = page_bytes_used(index) | val
 
 /* values for the page.allocated field */
 
@@ -226,12 +153,27 @@ extern page_index_t page_table_pages;
 
 /* forward declarations */
 
-sword_t update_dynamic_space_free_pointer(void);
-void gc_alloc_update_page_tables(int page_type_flag, struct alloc_region *alloc_region);
-void gc_alloc_update_all_page_tables(int);
-void gc_set_region_empty(struct alloc_region *region);
-void gc_mark_range(lispobj*start, long count);
-void gc_mark_obj(lispobj);
+void update_dynamic_space_free_pointer(void);
+void gc_close_region(struct alloc_region *alloc_region, int page_type_flag);
+static inline void ensure_region_closed(struct alloc_region *alloc_region,
+                                        int page_type_flag)
+{
+    if (alloc_region->start_addr)
+        gc_close_region(alloc_region, page_type_flag);
+}
+
+static inline void gc_set_region_empty(struct alloc_region *region)
+{
+    /* last_page is not reset. It can be used as a hint where to resume
+     * allocating after closing and re-opening the region */
+    region->start_addr = region->free_pointer = region->end_addr = 0;
+}
+
+static inline void gc_init_region(struct alloc_region *region)
+{
+    region->last_page = 0; // must always be a valid page index
+    gc_set_region_empty(region);
+}
 
 /*
  * predicates
@@ -253,13 +195,33 @@ find_page_index(void *addr)
     return (-1);
 }
 
+#define SINGLE_OBJECT_FLAG (1<<4)
+#define page_single_obj_p(page) ((page_table[page].type & SINGLE_OBJECT_FLAG)!=0)
 #ifdef PIN_GRANULARITY_LISPOBJ
+#ifndef GENCGC_IS_PRECISE
+#error "GENCGC_IS_PRECISE must be #defined as 0 or 1"
+#endif
+#define page_has_smallobj_pins(page) \
+  (page_table[page].pinned && !page_single_obj_p(page))
 static inline boolean pinned_p(lispobj obj, page_index_t page)
 {
     extern struct hopscotch_table pinned_objects;
     gc_dcheck(compacting_p());
-    return page_table[page].has_pins
+#if !GENCGC_IS_PRECISE
+    return page_has_smallobj_pins(page)
         && hopscotch_containsp(&pinned_objects, obj);
+#else
+    /* There is almost never anything in the hashtable on precise platforms */
+    if (!pinned_objects.count || !page_has_smallobj_pins(page))
+        return 0;
+# ifdef RETURN_PC_WIDETAG
+    /* Conceivably there could be a precise GC without RETURN-PC objects */
+    if (widetag_of(native_pointer(obj)) == RETURN_PC_WIDETAG)
+        obj = make_lispobj(fun_code_header(native_pointer(obj)),
+                           OTHER_POINTER_LOWTAG);
+# endif
+    return hopscotch_containsp(&pinned_objects, obj);
+#endif
 }
 #else
 #  define pinned_p(obj, page) (0)
@@ -278,18 +240,11 @@ from_space_p(lispobj obj)
         && !pinned_p(obj, page_index);
 }
 
-#include "genesis/weak-pointer.h"
-static inline void add_to_weak_pointer_list(struct weak_pointer *wp) {
-    /* Since we overwrite the 'next' field, we have to make
-     * sure not to do so for pointers already in the list.
-     * Instead of searching the list of weak_pointers each
-     * time, we ensure that next is always NULL when the weak
-     * pointer isn't in the list, and not NULL otherwise.
-     * Since we can't use NULL to denote end of list, we
-     * use a pointer back to the same weak_pointer.
-     */
-    wp->next = weak_pointers ? weak_pointers : wp;
-    weak_pointers = wp;
+static boolean __attribute__((unused)) new_space_p(lispobj obj)
+{
+    gc_dcheck(compacting_p());
+    page_index_t page_index = find_page_index((void*)obj);
+    return page_index >= 0 && page_table[page_index].gen == new_space;
 }
 
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
@@ -314,14 +269,14 @@ struct fixedobj_page { // 12 bytes per page
 extern struct fixedobj_page *fixedobj_pages;
 #define fixedobj_page_obj_align(i) (fixedobj_pages[i].attr.parts.obj_align<<WORD_SHIFT)
 #define fixedobj_page_obj_size(i) fixedobj_pages[i].attr.parts.obj_size
-#define FIRST_VARYOBJ_PAGE (IMMOBILE_FIXEDOBJ_SUBSPACE_SIZE/(int)IMMOBILE_CARD_BYTES)
 #endif
 
-extern page_index_t last_free_page;
-extern boolean gencgc_partial_pickup;
+extern page_index_t next_free_page;
 
 extern uword_t
 walk_generation(uword_t (*proc)(lispobj*,lispobj*,uword_t),
                 generation_index_t generation, uword_t extra);
+
+generation_index_t gc_gen_of(lispobj obj, int defaultval);
 
 #endif /* _GENCGC_INTERNAL_H_*/

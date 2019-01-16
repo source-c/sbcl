@@ -12,7 +12,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; cost estimation
 
@@ -47,8 +47,7 @@
         0)
       (when (eq type *empty-type*)
         0)
-      (let ((found (cdr (assoc type *backend-type-predicates*
-                               :test #'type=))))
+      (let ((found (backend-type-predicate type)))
         (if found
             (+ (fun-guessed-cost found) (fun-guessed-cost 'eq))
             nil))
@@ -139,6 +138,10 @@
          ;; weakening, so for integer types we simply collapse all
          ;; ranges into one.
          (weaken-integer-type type))
+        #!+sb-unicode
+        ((csubtypep type (specifier-type 'base-char))
+         ;; Don't want to be putting CHARACTERs into BASE-STRINGs.
+         (specifier-type 'base-char))
         (t
          (let ((min-cost (type-test-cost type))
                (min-type type)
@@ -189,10 +192,17 @@
 ;;; type weakenings, then look for any predicate that is cheaper.
 (defun maybe-weaken-check (type policy)
   (declare (type ctype type))
-  (ecase (policy policy type-check)
-    (0 *wild-type*)
-    (2 (weaken-values-type type))
-    (3 type)))
+  (typecase type
+    ;; Can't do much funcational type checking at run-time
+    (fun-designator-type
+     (specifier-type '(or function symbol)))
+    (fun-type
+     (specifier-type 'function))
+    (t
+     (ecase (policy policy type-check)
+       (0 *wild-type*)
+       (2 (weaken-values-type type))
+       (3 type)))))
 
 ;;; LVAR is an lvar we are doing a type check on and TYPES is a list
 ;;; of types that we are checking its values against. If we have
@@ -313,15 +323,16 @@
          ;; no destination. Perhaps we should mark cases inserted by
          ;; ASSERT-CALL-TYPE explicitly, and delete those whose destination is
          ;; deemed unreachable?
-         (almost-immediately-used-p lvar cast)
-         (values (values-subtypep (lvar-externally-checkable-type lvar)
-                                  (cast-type-to-check cast))))))
+         (and
+          (almost-immediately-used-p lvar cast)
+          (values (values-subtypep (lvar-externally-checkable-type lvar)
+                                   (cast-type-to-check cast)))))))
 
 ;; Type specifiers handled by the general-purpose MAKE-TYPE-CHECK-FORM are often
 ;; trivial enough to have an internal error number assigned to them that can be
 ;; used in lieu of OBJECT-NOT-TYPE-ERROR. On x86-64 this saves 16 bytes: 1 word
 ;; for the symbol in the function's constant area, a MOV instruction to load it,
-;; and an sc-offset in the error trap.
+;; and an SC+OFFSET in the error trap.
 (defglobal **type-spec-interr-symbols**
     (let* ((entries
             ;; read-time-eval so that during cold-init we can recreate the
@@ -330,8 +341,11 @@
             #.(map 'vector
                    (lambda (entry)
                      (cons (type-specifier (specifier-type (car entry)))
-                           (cdr entry)))
-                   (remove-if #'stringp sb!c:+backend-internal-errors+
+                           (cadr entry)))
+                   (remove-if (lambda (spec)
+                                (or (stringp spec)
+                                    (typep spec '(cons (eql or)))))
+                              sb-c:+backend-internal-errors+
                               :key #'car)))
            ;; This is effectively a compact read-only binned hashtable.
            (hashtable (make-array (logior (length entries) 1)
@@ -342,11 +356,52 @@
                       (bucket (mod (sxhash canon-type) (length hashtable))))
                  (push entry (svref hashtable bucket))))
              entries)
-        hashtable))
+      hashtable))
+
+(defglobal **type-spec-unions-interr-symbols**
+    #.(map 'vector
+           (lambda (entry)
+             (cons (type-specifier (specifier-type (car entry)))
+                   (cadr entry)))
+           (remove-if-not (lambda (spec)
+                            (typep spec '(cons (eql or))))
+                          sb-c:+backend-internal-errors+
+                          :key #'car)))
+(declaim (simple-vector **type-spec-unions-interr-symbols**))
+
+;;; Different order of elements in (OR ...) specs make the hash-table
+;;; approach inssuficient.
+(defun %interr-symbol-for-union-type-spec (spec)
+  (let* ((spec (cdr spec))
+         (length (length spec))
+         (bit-map (if (> length sb-vm:n-fixnum-bits)
+                      (return-from %interr-symbol-for-union-type-spec)
+                      (1- (ash 1 (truly-the (integer 1 #.sb-vm:n-fixnum-bits)
+                                            length))))))
+    (declare (list spec))
+    (loop for entry across **type-spec-unions-interr-symbols**
+          when
+          (let ((current-map bit-map))
+            ;; Check that each element is present and mark it in the bit map,
+            ;; at the end if the map is zero the specs match.
+            (declare (type fixnum current-map))
+            (loop for element in (cdar entry)
+                  for position = (position element spec :test #'equal)
+                  always position
+                  do
+                  (setf (ldb (byte 1 (truly-the (integer 0 (#.sb-vm:n-fixnum-bits))
+                                                position))
+                             current-map)
+                        0))
+            (zerop current-map))
+          return (cdr entry))))
+
 (defun %interr-symbol-for-type-spec (spec)
   (let ((table **type-spec-interr-symbols**))
-    (cadr (assoc spec (svref table (rem (sxhash spec) (length table)))
-                :test #'equal))))
+    (if (typep spec '(cons (eql or)))
+        (%interr-symbol-for-union-type-spec spec)
+        (cdr (assoc spec (svref table (rem (sxhash spec) (length table)))
+                    :test #'equal)))))
 #+nil ; some meta-analysis to decide what types should be in "generic/interr"
 (progn
   (defvar *checkgen-used-types* (make-hash-table :test 'equal))
@@ -367,7 +422,18 @@
            (%interr-symbol-for-type-spec external-spec)))
     (if interr-symbol
         `(%type-check-error/c ,var ',interr-symbol ',context)
-        `(%type-check-error ,var ',external-spec ',context))))
+        `(%type-check-error
+          ,var
+          ',(typecase type
+              ;; These are already loaded into the constants vector
+              (structure-classoid
+               ;; Can't use CLASSOID-LAYOUT as it may mismatch due to redefinition
+               (info :type :compiler-layout (classoid-name type)))
+              (standard-classoid
+               (find-classoid-cell (classoid-name type) :create t))
+              (t
+               external-spec))
+          ',context))))
 
 ;;; Return a lambda form that we can convert to do a type check
 ;;; of the specified TYPES. TYPES is a list of the format returned by
@@ -377,18 +443,28 @@
 ;;; unsupplied. Such checking is impossible to efficiently do at the
 ;;; source level because our fixed-values conventions are optimized
 ;;; for the common MV-BIND case.
-(defun make-type-check-form (types &optional context)
+(defun make-type-check-form (types cast)
   (let ((temps (make-gensym-list (length types))))
     `(multiple-value-bind ,temps 'dummy
-       ,@(mapcar (lambda (temp type)
-                   (let* ((spec
-                            (let ((*unparse-fun-type-simplify* t))
-                              (type-specifier (second type))))
-                          (test (if (first type) `(not ,spec) spec)))
-                     `(unless (typep ,temp ',test)
-                        ,(internal-type-error-call temp (third type) context))))
-                 temps
-                 types)
+       ,@(mapcar
+          (lambda (temp %type)
+            (destructuring-bind (not type-to-check
+                                 type-to-report) %type
+              (let* ((spec
+                       (let ((*unparse-fun-type-simplify* t))
+                         (type-specifier type-to-check)))
+                     (test (if not `(not ,spec) spec)))
+                `(unless
+                     ,(with-ir1-environment-from-node cast ;; it performs its own inlining of SATISFIES
+                        (%source-transform-typep temp test))
+                   ,(internal-type-error-call temp
+                                              (if (fun-designator-type-p type-to-report)
+                                                  ;; Simplify
+                                                  (specifier-type 'callable)
+                                                  type-to-report)
+                                              (cast-context cast))))))
+          temps
+          types)
        (values ,@temps))))
 
 ;;; Splice in explicit type check code immediately before CAST. This
@@ -396,28 +472,9 @@
 ;;; checks the type(s) of the value(s), then passes them further.
 (defun convert-type-check (cast types)
   (declare (type cast cast) (type list types))
-  (let ((value (cast-value cast))
-        (length (length types)))
-    (filter-lvar value (make-type-check-form types
-                                             (cast-context cast)))
-    (reoptimize-lvar (cast-value cast))
-    (setf (cast-type-to-check cast) *wild-type*)
-    (setf (cast-%type-check cast) nil)
-    (let* ((atype (cast-asserted-type cast))
-           (atype (cond ((not (values-type-p atype))
-                         atype)
-                        ((= length 1)
-                         (single-value-type atype))
-                        (t
-                         (make-values-type
-                          :required (values-type-in atype length)))))
-           (dtype (node-derived-type cast))
-           (dtype (make-values-type
-                   :required (values-type-in dtype length))))
-      (setf (cast-asserted-type cast) atype)
-      (setf (node-derived-type cast) dtype)))
-
-  (values))
+  (filter-lvar (cast-value cast)
+               (make-type-check-form types cast))
+  (setf (cast-%type-check cast) nil))
 
 ;;; Check all possible arguments of CAST and emit type warnings for
 ;;; those with type errors. If the value of USE is being used for a
@@ -452,14 +509,14 @@
         (cond ((and (ref-p use) (constant-p (ref-leaf use)))
                (warn condition
                      :format-control "~:[This~;~:*~A~] is not a ~
-                       ~<~%~9T~:;~/sb!impl:print-type/:~>~% ~S"
+                       ~<~%~9T~:;~/sb-impl:print-type/:~>~% ~S"
                      :format-arguments
                      (list what atype (constant-value (ref-leaf use)))))
               (t
                (warn condition
                      :format-control
-                      "~:[Result~;~:*~A~] is a ~/sb!impl:print-type/, ~
-                       ~<~%~9T~:;not a ~/sb!impl:print-type/.~>"
+                      "~:[Result~;~:*~A~] is a ~/sb-impl:print-type/, ~
+                       ~<~%~9T~:;not a ~/sb-impl:print-type/.~>"
                      :format-arguments (list what dtype atype)))))))
   (values))
 
@@ -492,36 +549,38 @@
 ;;; which may lead to inappropriate template choices due to the
 ;;; modification of argument types.
 (defun generate-type-checks (component)
-  (collect ((casts))
-    (do-blocks (block component)
-      (when (and (block-type-check block)
-                 (not (block-delete-p block)))
-        ;; CAST-EXTERNALLY-CHECKABLE-P wants the backward pass
-        (do-nodes-backwards (node nil block)
-          (when (and (cast-p node)
-                     (cast-type-check node))
-            (cast-check-uses node)
-            (cond ((cast-externally-checkable-p node)
-                   (setf (cast-%type-check node) :external))
-                  (t
-                   ;; it is possible that NODE was marked :EXTERNAL by
-                   ;; the previous pass
-                   (setf (cast-%type-check node) t)
-                   (casts node)))))
-        (setf (block-type-check block) nil)))
-    (dolist (cast (casts))
-      (unless (bound-cast-p cast)
-        (multiple-value-bind (check types) (cast-check-types cast)
-          (ecase check
-            (:simple
-             (convert-type-check cast types))
-            (:too-hairy
-             (let ((*compiler-error-context* cast))
-               (when (policy cast (>= safety inhibit-warnings))
-                 (compiler-notify
-                  "type assertion too complex to check:~%~
-                    ~/sb!impl:print-type/."
-                  (coerce-to-values (cast-asserted-type cast)))))
-             (setf (cast-type-to-check cast) *wild-type*)
-             (setf (cast-%type-check cast) nil)))))))
-  (values))
+  (let (generated)
+    (collect ((casts))
+      (do-blocks (block component)
+        (when (and (block-type-check block)
+                   (not (block-delete-p block)))
+          ;; CAST-EXTERNALLY-CHECKABLE-P wants the backward pass
+          (do-nodes-backwards (node nil block)
+            (when (and (cast-p node)
+                       (cast-type-check node))
+              (cast-check-uses node)
+              (cond ((cast-externally-checkable-p node)
+                     (setf (cast-%type-check node) :external))
+                    (t
+                     ;; it is possible that NODE was marked :EXTERNAL by
+                     ;; the previous pass
+                     (setf (cast-%type-check node) t)
+                     (casts node)))))
+          (setf (block-type-check block) nil)))
+      (dolist (cast (casts))
+        (unless (bound-cast-p cast)
+          (multiple-value-bind (check types) (cast-check-types cast)
+            (ecase check
+              (:simple
+               (convert-type-check cast types)
+               (setf generated t))
+              (:too-hairy
+               (let ((*compiler-error-context* cast))
+                 (when (policy cast (>= safety inhibit-warnings))
+                   (compiler-notify
+                    "type assertion too complex to check:~%~
+                    ~/sb-impl:print-type/."
+                    (coerce-to-values (cast-asserted-type cast)))))
+               (setf (cast-type-to-check cast) *wild-type*)
+               (setf (cast-%type-check cast) nil)))))))
+    generated))

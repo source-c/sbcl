@@ -13,13 +13,10 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-(load "assertoid.lisp")
-(use-package "ASSERTOID")
-
 ;;; Test that symbols are properly normalized in SB-UNICODE builds
 #+sb-unicode
 (with-test (:name (:normalizing-reader)
-                  :skipped-on '(not :sb-unicode))
+                  :skipped-on (not :sb-unicode))
   (labels ((str (&rest chars)
              (coerce chars 'string))
            (symbol (&rest chars)

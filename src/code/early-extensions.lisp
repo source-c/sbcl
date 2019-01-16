@@ -11,22 +11,12 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
-(defvar *core-pathname* nil
-  "The absolute pathname of the running SBCL core.")
-
-(defvar *runtime-pathname* nil
-  "The absolute pathname of the running SBCL runtime.")
-
-;;; something not EQ to anything we might legitimately READ
-(defglobal *eof-object* (make-symbol "EOF-OBJECT"))
-
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defconstant max-hash sb!xc:most-positive-fixnum))
-
-(def!type hash ()
-  `(integer 0 ,max-hash))
+;;; A number that can represent an index into a vector, including
+;;; one-past-the-end
+(deftype array-range ()
+  '(integer 0 #.sb-xc:array-dimension-limit))
 
 ;;; a type used for indexing into sequences, and for related
 ;;; quantities like lengths of lists and other sequences.
@@ -45,91 +35,23 @@
 ;;; MOST-POSITIVE-FIXNUM lets the system know it can increment a value
 ;;; of type INDEX without having to worry about using a bignum to
 ;;; represent the result.
-(def!type index () `(integer 0 (,sb!xc:array-dimension-limit)))
-
-;;; like INDEX, but only up to half the maximum. Used by hash-table
-;;; code that does plenty to (aref v (* 2 i)) and (aref v (1+ (* 2 i))).
-(def!type index/2 () `(integer 0 (,(floor sb!xc:array-dimension-limit 2))))
+(def!type index () `(integer 0 (,sb-xc:array-dimension-limit)))
 
 ;;; like INDEX, but augmented with -1 (useful when using the index
 ;;; to count downwards to 0, e.g. LOOP FOR I FROM N DOWNTO 0, with
 ;;; an implementation which terminates the loop by testing for the
 ;;; index leaving the loop range)
-(def!type index-or-minus-1 () `(integer -1 (,sb!xc:array-dimension-limit)))
-
-;;; A couple of VM-related types that are currently used only on the
-;;; alpha and mips platforms. -- CSR, 2002-06-24
-(def!type unsigned-byte-with-a-bite-out (size bite)
-  (unless (typep size '(integer 1))
-    (error "Bad size for the ~S type specifier: ~S."
-           'unsigned-byte-with-a-bite-out size))
-  (let ((bound (ash 1 size)))
-    `(integer 0 ,(- bound bite 1))))
-
-(def!type signed-byte-with-a-bite-out (size bite)
-  (unless (typep size '(integer 2))
-    (error "Bad size for ~S type specifier: ~S."
-            'signed-byte-with-a-bite-out size))
-  (let ((bound (ash 1 (1- size))))
-    `(integer ,(- bound) ,(- bound bite 1))))
+(def!type index-or-minus-1 () `(integer -1 (,sb-xc:array-dimension-limit)))
 
 ;;; The smallest power of two that is equal to or greater than X.
 (declaim (inline power-of-two-ceiling))
 (defun power-of-two-ceiling (x)
-  (declare (index x))
+  (declare (type index x))
   (ash 1 (integer-length (1- x))))
 
-(def!type load/store-index (scale lowtag min-offset
-                                 &optional (max-offset min-offset))
-  `(integer ,(- (truncate (+ (ash 1 16)
-                             (* min-offset sb!vm:n-word-bytes)
-                             (- lowtag))
-                          scale))
-            ,(truncate (- (+ (1- (ash 1 16)) lowtag)
-                          (* max-offset sb!vm:n-word-bytes))
-                       scale)))
-
-#!+(or x86 x86-64)
-(defun displacement-bounds (lowtag element-size data-offset)
-  (let* ((adjustment (- (* data-offset sb!vm:n-word-bytes) lowtag))
-         (bytes-per-element (ceiling element-size sb!vm:n-byte-bits))
-         (min (truncate (+ sb!vm::minimum-immediate-offset adjustment)
-                        bytes-per-element))
-         (max (truncate (+ sb!vm::maximum-immediate-offset adjustment)
-                        bytes-per-element)))
-    (values min max)))
-
-#!+(or x86 x86-64)
-(def!type constant-displacement (lowtag element-size data-offset)
-  (flet ((integerify (x)
-           (etypecase x
-             (integer x)
-             (symbol (symbol-value x)))))
-    (let ((lowtag (integerify lowtag))
-          (element-size (integerify element-size))
-          (data-offset (integerify data-offset)))
-      (multiple-value-bind (min max) (displacement-bounds lowtag
-                                                          element-size
-                                                          data-offset)
-        `(integer ,min ,max)))))
-
-;;; the default value used for initializing character data. The ANSI
-;;; spec says this is arbitrary, so we use the value that falls
-;;; through when we just let the low-level consing code initialize
-;;; all newly-allocated memory to zero.
-;;;
-;;; KLUDGE: It might be nice to use something which is a
-;;; STANDARD-CHAR, both to reduce user surprise a little and, probably
-;;; more significantly, to help SBCL's cross-compiler (which knows how
-;;; to dump STANDARD-CHARs). Unfortunately, the old CMU CL code is
-;;; shot through with implicit assumptions that it's #\NULL, and code
-;;; in several places (notably both DEFUN MAKE-ARRAY and DEFTRANSFORM
-;;; MAKE-ARRAY) would have to be rewritten. -- WHN 2001-10-04
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  ;; an expression we can use to construct a DEFAULT-INIT-CHAR value
-  ;; at load time (so that we don't need to teach the cross-compiler
-  ;; how to represent and dump non-STANDARD-CHARs like #\NULL)
-  (defparameter *default-init-char-form* '(code-char 0)))
+(declaim (inline align-up))
+(defun align-up (value granularity &aux (mask (1- granularity)))
+  (logandc2 (+ value mask) mask))
 
 ;;; CHAR-CODE values for ASCII characters which we care about but
 ;;; which aren't defined in section "2.1.3 Standard Characters" of the
@@ -195,12 +117,22 @@
            (recurse x (list x) 0)
            t))))
 
-;;; Is X a (possibly-improper) list of at least N elements?
-(declaim (ftype (function (t index)) list-of-length-at-least-p))
-(defun list-of-length-at-least-p (x n)
-  (or (zerop n) ; since anything can be considered an improper list of length 0
-      (and (consp x)
-           (list-of-length-at-least-p (cdr x) (1- n)))))
+;;; Is LIST a (possibly-improper) list of at least LENGTH elements?
+(declaim (ftype (sfunction (t index) boolean) list-of-length-at-least-p))
+(defun list-of-length-at-least-p (list length)
+  (named-let rec ((rest list) (n length))
+    (declare (type index n))
+    (or (zerop n) ; since anything can be considered an improper list of length 0
+        (and (consp rest) (rec (cdr rest) (1- n))))))
+
+(defun sequence-of-length-at-least-p (sequence length)
+  (etypecase sequence
+    (list
+     (list-of-length-at-least-p sequence length))
+    (vector
+     (>= (length sequence) length))
+    (sequence
+     (>= (length sequence) length))))
 
 ;;; Is X is a positive prime integer?
 (defun positive-primep (x)
@@ -356,6 +288,16 @@
                  (rplacd splice (cdr x))))
             (t (setq splice x)))))) ; Move splice along to include element.
 
+;;; Delete just one item
+(defun delq1 (item list)
+  (do ((prev nil x)
+       (x list (cdr x)))
+      ((null x) list)
+    (when (eq item (car x))
+      (if (null prev)
+          (return (cdr x))
+          (rplacd prev (cdr x)))
+      (return list))))
 
 ;;; like (POSITION .. :TEST #'EQ):
 ;;;   Return the position of the first element EQ to ITEM.
@@ -380,18 +322,6 @@
           (t list))))
 
 ;;;; miscellaneous iteration extensions
-
-;;; like Scheme's named LET
-;;;
-;;; (CMU CL called this ITERATE, and commented it as "the ultimate
-;;; iteration macro...". I (WHN) found the old name insufficiently
-;;; specific to remind me what the macro means, so I renamed it.)
-(defmacro named-let (name binds &body body)
-  (dolist (x binds)
-    (unless (proper-list-of-length-p x 2)
-      (error "malformed NAMED-LET variable spec: ~S" x)))
-  `(labels ((,name ,(mapcar #'first binds) ,@body))
-     (,name ,@(mapcar #'second binds))))
 
 (defun filter-dolist-declarations (decls)
   (mapcar (lambda (decl)
@@ -546,7 +476,7 @@ precise source locations in case conditions are signaled during the
 execution of BODY.
 
 NOTE: This interface is experimental and subject to change."
-  #-sb-xc-host `(sb!c::call-with-current-source-form
+  #-sb-xc-host `(sb-c::call-with-current-source-form
                  (lambda () ,@body) ,@forms)
   #+sb-xc-host `(progn (list ,@forms) ,@body))
 
@@ -592,7 +522,7 @@ NOTE: This interface is experimental and subject to change."
 ;;;   a fixnum with at least (* 2 <hash-bits>) of information in it.
 ;;; :VALUES <n>
 ;;;   the number of return values cached for each function call
-(defvar *cache-vector-symbols* nil)
+(define-load-time-global *cache-vector-symbols* nil)
 
 (defun drop-all-hash-caches ()
   (dolist (name *cache-vector-symbols*)
@@ -605,7 +535,7 @@ NOTE: This interface is experimental and subject to change."
     ;; in VALUES-SPECIFIER-TYPE. It's because SET calls VALUES-SPECIFIER-TYPE.
     (macrolet ((set! (symbol value)
                  `(#+sb-xc-host set
-                   #-sb-xc-host sb!kernel:%set-symbol-global-value
+                   #-sb-xc-host sb-kernel:%set-symbol-global-value
                    ,symbol ,value))
                (reset-stats ()
                  ;; If statistics gathering is not not compiled-in,
@@ -614,7 +544,7 @@ NOTE: This interface is experimental and subject to change."
                  ;; it is inconsequential to performance.
                  (if *profile-hash-cache*
                      `(let ((statistics
-                             (let ((*package* (symbol-package symbol)))
+                             (let ((*package* (sb-xc:symbol-package symbol)))
                                (symbolicate symbol "STATISTICS"))))
                         (unless (boundp statistics)
                           (set! statistics
@@ -624,7 +554,7 @@ NOTE: This interface is experimental and subject to change."
       ;; global variable before the vector's header+length have been set.
       ;; Without a barrier, this would be theoretically possible if the
       ;; architecture allows out-of-order memory writes.
-      (sb!thread:barrier (:write)
+      (sb-thread:barrier (:write)
         (reset-stats)
         (setq cache (make-array size :initial-element 0)))
       (set! symbol cache))))
@@ -698,7 +628,7 @@ NOTE: This interface is experimental and subject to change."
          (line-type (let ((n (+ nargs nvalues)))
                       (if (<= n 3) 'cons `(simple-vector ,n))))
          (bind-hashval
-          `((,hashval (the (signed-byte #.sb!vm:n-fixnum-bits)
+          `((,hashval (the (signed-byte #.sb-vm:n-fixnum-bits)
                            (funcall ,hash-function ,@arg-vars)))
             (,cache ,var-name)))
          (probe-it
@@ -707,7 +637,7 @@ NOTE: This interface is experimental and subject to change."
                (let ((,hashval ,hashval) ; gets clobbered in probe loop
                      (,cache (truly-the ,cache-type ,cache)))
                  ;; FIXME: redundant?
-                 (declare (type (signed-byte #.sb!vm:n-fixnum-bits) ,hashval))
+                 (declare (type (signed-byte #.sb-vm:n-fixnum-bits) ,hashval))
                  (loop repeat 2
                     do (let ((,entry
                               (svref ,cache
@@ -716,12 +646,12 @@ NOTE: This interface is experimental and subject to change."
                            ;; This barrier is a no-op on all multi-threaded SBCL
                            ;; architectures. No CPU except Alpha will move a
                            ;; load prior to a load on which it depends.
-                           (sb!thread:barrier (:data-dependency))
+                           (sb-thread:barrier (:data-dependency))
                            (locally (declare (type ,line-type ,entry))
                              (let* ,(case (length temps)
                                      (2 `((,(first temps) (car ,entry))
                                           (,(second temps) (cdr ,entry))))
-                                     (3 (let ((arg-temp (sb!xc:gensym "ARGS")))
+                                     (3 (let ((arg-temp (sb-xc:gensym "ARGS")))
                                           `((,arg-temp (cdr ,entry))
                                             (,(first temps) (car ,entry))
                                             (,(second temps)
@@ -757,7 +687,7 @@ NOTE: This interface is experimental and subject to change."
                    ;; MUST NOT be observed by another thread before its cells
                    ;; are filled. Equally bad, the 'output' cells in the line
                    ;; could be 0 while the 'input' cells matched something.
-                   (sb!thread:barrier (:write))
+                   (sb-thread:barrier (:write))
                    (cond ((eql (svref ,cache idx1) 0)
                           (setf (svref ,cache idx1) ,entry))
                          ((eql (svref ,cache idx2) 0)
@@ -769,7 +699,7 @@ NOTE: This interface is experimental and subject to change."
                  (values ,@result-temps))))))
     `(progn
        (pushnew ',var-name *cache-vector-symbols*)
-       (defglobal ,var-name nil)
+       (define-load-time-global ,var-name nil)
        ,@(when *profile-hash-cache*
            `((declaim (type (simple-array fixnum (3)) ,statistics-name))
              (defvar ,statistics-name)))
@@ -930,7 +860,7 @@ NOTE: This interface is experimental and subject to change."
 
 (defun looks-like-name-of-special-var-p (x)
   (and (symbolp x)
-       (symbol-package x)
+       (sb-xc:symbol-package x)
        (let ((name (symbol-name x)))
          (and (> (length name) 2) ; to exclude '* and '**
               (char= #\* (aref name 0))
@@ -964,7 +894,7 @@ NOTE: This interface is experimental and subject to change."
           (let* ((name (first spec))
                  (exp-temp (gensym "ONCE-ONLY")))
             `(let ((,exp-temp ,(second spec))
-                   (,name (sb!xc:gensym ,(symbol-name name))))
+                   (,name (sb-xc:gensym ,(symbol-name name))))
                `(let ((,,name ,,exp-temp))
                   ,,(frob (rest specs) body))))))))
 
@@ -978,8 +908,6 @@ NOTE: This interface is experimental and subject to change."
 ;;; error indicating that a required &KEY argument was not supplied.
 ;;; This function is also useful for DEFSTRUCT slot defaults
 ;;; corresponding to required arguments.
-(declaim (ftype (function () #+(and sb-xc-host ccl) *
-                             #-(and sb-xc-host ccl) nil) missing-arg))
 (defun missing-arg ()
   (/show0 "entering MISSING-ARG")
   (error "A required &KEY or &OPTIONAL argument was not supplied."))
@@ -1024,6 +952,18 @@ NOTE: This interface is experimental and subject to change."
       (destructuring-bind (result) x result)
       x))
 
+;;; Coerce a numeric type bound to the given type while handling
+;;; exclusive bounds.
+(defun coerce-numeric-bound (bound type)
+  (flet ((c (thing)
+           (case type
+             (rational (rational thing))
+             (t (coerce thing type)))))
+    (when bound
+      (if (consp bound)
+          (list (c (car bound)))
+          (c bound)))))
+
 ;;; some commonly-occurring CONSTANTLY forms
 (macrolet ((def-constantly-fun (name constant-expr)
              `(progn
@@ -1033,27 +973,6 @@ NOTE: This interface is experimental and subject to change."
   (def-constantly-fun constantly-t t)
   (def-constantly-fun constantly-nil nil)
   (def-constantly-fun constantly-0 0))
-
-;;; If X is a symbol, see whether it is present in *FEATURES*. Also
-;;; handle arbitrary combinations of atoms using NOT, AND, OR.
-(defun featurep (x)
-  (typecase x
-    (cons
-     (case (car x)
-       ((:not not)
-        (cond
-          ((cddr x)
-           (error "too many subexpressions in feature expression: ~S" x))
-          ((null (cdr x))
-           (error "too few subexpressions in feature expression: ~S" x))
-          (t (not (featurep (cadr x))))))
-       ((:and and) (every #'featurep (cdr x)))
-       ((:or or) (some #'featurep (cdr x)))
-       (t
-        (error "unknown operator in feature expression: ~S." x))))
-    (symbol (not (null (memq x *features*))))
-    (t
-      (error "invalid feature expression: ~S" x))))
 
 
 ;;;; utilities for two-VALUES predicates
@@ -1119,6 +1038,8 @@ NOTE: This interface is experimental and subject to change."
 (defun defprinter-print-space (stream)
   (write-char #\space stream))
 
+(defvar *print-ir-nodes-pretty* nil)
+
 ;;; Define some kind of reasonable PRINT-OBJECT method for a
 ;;; STRUCTURE-OBJECT class.
 ;;;
@@ -1142,27 +1063,30 @@ NOTE: This interface is experimental and subject to change."
 ;;;
 ;;; The structure being printed is bound to STRUCTURE and the stream
 ;;; is bound to STREAM.
+;;;
+;;; If PRETTY-IR-PRINTER is supplied, the form is invoked when
+;;; *PRINT-IR-NODES-PRETTY* is true.
 (defmacro defprinter ((name
                        &key
                        (conc-name (concatenate 'simple-string
                                                (symbol-name name)
                                                "-"))
-                       identity)
+                       identity
+                       pretty-ir-printer)
                       &rest slot-descs)
   (let ((first? t)
         maybe-print-space
-        (reversed-prints nil)
-        (stream (sb!xc:gensym "STREAM")))
+        (reversed-prints nil))
     (flet ((sref (slot-name)
              `(,(symbolicate conc-name slot-name) structure)))
       (dolist (slot-desc slot-descs)
         (if first?
             (setf maybe-print-space nil
                   first? nil)
-            (setf maybe-print-space `(defprinter-print-space ,stream)))
+            (setf maybe-print-space `(defprinter-print-space stream)))
         (cond ((atom slot-desc)
                (push maybe-print-space reversed-prints)
-               (push `(defprinter-prin1 ',slot-desc ,(sref slot-desc) ,stream)
+               (push `(defprinter-prin1 ',slot-desc ,(sref slot-desc) stream)
                      reversed-prints))
               (t
                (let ((sname (first slot-desc))
@@ -1175,26 +1099,40 @@ NOTE: This interface is experimental and subject to change."
                                    ,maybe-print-space
                                    ,@(or (stuff)
                                          `((defprinter-prin1
-                                             ',sname ,sname ,stream)))))
+                                             ',sname ,sname stream)))))
                               reversed-prints))
                      (case (first option)
                        (:prin1
                         (stuff `(defprinter-prin1
-                                  ',sname ,(second option) ,stream)))
+                                  ',sname ,(second option) stream)))
                        (:princ
                         (stuff `(defprinter-princ
-                                  ',sname ,(second option) ,stream)))
+                                  ',sname ,(second option) stream)))
                        (:test (setq test (second option)))
                        (t
                         (error "bad option: ~S" (first option)))))))))))
-    `(defmethod print-object ((structure ,name) ,stream)
-       (pprint-logical-block (,stream nil)
-         (print-unreadable-object (structure
-                                   ,stream
-                                   :type t
-                                   :identity ,identity)
-           ,@(nreverse reversed-prints))))))
+    (let ((normal-printer `(pprint-logical-block (stream nil)
+                             (print-unreadable-object (structure
+                                                       stream
+                                                       :type t
+                                                       :identity ,identity)
+                               ,@(nreverse reversed-prints))) ))
+      `(defmethod print-object ((structure ,name) stream)
+         ,(cond (pretty-ir-printer
+                 `(if *print-ir-nodes-pretty*
+                      ,pretty-ir-printer
+                      ,normal-printer))
+                (t
+                 normal-printer))))))
 
+;;; When cross-compiling, there is nothing out of the ordinary
+;;; about compilling a DEFUN wrapped in PRESERVING-HOST-FUNCTION,
+;;; so just remove the decoration.
+#-sb-xc-host
+(eval-when (:compile-toplevel)
+  (sb-xc:defmacro sb-cold:preserving-host-function (form) form))
+
+(sb-cold:preserving-host-function
 (defun print-symbol-with-prefix (stream symbol &optional colon at)
   "For use with ~/: Write SYMBOL to STREAM as if it is not accessible from
   the current package."
@@ -1203,9 +1141,10 @@ NOTE: This interface is experimental and subject to change."
   ;; keywords are always printed with colons, so this guarantees that the
   ;; symbol will not be printed without a prefix.
   (let ((*package* *keyword-package*))
-    (write symbol :stream stream :escape t)))
+    (write symbol :stream stream :escape t))))
 
-(declaim (special sb!pretty:*pprint-quote-with-syntactic-sugar*))
+(declaim (special sb-pretty:*pprint-quote-with-syntactic-sugar*))
+(sb-cold:preserving-host-function
 (defun print-type-specifier (stream type-specifier &optional colon at)
   (declare (ignore colon at))
   ;; Binding *PPRINT-QUOTE-WITH-SYNTACTIC-SUGAR* prevents certain
@@ -1219,12 +1158,13 @@ NOTE: This interface is experimental and subject to change."
   ;; like CL:FUNCTION, CL:INTEGER, etc. to be printed without package
   ;; prefix but forces printing with package prefix for other
   ;; specifiers.
-  (let ((sb!pretty:*pprint-quote-with-syntactic-sugar* nil)
+  (let ((sb-pretty:*pprint-quote-with-syntactic-sugar* nil)
         (*package* *cl-package*))
-    (prin1 type-specifier stream)))
+    (prin1 type-specifier stream))))
 
+(sb-cold:preserving-host-function
 (defun print-type (stream type &optional colon at)
-  (print-type-specifier stream (type-specifier type) colon at))
+  (print-type-specifier stream (type-specifier type) colon at)))
 
 (declaim (ftype (sfunction (index &key (:comma-interval (and (integer 1) index))) index)
                 decimal-with-grouped-digits-width))
@@ -1233,14 +1173,6 @@ NOTE: This interface is experimental and subject to change."
     (+ digits (floor (1- digits) comma-interval))))
 
 
-;;;; etc.
-
-;;; Given a pathname, return a corresponding physical pathname.
-(defun physicalize-pathname (possibly-logical-pathname)
-  (if (typep possibly-logical-pathname 'logical-pathname)
-      (translate-logical-pathname possibly-logical-pathname)
-      possibly-logical-pathname))
-
 ;;;; Deprecating stuff
 
 (deftype deprecation-state ()
@@ -1326,38 +1258,6 @@ NOTE: This interface is experimental and subject to change."
        state (first since) (second since) namespace name replacements)
       (values state since replacements))))
 
-;;; For-effect-only variant of CHECK-DEPRECATED-THING for
-;;; type-specifiers that descends into compound type-specifiers.
-(defun %check-deprecated-type (type-specifier)
-  (let ((seen '()))
-    ;; KLUDGE: we have to use SPECIFIER-TYPE to sanely traverse
-    ;; TYPE-SPECIFIER and detect references to deprecated types. But
-    ;; then we may have to drop its cache to get the
-    ;; PARSE-DEPRECATED-TYPE condition when TYPE-SPECIFIER is parsed
-    ;; again later.
-    ;;
-    ;; Proper fix would be a
-    ;;
-    ;;   walk-type function type-specifier
-    ;;
-    ;; mechanism that could drive VALUES-SPECIFIER-TYPE but also
-    ;; things like this function.
-    (block nil
-      (handler-bind
-          ((sb!kernel::parse-deprecated-type
-             (lambda (condition)
-               (let ((type-specifier (sb!kernel::parse-deprecated-type-specifier
-                                      condition)))
-                 (aver (symbolp type-specifier))
-                 (unless (memq type-specifier seen)
-                   (push type-specifier seen)
-                   (check-deprecated-thing 'type type-specifier)))))
-           ((or error sb!kernel:parse-unknown-type)
-             (lambda (condition)
-               (declare (ignore condition))
-               (return))))
-        (specifier-type type-specifier)))))
-
 (defun check-deprecated-type (type-specifier)
   (typecase type-specifier
     ((or symbol cons)
@@ -1421,25 +1321,27 @@ NOTE: This interface is experimental and subject to change."
 ;;; - SB-C::STACK-ALLOCATE-VECTOR (policy)         since 1.0.19.7            -> Final: anytime
 ;;; - SB-C::STACK-ALLOCATE-VALUE-CELLS (policy)    since 1.0.19.7            -> Final: anytime
 
+(sb-cold:preserving-host-function
 (defun print-deprecation-replacements (stream replacements &optional colonp atp)
   (declare (ignore colonp atp))
   ;; I don't think this is callable during cross-compilation, is it?
+  ;; Anyway, the format string tokenizer can not handle APPLY on its own.
   (apply #'format stream
-         "~#[~;~
+         (sb-format:tokens "~#[~;~
              Use ~/sb-ext:print-symbol-with-prefix/ instead.~;~
              Use ~/sb-ext:print-symbol-with-prefix/ or ~
              ~/sb-ext:print-symbol-with-prefix/ instead.~:;~
              Use~@{~#[~; or~] ~
              ~/sb-ext:print-symbol-with-prefix/~^,~} instead.~
-           ~]"
-         replacements))
+           ~]")
+         replacements)))
 
 (defun print-deprecation-message (namespace name software version
                                   &optional replacements stream)
   (format stream
-           "The ~(~A~) ~/sb!impl:print-symbol-with-prefix/ has been ~
+           "The ~(~A~) ~/sb-ext:print-symbol-with-prefix/ has been ~
             deprecated as of ~@[~A ~]version ~A.~
-            ~@[~2%~/sb!impl::print-deprecation-replacements/~]"
+            ~@[~2%~/sb-impl::print-deprecation-replacements/~]"
           namespace name software version replacements))
 
 (defun setup-function-in-final-deprecation
@@ -1447,15 +1349,16 @@ NOTE: This interface is experimental and subject to change."
   #+sb-xc-host (declare (ignore software version name replacement-spec))
   #-sb-xc-host
   (setf (fdefinition name)
-        (sb!impl::set-closure-name
+        (set-closure-name
          (lambda (&rest args)
            (declare (ignore args))
            (deprecation-error software version 'function name replacement-spec))
+         t
          name)))
 
 (defun setup-variable-in-final-deprecation
     (software version name replacement-spec)
-  (sb!c::%define-symbol-macro
+  (sb-c::%define-symbol-macro
    name
    `(deprecation-error
      ,software ,version 'variable ',name
@@ -1574,46 +1477,25 @@ NOTE: This interface is experimental and subject to change."
   (or (not (consp promise))
       (car promise)))
 
-;;; toplevel helper
-(defmacro with-rebound-io-syntax (&body body)
-  `(%with-rebound-io-syntax (lambda () ,@body)))
-
-(defun %with-rebound-io-syntax (function)
-  (declare (type function function))
-  (let ((*package* *package*)
-        (*print-array* *print-array*)
-        (*print-base* *print-base*)
-        (*print-case* *print-case*)
-        (*print-circle* *print-circle*)
-        (*print-escape* *print-escape*)
-        (*print-gensym* *print-gensym*)
-        (*print-length* *print-length*)
-        (*print-level* *print-level*)
-        (*print-lines* *print-lines*)
-        (*print-miser-width* *print-miser-width*)
-        (*print-pretty* *print-pretty*)
-        (*print-radix* *print-radix*)
-        (*print-readably* *print-readably*)
-        (*print-right-margin* *print-right-margin*)
-        (*read-base* *read-base*)
-        (*read-default-float-format* *read-default-float-format*)
-        (*read-eval* *read-eval*)
-        (*read-suppress* *read-suppress*)
-        (*readtable* *readtable*))
-    (funcall function)))
-
 ;;; Bind a few "potentially dangerous" printer control variables to
 ;;; safe values, respecting current values if possible.
 (defmacro with-sane-io-syntax (&body forms)
   `(call-with-sane-io-syntax (lambda () ,@forms)))
 
+(defparameter *print-vector-length* nil ; initialized by genesis
+  "Like *PRINT-LENGTH* but works on strings and bit-vectors.
+Does not affect the cases that are already controlled by *PRINT-LENGTH*")
+(declaim (always-bound *print-vector-length*))
+
 (defun call-with-sane-io-syntax (function)
   (declare (type function function))
+  #-sb-xc-host (declare (dynamic-extent function)) ; "unable"
   (macrolet ((true (sym)
                `(and (boundp ',sym) ,sym)))
     (let ((*print-readably* nil)
           (*print-level* (or (true *print-level*) 6))
-          (*print-length* (or (true *print-length*) 12)))
+          (*print-length* (or (true *print-length*) 12))
+          (*print-vector-length* (or (true *print-vector-length*) 200)))
       (funcall function))))
 
 ;;; Returns a list of members of LIST. Useful for dealing with circular lists.
@@ -1634,11 +1516,11 @@ NOTE: This interface is experimental and subject to change."
 
 (declaim (type (member :compile #!+(or sb-eval sb-fasteval) :interpret)
                *evaluator-mode*))
-(!defparameter *evaluator-mode* :compile
+(defparameter *evaluator-mode* :compile ; initialized by genesis
   "Toggle between different evaluator implementations. If set to :COMPILE,
 an implementation of EVAL that calls the compiler will be used. If set
 to :INTERPRET, an interpreter will be used.")
-
+(declaim (always-bound *evaluator-mode*))
 ;; This is not my preferred name for this function, but chosen for harmony
 ;; with everything else that refers to these as 'hash-caches'.
 ;; Hashing is just one particular way of memoizing, and it would have been
@@ -1648,7 +1530,7 @@ to :INTERPRET, an interpreter will be used.")
 '(defun show-hash-cache-statistics ()
   (flet ((cache-stats (symbol)
            (let* ((name (string symbol))
-                  (statistics (let ((*package* (symbol-package symbol)))
+                  (statistics (let ((*package* (sb-xc:symbol-package symbol)))
                                 (symbolicate symbol "STATISTICS")))
                   (prefix
                    (subseq name 0 (- (length name) (length "VECTOR**")))))
@@ -1678,7 +1560,7 @@ to :INTERPRET, an interpreter will be used.")
                                 (length cache))))
                   short-name))))))
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 (defun fp-zero-p (x)
   (typecase x
@@ -1717,6 +1599,19 @@ to :INTERPRET, an interpreter will be used.")
              (sorted (stable-sort wrapped comparator :key #'cdr)))
         (map-into sorted #'car sorted))))
 
+(declaim (inline schwartzian-stable-sort-vector))
+(defun schwartzian-stable-sort-vector (vector comparator &key key)
+  (if (null key)
+      (stable-sort (copy-seq vector) comparator)
+      (let* ((key (if (functionp key)
+                      key
+                      (symbol-function key)))
+             (wrapped (map 'vector (lambda (x)
+                                     (cons x (funcall key x)))
+                           vector))
+             (sorted (stable-sort wrapped comparator :key #'cdr)))
+        (map-into sorted #'car sorted))))
+
 ;;; Just like WITH-OUTPUT-TO-STRING but doesn't close the stream,
 ;;; producing more compact code.
 (defmacro with-simple-output-to-string
@@ -1724,13 +1619,13 @@ to :INTERPRET, an interpreter will be used.")
      &body body)
   (multiple-value-bind (forms decls) (parse-body body nil)
     (if string
-        `(let ((,var (sb!impl::make-fill-pointer-output-stream ,string)))
+        `(let ((,var (sb-impl::make-fill-pointer-output-stream ,string)))
            ,@decls
            ,@forms)
         `(let ((,var #+sb-xc-host (make-string-output-stream)
-                     #-sb-xc-host (sb!impl::%make-string-output-stream
+                     #-sb-xc-host (sb-impl::%make-string-output-stream
                                    (or #!-sb-unicode 'character :default)
-                                   #'sb!impl::string-ouch)))
+                                   #'sb-impl::string-ouch)))
 
            ,@decls
            ,@forms
@@ -1748,6 +1643,10 @@ to :INTERPRET, an interpreter will be used.")
 (defun self-evaluating-p (x)
   (typecase x
     (null t)
-    (symbol (or (eq x t) (eq (symbol-package x) *keyword-package*)))
+    ;; This looks slighly broken if you intern a random non-constant symbol
+    ;; into the keyword package after uninterning it from its orginal home.
+    (symbol (or (eq x t) (eq (cl:symbol-package x) *keyword-package*)))
     (cons nil)
     (t t)))
+
+(defvar *top-level-form-p* nil)

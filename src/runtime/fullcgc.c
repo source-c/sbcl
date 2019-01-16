@@ -11,10 +11,17 @@
 
 #include "gc.h"
 #include "gc-internal.h"
+#include "gc-private.h"
+#include "gencgc-private.h"
 #include "genesis/gc-tables.h"
 #include "genesis/closure.h"
+#include "genesis/cons.h"
+#include "genesis/instance.h"
+#include "genesis/vector.h"
 #include "genesis/layout.h"
 #include "genesis/hash-table.h"
+#include "code.h"
+#include "immobile-space.h"
 #include "queue.h"
 
 #include <stdio.h>
@@ -35,12 +42,8 @@
 #define BIGNUM_MARK_BIT MARK_BIT
 #endif
 
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
 #define interesting_pointer_p(x) \
-  (find_page_index((void*)x) >= 0 || find_immobile_page_index((void*)x) >= 0)
-#else
-#define interesting_pointer_p(x) (find_page_index((void*)x) >= 0)
-#endif
+  (find_page_index((void*)x) >= 0 || immobile_space_p(x))
 
 #ifdef DEBUG
 #  define dprintf(arg) printf arg
@@ -61,15 +64,16 @@ struct unbounded_queue {
 static page_index_t free_page;
 
 /* The whole-page allocator works backwards from the end of dynamic space.
- * If it collides with 'last_free_page', then you lose. */
+ * If it collides with 'next_free_page', then you lose.
+ * TOOD: It would be reasonably simple to have this request more memory from
+ * the OS instead of failing on overflow */
 static void* get_free_page() {
     --free_page;
-    if (free_page < last_free_page)
+    if (free_page < next_free_page)
         lose("Needed more space to GC\n");
+    page_table[free_page].type = UNBOXED_PAGE_FLAG;
     char* mem = page_address(free_page);
-    if (page_need_to_zero(free_page))
-        memset(mem, 0, GENCGC_CARD_BYTES);
-    set_page_need_to_zero(free_page, 1);
+    zero_dirty_pages(free_page, free_page);
     return mem;
 }
 
@@ -139,7 +143,7 @@ static lispobj gc_dequeue()
 struct hopscotch_table mark_bits;
 
 static inline uword_t compute_page_key(lispobj cons) {
-    return cons & ~(GENCGC_CARD_BYTES - 1);
+    return ALIGN_DOWN(cons, GENCGC_CARD_BYTES);
 }
 static inline int compute_dword_number(lispobj cons) {
     return (cons & (GENCGC_CARD_BYTES - 1)) >> (1+WORD_SHIFT);
@@ -164,12 +168,12 @@ static inline int pointer_survived_gc_yet(lispobj pointer)
 {
     if (!interesting_pointer_p(pointer))
         return 1;
-    if (lowtag_of(pointer) == LIST_POINTER_LOWTAG)
+    if (listp(pointer))
         return cons_markedp(pointer);
     lispobj header = *native_pointer(pointer);
-    if (widetag_of(header) == BIGNUM_WIDETAG)
+    if (header_widetag(header) == BIGNUM_WIDETAG)
         return (header & BIGNUM_MARK_BIT) != 0;
-    if (embedded_obj_p(widetag_of(header)))
+    if (embedded_obj_p(header_widetag(header)))
         header = *fun_code_header(native_pointer(pointer));
     return (header & MARK_BIT) != 0;
 }
@@ -179,14 +183,14 @@ void __mark_obj(lispobj pointer)
     gc_dcheck(is_lisp_pointer(pointer));
     if (!interesting_pointer_p(pointer))
         return;
-    if (lowtag_of(pointer) != LIST_POINTER_LOWTAG) {
+    if (!listp(pointer)) {
         lispobj* base = native_pointer(pointer);
         lispobj header = *base;
-        if (widetag_of(header) == BIGNUM_WIDETAG) {
+        if (header_widetag(header) == BIGNUM_WIDETAG) {
             *base |= BIGNUM_MARK_BIT;
             return; // don't enqueue - no pointers
         } else {
-            if (embedded_obj_p(widetag_of(header))) {
+            if (embedded_obj_p(header_widetag(header))) {
                 base = fun_code_header(base);
                 pointer = make_lispobj(base, OTHER_POINTER_LOWTAG);
                 header = *base;
@@ -200,7 +204,7 @@ void __mark_obj(lispobj pointer)
                 return; // already marked
             *base |= MARK_BIT;
         }
-        if (unboxed_obj_widetag_p(widetag_of(header)))
+        if (unboxed_obj_widetag_p(header_widetag(header)))
             return;
     } else {
         uword_t key = compute_page_key(pointer);
@@ -241,7 +245,7 @@ void gc_mark_range(lispobj* where, long count) {
 static void trace_object(lispobj* where)
 {
     lispobj header = *where;
-    int widetag = widetag_of(header);
+    int widetag = header_widetag(header);
     sword_t scan_from = 1;
     sword_t scan_to = sizetab[widetag](where);
     sword_t i;
@@ -267,27 +271,48 @@ static void trace_object(lispobj* where)
         // mixed boxed/unboxed objects
         bitmap = ((struct layout*)native_pointer(layout))->bitmap;
         // If no raw slots, just scan without use of the bitmap.
+        // A bitmap of -1 implies that not only are all slots tagged,
+        // there is no special GC method for any slot.
         if (bitmap == make_fixnum(-1)) break;
+        // Otherwise, the first slot might merit special treatment.
+        if (*where & CUSTOM_GC_SCAVENGE_FLAG) {
+            struct instance* node = (struct instance*)where;
+            lispobj next = node->slots[INSTANCE_DATA_START];
+            if (fixnump(next) && next) // ignore initially 0 heap words
+                __mark_obj(next|INSTANCE_POINTER_LOWTAG);
+        }
         for(i=1; i<scan_to; ++i)
             if (layout_bitmap_logbitp(i-1, bitmap) && is_lisp_pointer(where[i]))
                 __mark_obj(where[i]);
         return; // do not scan slots
     case SIMPLE_VECTOR_WIDETAG:
-        if ((HeaderValue(header) & 0xFF) != subtype_VectorNormal) {
+        if (is_vector_subtype(header, VectorValidHashing)) {
             lispobj lhash_table = where[2];
             gc_dcheck(is_lisp_pointer(lhash_table));
             __mark_obj(lhash_table);
             struct hash_table* hash_table
               = (struct hash_table *)native_pointer(lhash_table);
-            if (!hash_table->_weakness) {
-                scav_hash_table_entries(hash_table, alivep_funs, mark_pair);
+            if (!hashtable_weakp(hash_table)) {
+                scav_hash_table_entries(hash_table, 0, mark_pair);
             } else {
                 // An object can only be removed from the queue once.
                 // Therefore the 'next' pointer has got to be nil.
                 gc_assert(hash_table->next_weak_hash_table == NIL);
-                hash_table->next_weak_hash_table = (lispobj)weak_hash_tables;
-                weak_hash_tables = hash_table;
+                int weakness = hashtable_weakness(hash_table);
+                boolean defer = 1;
+                if (weakness != WEAKNESS_KEY_AND_VALUE)
+                    defer = scav_hash_table_entries(hash_table,
+                                                    alivep_funs[weakness],
+                                                    mark_pair);
+                if (defer) {
+                    hash_table->next_weak_hash_table = (lispobj)weak_hash_tables;
+                    weak_hash_tables = hash_table;
+                }
             }
+            return;
+        }
+        if (is_vector_subtype(header, VectorWeak)) {
+            add_to_weak_vector_list(where, header);
             return;
         }
         break;
@@ -304,7 +329,7 @@ static void trace_object(lispobj* where)
             gc_mark_range(SIMPLE_FUN_SCAV_START(fun),
                           SIMPLE_FUN_SCAV_NWORDS(fun));
         })
-        scan_to = code_header_words(header);
+        scan_to = code_header_words((struct code*)where);
         break;
     case FDEFN_WIDETAG:
         gc_mark_obj(fdefn_callee_lispobj((struct fdefn*)where));
@@ -313,7 +338,7 @@ static void trace_object(lispobj* where)
     case WEAK_POINTER_WIDETAG:
         weakptr = (struct weak_pointer*)where;
         if (is_lisp_pointer(weakptr->value) && interesting_pointer_p(weakptr->value))
-            add_to_weak_pointer_list(weakptr);
+            add_to_weak_pointer_chain(weakptr);
         return;
     default:
         if (unboxed_obj_widetag_p(widetag)) return;
@@ -355,53 +380,61 @@ void execute_full_mark_phase()
     while (where < end) {
         lispobj obj = compute_lispobj(where);
         gc_enqueue(obj);
-        where += lowtag_of(obj) != LIST_POINTER_LOWTAG
-                   ? sizetab[widetag_of(*where)](where) : 2;
+        where += listp(obj) ? 2 : sizetab[widetag_of(where)](where);
     }
- again:
-    while (scav_queue.head_block->count) {
+    do {
         lispobj ptr = gc_dequeue();
         gc_dcheck(ptr != 0);
-        if (lowtag_of(ptr) != LIST_POINTER_LOWTAG)
+        if (!listp(ptr))
             trace_object(native_pointer(ptr));
         else
             mark_pair((lispobj*)(ptr - LIST_POINTER_LOWTAG));
-    }
-    if (weak_hash_tables) {
-        scav_weak_hash_tables(alivep_funs, mark_pair);
-        if (scav_queue.head_block->count) {
-            dprintf(("looping due to weak objects\n"));
-            goto again;
-        }
-    }
+    } while (scav_queue.head_block->count ||
+             (test_weak_triggers(pointer_survived_gc_yet, gc_mark_obj) &&
+              scav_queue.head_block->count));
+    gc_dispose_private_pages();
 #if HAVE_GETRUSAGE
     getrusage(RUSAGE_SELF, &after);
 #define timediff(b,a,field) \
     (double)((a.field.tv_sec-b.field.tv_sec)*1000000 + \
              (a.field.tv_usec-b.field.tv_usec)) / 1000000.0
-    fprintf(stderr,
-            "[Mark phase: %d pages used, HT-count=%d, ET=%f+%f sys+usr]\n",
-            (int)(page_table_pages - free_page), mark_bits.count,
-            timediff(before, after, ru_stime), timediff(before, after, ru_utime));
+    if (gencgc_verbose)
+        fprintf(stderr,
+                "[Mark phase: %d pages used, HT-count=%d, ET=%f+%f sys+usr]\n",
+                (int)(page_table_pages - free_page), mark_bits.count,
+                timediff(before, after, ru_stime), timediff(before, after, ru_utime));
 #endif
 }
 
 static void smash_weak_pointers()
 {
     struct weak_pointer *wp, *next_wp;
-    for (wp = weak_pointers, next_wp = NULL; wp != NULL; wp = next_wp) {
-        gc_assert(widetag_of(wp->header)==WEAK_POINTER_WIDETAG);
-
+    for (wp = weak_pointer_chain; wp != WEAK_POINTER_CHAIN_END; wp = next_wp) {
+        gc_assert(widetag_of(&wp->header) == WEAK_POINTER_WIDETAG);
         next_wp = wp->next;
         wp->next = NULL;
-        if (next_wp == wp) /* gencgc uses a ref to self for end of list */
-            next_wp = NULL;
-
         lispobj pointee = wp->value;
         gc_assert(is_lisp_pointer(pointee));
         if (!pointer_survived_gc_yet(pointee))
             wp->value = UNBOUND_MARKER_WIDETAG;
     }
+    weak_pointer_chain = WEAK_POINTER_CHAIN_END;
+
+    struct cons* vectors = weak_vectors;
+    while (vectors) {
+        struct vector* vector = (struct vector*)vectors->car;
+        vectors = (struct cons*)vectors->cdr;
+        UNSET_WEAK_VECTOR_VISITED(vector);
+        sword_t len = fixnum_value(vector->length);
+        sword_t i;
+        for (i = 0; i<len; ++i) {
+            lispobj obj = vector->data[i];
+            // Ignore non-pointers
+            if (is_lisp_pointer(obj) && !pointer_survived_gc_yet(obj))
+                vector->data[i] = NIL;
+        }
+    }
+    weak_vectors = 0;
 }
 
 __attribute__((unused)) static char *fillerp(lispobj* where)
@@ -409,23 +442,21 @@ __attribute__((unused)) static char *fillerp(lispobj* where)
     page_index_t page;
     if (where[0] | where[1])
         return "cons";
-    if ((page = find_page_index(where)) >= 0 && page_table[page].large_object)
+    if ((page = find_page_index(where)) >= 0 && page_single_obj_p(page))
         return "cons (largeobj filler)";
     return "cons (filler)";
 }
 
-FILE *sweeplog;
+static FILE *sweeplog;
+static int sweep_mode = 1;
 
-#ifdef LOG_SWEEP_ACTIONS
-# define NOTE_GARBAGE(gen,addr,nwords,tally) \
+# define NOTE_GARBAGE(gen,addr,nwords,tally,erase) \
   { tally[gen] += nwords; \
-    if (sweeplog) \
+    if (sweep_mode & 2) /* print before erasing */ \
      fprintf(sweeplog, "%5d %d #x%"OBJ_FMTX": %"OBJ_FMTX" %"OBJ_FMTX"\n", \
              (int)nwords, gen, compute_lispobj(addr), \
-             addr[0], addr[1]); }
-#else
-# define NOTE_GARBAGE(gen,addr,nwords,tally) tally[gen] += nwords
-#endif
+             addr[0], addr[1]); \
+    if (sweep_mode & 1) { erase; } }
 
 #ifndef LISP_FEATURE_IMMOBILE_SPACE
 #define __immobile_obj_gen_bits(x) (lose("No page index?"),0)
@@ -434,24 +465,23 @@ static void sweep_fixedobj_pages(long *zeroed)
 {
     low_page_index_t page;
 
-    for (page = find_immobile_page_index((void*)(immobile_fixedobj_free_pointer-1));
-         page >= 0;
-         --page) {
+    for (page = 0 ; ; ++page) {
+        lispobj *obj = fixedobj_page_address(page);
+        if (obj >= fixedobj_free_pointer)
+            break;
         int obj_spacing = fixedobj_page_obj_align(page);
         if (!obj_spacing)
             continue;
-        char *page_base = (char*)IMMOBILE_SPACE_START + page * IMMOBILE_CARD_BYTES;
         int nwords = fixedobj_page_obj_size(page);
-        lispobj *obj = (lispobj*)page_base;
-        lispobj *limit = (lispobj*)(page_base + IMMOBILE_CARD_BYTES - obj_spacing);
+        lispobj *limit = (lispobj*)((char*)obj + IMMOBILE_CARD_BYTES - obj_spacing);
         for ( ; obj <= limit ; obj = (lispobj*)((char*)obj + obj_spacing) ) {
             lispobj header = *obj;
             if (fixnump(header)) { // is a hole
             } else if (header & MARK_BIT) { // live object
                 *obj = header ^ MARK_BIT;
             } else {
-                NOTE_GARBAGE(__immobile_obj_gen_bits(obj), obj, nwords, zeroed);
-                memset(obj, 0, nwords * N_WORD_BYTES);
+                NOTE_GARBAGE(__immobile_obj_gen_bits(obj), obj, nwords, zeroed,
+                             memset(obj, 0, nwords * N_WORD_BYTES));
             }
         }
     }
@@ -473,14 +503,14 @@ static uword_t sweep(lispobj* where, lispobj* end, uword_t arg)
                cons:
                     gc_dcheck(!immobile_space_p((lispobj)where));
                     NOTE_GARBAGE(page_table[find_page_index(where)].gen,
-                                 where, 2, zeroed);
-                    where[0] = where[1] = 0;
+                                 where, 2, zeroed,
+                                 where[0] = where[1] = 0);
                 }
             }
         } else {
-            nwords = sizetab[widetag_of(header)](where);
+            nwords = sizetab[header_widetag(header)](where);
             lispobj markbit =
-              widetag_of(header) != BIGNUM_WIDETAG ? MARK_BIT : BIGNUM_MARK_BIT;
+              header_widetag(header) != BIGNUM_WIDETAG ? MARK_BIT : BIGNUM_MARK_BIT;
             if (header & markbit)
                 *where = header ^ markbit;
             else {
@@ -489,15 +519,17 @@ static uword_t sweep(lispobj* where, lispobj* end, uword_t arg)
                 if (nwords <= 2) // could be SAP, SIMPLE-ARRAY-NIL, 1-word bignum, etc
                     goto cons;
                 struct code* code  = (struct code*)where;
-                lispobj header = 2<<N_WIDETAG_BITS | CODE_HEADER_WIDETAG;
-                if (code->header != header) {
+                // Keep in sync with the definition of filler_obj_p()
+                if (!filler_obj_p((lispobj*)code)) {
                     page_index_t page = find_page_index(where);
                     int gen = page >= 0 ? page_table[page].gen
                       : __immobile_obj_gen_bits(where);
-                    NOTE_GARBAGE(gen, where, nwords, zeroed);
-                    code->header = header;
-                    code->code_size = make_fixnum((nwords - 2) * N_WORD_BYTES);
-                    memset(where+2, 0, (nwords - 2) * N_WORD_BYTES);
+                    NOTE_GARBAGE(gen, where, nwords, zeroed, {
+                        code->boxed_size = 0;
+                        code->header = (nwords << CODE_HEADER_SIZE_SHIFT)
+                                     | CODE_HEADER_WIDETAG;
+                        memset(where+2, 0, (nwords - 2) * N_WORD_BYTES);
+                    })
                 }
             }
         }
@@ -505,35 +537,66 @@ static uword_t sweep(lispobj* where, lispobj* end, uword_t arg)
     return 0;
 }
 
+// sweep_mode: 1 = erase, 2 = print, 3 = both
+void toggle_print_garbage(char *filename, int enable)
+{
+    if (enable) {
+        if (sweeplog) {
+          fprintf(stderr,"Erasing previous sweep log file\n");
+          fclose(sweeplog);
+        }
+        sweeplog = fopen(filename, "w");
+        sweep_mode = enable < 0 ? 2 : 3;
+        fprintf(stderr, "Set sweep mode to %d\n", sweep_mode);
+    } else {
+        fclose(sweeplog);
+        fprintf(stderr, "Sweep log closed\n");
+        sweep_mode = 1;
+    }
+}
+
 void execute_full_sweep_phase()
 {
     long words_zeroed[1+PSEUDO_STATIC_GENERATION]; // One count per generation
 
-    scan_weak_hash_tables(alivep_funs);
+    cull_weak_hash_tables(alivep_funs);
     smash_weak_pointers();
-
-#ifdef LOG_SWEEP_ACTIONS
-    sweeplog = fopen("/tmp/sweep.log", "a");
-    fprintf(sweeplog, "-- begin sweep --\n");
-#endif
 
     memset(words_zeroed, 0, sizeof words_zeroed);
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
+    if (sweeplog) fprintf(sweeplog, "-- fixedobj space --\n");
     sweep_fixedobj_pages(words_zeroed);
-    if (sweeplog) fprintf(sweeplog, "-- varyobj pages --\n");
-    sweep((lispobj*)IMMOBILE_VARYOBJ_SUBSPACE_START, immobile_space_free_pointer,
+    if (sweeplog) fprintf(sweeplog, "-- varyobj space --\n");
+    sweep((lispobj*)VARYOBJ_SPACE_START, varyobj_free_pointer,
           (uword_t)words_zeroed);
 #endif
     if (sweeplog) fprintf(sweeplog, "-- dynamic space --\n");
     walk_generation(sweep, -1, (uword_t)words_zeroed);
-    fprintf(stderr, "[Sweep phase: ");
-    int i;
-    for(i=6;i>=0;--i)
-        fprintf(stderr, "%ld%s", words_zeroed[i], i?"+":"");
-    fprintf(stderr, " words zeroed]\n");
+    if (gencgc_verbose) {
+        fprintf(stderr, "[Sweep phase: ");
+        int i;
+        for(i=6;i>=0;--i)
+            fprintf(stderr, "%ld%s", words_zeroed[i], i?"+":"");
+        fprintf(stderr, " words zeroed]\n");
+    }
     hopscotch_destroy(&mark_bits);
-#ifdef LOG_SWEEP_ACTIONS
-    fclose(sweeplog);
-    sweeplog = 0;
-#endif
+    if (sweeplog)
+        fflush(sweeplog);
+
+    page_index_t first_page, last_page;
+    for (first_page = 0; first_page < next_free_page; ++first_page)
+        if (page_table[first_page].write_protected
+            && protection_mode(first_page) == PHYSICAL) {
+            last_page = first_page;
+            while (page_table[last_page+1].write_protected
+                   && protection_mode(last_page+1) == PHYSICAL)
+                ++last_page;
+            os_protect(page_address(first_page),
+                       (last_page - first_page + 1) * GENCGC_CARD_BYTES,
+                       OS_VM_PROT_READ | OS_VM_PROT_EXECUTE);
+            first_page = last_page;
+        }
+    while (free_page < page_table_pages) {
+        page_table[free_page++].type = FREE_PAGE_FLAG;
+    }
 }

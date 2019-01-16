@@ -12,6 +12,7 @@
 .gdb_history
 output
 obj
+build-features.lisp-expr
 local-target-features.lisp-expr
 customize-target-features.*
 customize-backend-subfeatures.*
@@ -36,6 +37,7 @@ src/runtime/target-os.h
 src/runtime/ppc-linux-mcontext.h
 src/runtime/sparc-funcdef.h
 tests/test-status.lisp-expr
+tests/test.log
 tests/*.so
 tests/run-tests-*
 tests/last-random-state.lisp-expr

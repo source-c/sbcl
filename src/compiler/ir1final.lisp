@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;; Give the user grief about optimizations that we weren't able to
 ;;; do. It is assumed that the user wants to hear about this, or there
@@ -60,7 +60,8 @@
          (defined-ftype (definition-type leaf)))
     (setf (leaf-type leaf) defined-ftype)
     (when (and (leaf-has-source-name-p leaf)
-               (eq (leaf-source-name leaf) (functional-debug-name leaf)))
+               (eq (leaf-source-name leaf) (functional-debug-name leaf))
+               (functional-top-level-defun-p leaf))
       (let ((source-name (leaf-source-name leaf)))
         (let* ((where (info :function :where-from source-name))
                (*compiler-error-context* (lambda-bind (main-entry leaf)))
@@ -88,9 +89,9 @@
                          defined-ftype declared-ftype)
                  (compiler-style-warn
                   "~@<The previously declared FTYPE~
-                   ~2I ~_~/sb!impl:print-type/~I ~_~
+                   ~2I ~_~/sb-impl:print-type/~I ~_~
                    conflicts with the definition type ~
-                   ~2I~_~/sb!impl:print-type/~:>"
+                   ~2I~_~/sb-impl:print-type/~:>"
                   declared-ftype defined-ftype))))
             (:defined
              (setf (info :function :type source-name) defined-ftype)))))))
@@ -118,11 +119,11 @@
 ;;; Merge CASTs with preceding/following nodes.
 (defun ir1-merge-casts (component)
   (do-blocks-backwards (block component)
-    (do-nodes-backwards (node lvar block)
+    (do-nodes-backwards (node lvar block :restart-p t)
       (let ((dest (when lvar (lvar-dest lvar))))
         (cond ((and (cast-p dest)
                     (not (cast-type-check dest))
-                    (immediately-used-p lvar node))
+                    (almost-immediately-used-p lvar node))
                (let ((dtype (node-derived-type node))
                      (atype (node-derived-type dest)))
                  (when (values-types-equal-or-intersect
@@ -174,21 +175,22 @@
       (string-not-greaterp two-arg-string-not-greaterp)
       (string-not-equal two-arg-string-not-equal)))
 
-(defmacro def-two-arg-fun (function)
+(defmacro def-two-arg-fun (types function)
   (let ((name (symbolicate 'two-arg- function)))
     `(progn
-       (defknown ,name (t t) t ())
+       (defknown ,name ,types boolean ())
        (defun ,name (a b)
          (,function a b))
        (pushnew (list ',function ',name) *two-arg-functions* :key #'car))))
 
-(defmacro def-two-arg-funs (&body functions)
+(defmacro def-two-arg-funs (types &body functions)
   `(progn
      ,@(loop for fun in functions
-             collect `(def-two-arg-fun ,fun))))
+             collect `(def-two-arg-fun ,types ,fun))))
 
-(def-two-arg-funs
-  char= char/= char< char> char<= char>=
+(def-two-arg-funs (character character)
+  char= char/= char< char> char<= char>=)
+(def-two-arg-funs (number number)
   >= <= /=)
 
 ;;; Convert function designators to functions in calls to known functions
@@ -198,41 +200,51 @@
     (do-nodes (node nil block)
       (when (and (combination-p node)
                  (eq (combination-kind node) :known))
-        (let ((comination-name (lvar-fun-name (combination-fun node) t)))
+        (let ((combination-name (lvar-fun-name (combination-fun node) t)))
           (map-callable-arguments
-           (lambda (lvar &key arg-count no-function-conversion &allow-other-keys)
-             ;; TODO: handle CASTS.
-             ;; principal-lvar-use will return the REF but the
-             ;; CAST itself needs to be replaced.
+           (lambda (lvar args results &key no-function-conversion &allow-other-keys)
+             (declare (ignore results))
              (unless no-function-conversion
-               (let ((ref (lvar-uses lvar)))
-                 (when (ref-p ref)
-                   (flet ((translate-two-args (name)
+               (let ((ref (lvar-uses lvar))
+                     (arg-count (length args)))
+                 (labels ((translate-two-args (name)
                             (and (eql arg-count 2)
-                                 (neq comination-name 'reduce)
-                                 (cadr (assoc name *two-arg-functions*)))))
-                     (let* ((leaf (ref-leaf ref))
-                            (fun-name (and (constant-p leaf)
-                                           (constant-value leaf)))
-                            (replacement
-                              (cond ((and fun-name
-                                          (symbolp fun-name))
-                                     (or (translate-two-args fun-name)
-                                         fun-name))
-                                    ((and (global-var-p leaf)
-                                          (eq (global-var-kind leaf) :global-function))
-                                     (translate-two-args (global-var-%source-name leaf))))))
-                       (when replacement
-                         (change-ref-leaf
-                          ref
-                          (let ((*compiler-error-context* node))
-                            (find-free-fun replacement "ir1-finalize"))))))))))
+                                 (neq combination-name 'reduce)
+                                 (cadr (assoc name *two-arg-functions*))))
+                          (translate (ref)
+                            (let* ((leaf (ref-leaf ref))
+                                   (fun-name (and (constant-p leaf)
+                                                  (constant-value leaf)))
+                                   (replacement
+                                     (cond ((and fun-name
+                                                 (symbolp fun-name))
+                                            (or (translate-two-args fun-name)
+                                                fun-name))
+                                           ((and (global-var-p leaf)
+                                                 (eq (global-var-kind leaf) :global-function))
+                                            (translate-two-args (global-var-%source-name leaf)))))
+                                   (*compiler-error-context* node))
+                              (and replacement
+                                   (find-free-fun replacement "ir1-finalize")))))
+                   (cond ((ref-p ref)
+                          (let ((replacement (translate ref)))
+                            (when replacement
+                              (change-ref-leaf ref replacement))))
+                         ((cast-p ref)
+                          (let* ((cast ref)
+                                 (ref (lvar-uses (cast-value cast))))
+                            (when (ref-p ref)
+                              (let ((replacement (translate ref)))
+                                (when replacement
+                                  (change-ref-leaf ref replacement :recklessly t)
+                                  (setf (node-derived-type cast)
+                                        (lvar-derived-type (cast-value cast)))))))))))))
            node))))))
 
 (defun rewrite-full-call (combination)
-  (let ((comination-name (lvar-fun-name (combination-fun combination) t))
+  (let ((combination-name (lvar-fun-name (combination-fun combination) t))
         (args (combination-args combination)))
-    (let ((two-arg (cadr (assoc comination-name *two-arg-functions*)))
+    (let ((two-arg (cadr (assoc combination-name *two-arg-functions*)))
           (ref (lvar-uses (combination-fun combination))))
       (when (and two-arg
                  (ref-p ref)

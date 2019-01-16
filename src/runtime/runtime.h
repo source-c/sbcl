@@ -25,6 +25,7 @@
 #endif
 
 #include <stdint.h>
+#include <inttypes.h>
 
 #if defined(LISP_FEATURE_SB_THREAD)
 #define thread_self() pthread_self()
@@ -46,10 +47,6 @@
 #define thread_mutex_unlock(l) 0
 #endif
 
-#if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
-void os_preinit();
-#endif
-
 void os_link_runtime();
 
 #if defined(LISP_FEATURE_SB_SAFEPOINT)
@@ -67,10 +64,14 @@ typedef enum {
 
 void map_gc_page();
 void unmap_gc_page();
-int check_pending_interrupts();
 void gc_state_lock();
 void gc_state_wait(gc_phase_t);
+int gc_cycle_active(void);
 void gc_state_unlock();
+
+#define WITH_GC_STATE_LOCK \
+    gc_state_lock(); \
+    RUN_BODY_ONCE(gc_state_lock, gc_state_unlock())
 
 #endif
 
@@ -244,7 +245,7 @@ typedef s32 sword_t;
    alpha64 has arrived, all this nastiness can go away */
 #if 64 == N_WORD_BITS
 #define LOW_WORD(c) ((uintptr_t)c)
-#define OBJ_FMTX "lx"
+#define OBJ_FMTX PRIxPTR
 typedef uintptr_t lispobj;
 #else
 #define OBJ_FMTX "x"
@@ -260,7 +261,16 @@ lowtag_of(lispobj obj)
 }
 
 static inline int
-widetag_of(lispobj obj)
+widetag_of(lispobj* obj)
+{
+#ifdef LISP_FEATURE_LITTLE_ENDIAN
+    return *(unsigned char*)obj;
+#else
+    return *obj & WIDETAG_MASK;
+#endif
+}
+static inline int
+header_widetag(lispobj obj)
 {
     return obj & WIDETAG_MASK;
 }
@@ -271,15 +281,25 @@ HeaderValue(lispobj obj)
   return obj >> N_WIDETAG_BITS;
 }
 
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-#define HEADER_VALUE_MASKED(x) (HeaderValue(x) & SHORT_HEADER_MAX_WORDS)
-#else
-#define HEADER_VALUE_MASKED(x) HeaderValue(x)
-#endif
+static inline int listp(lispobj obj) {
+    return lowtag_of(obj) == LIST_POINTER_LOWTAG;
+}
+static inline int instancep(lispobj obj) {
+    return lowtag_of(obj) == INSTANCE_POINTER_LOWTAG;
+}
+static inline int functionp(lispobj obj) {
+    return lowtag_of(obj) == FUN_POINTER_LOWTAG;
+}
+static inline int simple_vector_p(lispobj obj) {
+    return lowtag_of(obj) == OTHER_POINTER_LOWTAG &&
+           widetag_of((lispobj*)(obj-OTHER_POINTER_LOWTAG)) == SIMPLE_VECTOR_WIDETAG;
+}
+
 static inline uword_t instance_length(lispobj header)
 {
-  return HEADER_VALUE_MASKED(header);
+  return HeaderValue(header) & SHORT_HEADER_MAX_WORDS;
 }
+
 /* Define an assignable instance_layout() macro taking a native pointer */
 #ifndef LISP_FEATURE_COMPACT_INSTANCE_HEADER
 # define instance_layout(instance_ptr) (instance_ptr)[1]
@@ -309,12 +329,13 @@ is_lisp_pointer(lispobj obj)
 static inline int
 is_lisp_immediate(lispobj obj)
 {
+    int widetag;
     return (fixnump(obj)
-            || (widetag_of(obj) == CHARACTER_WIDETAG)
+            || ((widetag = header_widetag(obj)) == CHARACTER_WIDETAG)
 #if N_WORD_BITS == 64
-            || (widetag_of(obj) == SINGLE_FLOAT_WIDETAG)
+            || (widetag == SINGLE_FLOAT_WIDETAG)
 #endif
-            || (widetag_of(obj) == UNBOUND_MARKER_WIDETAG));
+            || (widetag == UNBOUND_MARKER_WIDETAG));
 }
 
 /* Convert from a lispobj with type bits to a native (ordinary
@@ -335,7 +356,7 @@ make_lispobj(void *o, int low_tag)
 
 #define MAKE_FIXNUM(n) (n << N_FIXNUM_TAG_BITS)
 static inline lispobj
-make_fixnum(sword_t n)
+make_fixnum(uword_t n) // '<<' on negatives is _technically_ undefined behavior
 {
     return MAKE_FIXNUM(n);
 }
@@ -343,24 +364,10 @@ make_fixnum(sword_t n)
 static inline sword_t
 fixnum_value(lispobj n)
 {
-    return n >> N_FIXNUM_TAG_BITS;
+    return (sword_t)n >> N_FIXNUM_TAG_BITS;
 }
 
-static inline uword_t
-code_header_words(lispobj header) // given header = code->header
-{
-  return HeaderValue(header) & SHORT_HEADER_MAX_WORDS;
-}
-
-static inline sword_t
-code_instruction_words(lispobj n) // given n = code->code_size
-{
-    /* Convert bytes into words, double-word aligned. */
-    sword_t x = ((n >> N_FIXNUM_TAG_BITS) + LOWTAG_MASK) & ~LOWTAG_MASK;
-
-    return x >> WORD_SHIFT;
-}
-#undef HEADER_VALUE_MASKED
+#include "align.h"
 
 #if defined(LISP_FEATURE_WIN32)
 /* KLUDGE: Avoid double definition of boolean by rpcndr.h included via
@@ -392,12 +399,12 @@ is_cons_half(lispobj obj)
      * other_immediate and are Lisp immediates can be half of a cons */
     return !other_immediate_lowtag_p(obj)
 #if N_WORD_BITS == 64
-        || ((uword_t)IMMEDIATE_WIDETAGS_MASK >> (widetag_of(obj) >> 2)) & 1;
+        || ((uword_t)IMMEDIATE_WIDETAGS_MASK >> (header_widetag(obj) >> 2)) & 1;
 #else
       /* The above bit-shifting approach is not applicable
        * since we can't employ a 64-bit unsigned integer constant. */
-      || widetag_of(obj) == CHARACTER_WIDETAG
-      || widetag_of(obj) == UNBOUND_MARKER_WIDETAG;
+      || header_widetag(obj) == CHARACTER_WIDETAG
+      || header_widetag(obj) == UNBOUND_MARKER_WIDETAG;
 #endif
 }
 
@@ -433,6 +440,8 @@ extern char *copied_string (char *string);
  * the naive way: */
 #if defined(LISP_FEATURE_GENCGC) && !defined(LISP_FEATURE_C_STACK_IS_CONTROL_STACK)
 # define GENCGC_IS_PRECISE 1
+#else
+# define GENCGC_IS_PRECISE 0
 #endif
 
 void *os_dlsym_default(char *name);
@@ -440,6 +449,7 @@ void *os_dlsym_default(char *name);
 struct lisp_startup_options {
     boolean noinform;
 };
+extern struct lisp_startup_options lisp_startup_options;
 
 /* Even with just -O1, gcc optimizes the jumps in this "loop" away
  * entirely, giving the ability to define WITH-FOO-style macros. */
@@ -455,6 +465,18 @@ struct lisp_startup_options {
       (__extension__ ({ __typeof__ (x) __x = (x); (void) __x; }))
 #else
 # define ignore_value(x) ((void) (x))
+#endif
+
+#if defined(__GNUC__) && defined(ADDRESS_SANITIZER)
+#define NO_SANITIZE_ADDRESS __attribute__((no_sanitize_address))
+#else
+#define NO_SANITIZE_ADDRESS
+#endif
+
+#if defined(__GNUC__) && defined(MEMORY_SANITIZER)
+#define NO_SANITIZE_MEMORY __attribute__((no_sanitize_memory))
+#else
+#define NO_SANITIZE_MEMORY
 #endif
 
 #endif /* _SBCL_RUNTIME_H_ */

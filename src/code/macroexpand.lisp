@@ -9,16 +9,16 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 ;;;; syntactic environment access
 
-(defun sb!xc:special-operator-p (symbol)
+(defun sb-xc:special-operator-p (symbol)
   "If the symbol globally names a special form, return T, otherwise NIL."
   (declare (symbol symbol))
   (eq (info :function :kind symbol) :special-form))
 
-(defvar sb!xc:*macroexpand-hook* 'funcall
+(defvar sb-xc:*macroexpand-hook* 'funcall
   "The value of this variable must be a designator for a function that can
   take three arguments, a macro expander function, the macro form to be
   expanded, and the lexical environment to expand in. The function should
@@ -32,7 +32,7 @@
 ;;; Something insane like a generic function with an interpreted method
 ;;; on CONS would appear to be a compiled-function. Nothing can prevent that,
 ;;; but hopefully this wrapper protects against reasonable mistakes.
-(defun valid-macroexpand-hook (&optional (hook sb!xc:*macroexpand-hook*))
+(defun valid-macroexpand-hook (&optional (hook sb-xc:*macroexpand-hook*))
   (when (eq hook 'funcall)
     (return-from valid-macroexpand-hook #'funcall))
   ;; If you mistakenly bind the hook to a un-fboundp symbol (esp. NIL),
@@ -41,11 +41,8 @@
   (let ((fun (if (functionp hook)
                  hook
                  ;; We need to get the function named by the designator.
-                 ;; The type proclamation in 'cl-specials' seems to think
-                 ;; that SETF functions are permitted here, though that
-                 ;; really seems like a bug. If it is permitted,
-                 ;; we can't use SYMBOL-FUNCTION. But using FDEFINITION
-                 ;; would strip encapsulations, so use %COERCE-NAME-TO-FUN.
+                 ;; Use %COERCE-NAME-TO-FUN instead of FDEFINITION here
+                 ;; to avoid stripping off an encapsulation.
                  ;; (This allows tracing the macroexpand-hook, e.g.)
                  (and (fboundp hook)
                       #+sb-xc-host (fdefinition hook)
@@ -58,11 +55,11 @@
     ;;   technique, as it would call COMPILE once per macro usage.
     (if (compiled-function-p fun)
         fun
-        (error 'sb!kernel::macroexpand-hook-type-error
+        (error 'sb-kernel::macroexpand-hook-type-error
                :datum hook
                :expected-type 'compiled-function))))
 
-(defun sb!xc:macroexpand-1 (form &optional env)
+(defun sb-xc:macroexpand-1 (form &optional env)
   "If form is a macro (or symbol macro), expand it once. Return two values,
    the expanded form and a T-or-NIL flag indicating whether the form was, in
    fact, a macro. ENV is the lexical environment to expand in, which defaults
@@ -87,15 +84,15 @@
              (typecase env
                (null (global-expansion))
                #!+(and sb-fasteval (host-feature sb-xc))
-               (sb!interpreter:basic-env
+               (sb-interpreter:basic-env
                 (multiple-value-bind (cell kind frame-ptr def)
-                    (sb!interpreter:find-lexical-var env sym)
+                    (sb-interpreter:find-lexical-var env sym)
                   (declare (ignore cell frame-ptr))
                   (cond ((eq kind :macro) (values def t))
                         ((null kind) (global-expansion))
                         (t (values nil nil)))))
                (lexenv
-                (let ((def (cdr (assoc sym (sb!c::lexenv-vars env)))))
+                (let ((def (cdr (assoc sym (sb-c::lexenv-vars env)))))
                   (cond ((null def) (global-expansion))
                         ((listp def) (values (cdr def) t))
                         (t (values nil nil)))))))))
@@ -108,19 +105,19 @@
                   (values form nil))))
            ((and (listp form)
                  (let ((fn (car form)))
-                   (and (symbolp fn) (sb!xc:macro-function fn env))))
+                   (and (symbolp fn) (sb-xc:macro-function fn env))))
             (perform-expansion it))
            (t
             (values form nil)))))
 
-(defun sb!xc:macroexpand (form &optional env)
+(defun sb-xc:macroexpand (form &optional env)
   "Repetitively call MACROEXPAND-1 until the form can no longer be expanded.
    Returns the final resultant form, and T if it was expanded. ENV is the
    lexical environment to expand in, or NIL (the default) for the null
    environment."
   (labels ((frob (form expanded)
              (multiple-value-bind (new-form newly-expanded-p)
-                 (sb!xc:macroexpand-1 form env)
+                 (sb-xc:macroexpand-1 form env)
                (if newly-expanded-p
                    (frob new-form t)
                    (values new-form expanded)))))
@@ -130,8 +127,8 @@
 (defun %macroexpand-1 (form &optional env)
   (if (or (atom form)
           (let ((op (car form)))
-            (not (and (symbolp op) (sb!xc:special-operator-p op)))))
-      (sb!xc:macroexpand-1 form env)
+            (not (and (symbolp op) (sb-xc:special-operator-p op)))))
+      (sb-xc:macroexpand-1 form env)
       (values form nil)))
 
 ;;; Like MACROEXPAND, but takes care not to expand special forms.

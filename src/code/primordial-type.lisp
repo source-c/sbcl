@@ -7,7 +7,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!KERNEL")
+(in-package "SB-KERNEL")
 
 (!begin-collecting-cold-init-forms)
 
@@ -17,12 +17,17 @@
             `(progn
                #+sb-xc-host
                (progn (defvar ,global-sym
-                        (mark-ctype-interned (make-named-type :name ',type)))
+                        (!make-named-type (interned-type-hash ',type 'named
+                                             ,(case type
+                                                ((nil t)
+                                                 `(sb-vm::saetp-index-or-lose ',type))
+                                                (* 31)))
+                                          ',type))
                       ;; Make it known as a constant in the cross-compiler.
                       (setf (info :variable :kind ',global-sym) :constant))
                (!cold-init-forms
-                #+sb-xc (sb!c::%defconstant ',global-sym ,global-sym
-                                            (sb!c::source-location))
+                #+sb-xc (sb-c::%defconstant ',global-sym ,global-sym
+                                            (sb-c::source-location))
                 (setf (info :type :builtin ',type) ,global-sym
                       (info :type :kind ',type) :primitive)))))
    ;; KLUDGE: In ANSI, * isn't really the name of a type, it's just a
@@ -53,3 +58,28 @@
 (declaim (type simple-vector **built-in-class-codes**))
 
 (!defun-from-collected-cold-init-forms !primordial-type-cold-init)
+
+;;; A HAIRY-TYPE represents anything too weird to be described
+;;; reasonably or to be useful, such as NOT, SATISFIES, unknown types,
+;;; and unreasonably complicated types involving AND. We just remember
+;;; the original type spec.
+;;; A possible improvement would be for HAIRY-TYPE to have a subtype
+;;; named SATISFIES-TYPE for the hairy types which are specifically
+;;; of the form (SATISFIES pred) so that we don't have to examine
+;;; the sexpr repeatedly to decide whether it takes that form.
+;;; And as a further improvement, we might want a table that maps
+;;; predicates to their exactly recognized type when possible.
+;;; We have such a table in fact - *BACKEND-PREDICATE-TYPES*
+;;; as a starting point. But something like PLUSP isn't in there.
+;;; On the other hand, either of these points may not be sources of
+;;; inefficiency, and the latter if implemented might have undesirable
+;;; user-visible ramifications, though it seems unlikely.
+(defstruct (hairy-type (:include ctype
+                        (class-info (type-class-or-lose 'hairy)))
+                       (:constructor %make-hairy-type (specifier))
+                       (:constructor !make-interned-hairy-type
+                           (specifier &aux (hash-value (interned-type-hash))))
+                       (:copier nil)
+                       #!+cmu (:pure nil))
+  ;; the Common Lisp type-specifier of the type we represent
+  (specifier nil :type t :read-only t))

@@ -10,51 +10,77 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
-(defun symbol-slot-addr (symbol slot)
-  (make-ea :qword :disp
-           (let ((offset (- (* slot n-word-bytes) other-pointer-lowtag)))
+(defun symbol-slot-ea (symbol slot)
+  (ea (let ((offset (- (* slot n-word-bytes) other-pointer-lowtag)))
              (if (static-symbol-p symbol)
                  (+ nil-value (static-symbol-offset symbol) offset)
                  (make-fixup symbol :immobile-object offset)))))
 
+(defun gen-cell-set (ea value result &optional vop pseudo-atomic)
+  (when pseudo-atomic
+    ;; (SETF %FUNCALLABLE-INSTANCE-FUN) and (SETF %FUNCALLABLE-INSTANCE-INFO)
+    ;; pass in pseudo-atomic = T.
+    (pseudo-atomic ()
+     (inst push (ea-base ea))
+     (invoke-asm-routine 'call 'touch-gc-card vop)
+     (gen-cell-set ea value result))
+    (return-from gen-cell-set))
+  (when (sc-is value immediate)
+    (let ((bits (encode-value-if-immediate value)))
+      (cond ((not result)
+             ;; Try to move imm-to-mem if BITS fits
+             (acond ((or (and (fixup-p bits)
+                              ;; immobile-object fixups must fit in 32 bits
+                              (eq (fixup-flavor bits) :immobile-object)
+                              bits)
+                         (plausible-signed-imm32-operand-p bits))
+                     (inst mov :qword ea it))
+                    (t
+                     (inst mov temp-reg-tn bits)
+                     (inst mov ea temp-reg-tn)))
+             (return-from gen-cell-set))
+            ;; Move the immediate value into RESULT provided that doing so
+            ;; doesn't clobber EA. If it would, use TEMP-REG-TN instead.
+            ;; TODO: if RESULT is unused, and the immediate fits in an
+            ;; imm32 operand, then perform imm-to-mem move, but as the comment
+            ;; observes, there's no easy way to spot an unused TN.
+            ((or (location= (ea-base ea) result)
+                 (awhen (ea-index ea) (location= it result)))
+             (inst mov temp-reg-tn bits)
+             (setq value temp-reg-tn))
+            (t
+             ;; Can move into RESULT, then into EA
+             (inst mov result bits)
+             (inst mov ea result)
+             (return-from gen-cell-set)))))
+  (inst mov :qword ea value) ; specify the size for when VALUE is an integer
+  (when result
+    ;; Ideally we would skip this move if RESULT is unused hereafter,
+    ;; but unfortunately (NOT (TN-READS RESULT)) isn't equivalent
+    ;; to there being no reads from the TN at all.
+    (move result value)))
+
 ;;; CELL-REF and CELL-SET are used to define VOPs like CAR, where the
 ;;; offset to be read or written is a property of the VOP used.
 (define-vop (cell-ref)
-  (:args (object :scs (descriptor-reg)
-                 :load-if (not (and (sc-is object immediate)
-                                    (symbolp (tn-value object))))))
+  (:args (object :scs (descriptor-reg)))
   (:results (value :scs (descriptor-reg any-reg)))
   (:variant-vars offset lowtag)
   (:policy :fast-safe)
   (:generator 4
-    (cond ((sc-is object immediate)
-           ;; this sanity-check is meta-compile-time statically assertable
-           (aver (eq offset symbol-value-slot))
-           (inst mov value (symbol-slot-addr (tn-value object) offset)))
-          (t
-           (loadw value object offset lowtag)))))
+    (loadw value object offset lowtag)))
+;; This vop's sole purpose is to be an ancestor for other vops, to assign
+;; default operands, policy, and generator.
 (define-vop (cell-set)
-  (:args (object :scs (descriptor-reg)
-                 :load-if (not (and (sc-is object immediate)
-                                    (symbolp (tn-value object)))))
-         (value :scs (descriptor-reg any-reg)
-                :load-if (not (and (sc-is value immediate)
-                                   (typep (tn-value value)
-                                          '(or symbol
-                                               character
-                                               (signed-byte 32)))))))
+  (:args (object :scs (descriptor-reg))
+         (value :scs (descriptor-reg any-reg immediate)))
   (:variant-vars offset lowtag)
   (:policy :fast-safe)
   (:generator 4
-    (let ((value (encode-value-if-immediate value)))
-      (cond ((sc-is object immediate)
-             ;; this sanity-check is meta-compile-time statically assertable
-             (aver (eq offset symbol-value-slot))
-             (inst mov (symbol-slot-addr (tn-value object) offset) value))
-            (t
-             (storew value object offset lowtag))))))
+    (gen-cell-set (make-ea-for-object-slot object offset lowtag)
+                  value nil)))
 
 ;;; X86 special
 (define-vop (cell-xadd)
@@ -134,16 +160,14 @@
                (inst jmp :nz err)
                (if const
                    (cond ((typep const '(signed-byte 32))
-                          (inst lea newval
-                                (make-ea :qword :base rax :disp const)))
+                          (inst lea newval (ea const rax)))
                          (t
                           (inst mov newval const)
                           (inst add newval rax)))
                    ,(if (eq inherit 'cell-xsub)
                         `(progn (move newval rax)
                                 (inst sub newval delta))
-                        `(inst lea newval
-                               (make-ea :qword :base rax :index delta))))
+                        `(inst lea newval (ea rax delta))))
                (inst cmpxchg
                      (make-ea-for-object-slot cell ,slot list-pointer-lowtag)
                      newval :lock)
@@ -153,67 +177,3 @@
   (def-atomic %atomic-inc-cdr cell-xadd cons-cdr-slot)
   (def-atomic %atomic-dec-car cell-xsub cons-car-slot)
   (def-atomic %atomic-dec-cdr cell-xsub cons-cdr-slot))
-
-;;; SLOT-REF and SLOT-SET are used to define VOPs like CLOSURE-REF,
-;;; where the offset is constant at compile time, but varies for
-;;; different uses.
-(define-vop (slot-ref)
-  (:args (object :scs (descriptor-reg)))
-  (:results (value :scs (descriptor-reg any-reg)))
-  (:variant-vars base lowtag)
-  (:info offset)
-  (:generator 4
-    (loadw value object (+ base offset) lowtag)))
-(define-vop (slot-set)
-  (:args (object :scs (descriptor-reg))
-         (value :scs (descriptor-reg any-reg immediate)))
-  (:temporary (:sc unsigned-reg) temp)
-  (:variant-vars base lowtag)
-  (:info offset)
-  (:generator 4
-     (if (sc-is value immediate)
-         (move-immediate (make-ea :qword :base object
-                                         :disp (- (* (+ base offset) n-word-bytes)
-                                                  lowtag))
-                         (encode-value-if-immediate value)
-                         temp)
-         ;; Else, value not immediate.
-         (storew value object (+ base offset) lowtag))))
-
-(define-vop (slot-set-conditional)
-  (:args (object :scs (descriptor-reg) :to :eval)
-         (old-value :scs (descriptor-reg any-reg) :target eax)
-         (new-value :scs (descriptor-reg any-reg) :target temp))
-  (:temporary (:sc descriptor-reg :offset eax-offset
-                   :from (:argument 1) :to :result :target result)  eax)
-  (:temporary (:sc descriptor-reg :from (:argument 2) :to :result) temp)
-  (:variant-vars base lowtag)
-  (:results (result :scs (descriptor-reg)))
-  (:info offset)
-  (:generator 4
-    (move eax old-value)
-    (move temp new-value)
-    (inst cmpxchg (make-ea :dword :base object
-                           :disp (- (* (+ base offset) n-word-bytes) lowtag))
-          temp)
-    (move result eax)))
-
-;;; X86 special
-;;; FIXME: Figure out whether we should delete this.
-;;; It looks just like 'cell-xadd' and is buggy in the same ways:
-;;;   - modifies 'value' operand which *should* be in the same physical reg
-;;;     as 'result' operand, but would cause harm if not.
-;;;   - operand width needs to be :qword
-;;;   - :LOCK is missing
-(define-vop (slot-xadd)
-  (:args (object :scs (descriptor-reg) :to :result)
-         (value :scs (any-reg) :target result))
-  (:results (result :scs (any-reg) :from (:argument 1)))
-  (:result-types tagged-num)
-  (:variant-vars base lowtag)
-  (:info offset)
-  (:generator 4
-    (move result value)
-    (inst xadd (make-ea :dword :base object
-                        :disp (- (* (+ base offset) n-word-bytes) lowtag))
-          value)))

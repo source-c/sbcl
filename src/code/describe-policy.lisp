@@ -9,14 +9,14 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB-C") ;(SB-C, not SB!C, since we're built in warm load.)
+(in-package "SB-C") ;(SB-C, not SB-C, since we're built in warm load.)
 
 (defun describe-compiler-policy (&optional spec)
   "Print all global optimization settings, augmented by SPEC."
   (let ((policy (process-optimize-decl (cons 'optimize spec) *policy*)))
     (fresh-line)
     (format t "  Basic qualities:~%")
-    (dovector (quality **policy-primary-qualities**)
+    (dovector (quality +policy-primary-qualities+)
       (format t "~S = ~D~%" quality (policy-quality policy quality)))
     (format t "  Dependent qualities:~%")
     (loop for info across **policy-dependent-qualities**

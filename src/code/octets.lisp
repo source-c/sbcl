@@ -15,13 +15,8 @@
 ;;; a decoding error error?  Or should we just give up on non-Unicode
 ;;; builds?
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
-;;; FIXME: don't we have this somewhere else?
-(deftype array-range ()
-  "A number that can represent an index into a vector, including
-one-past-the-end"
-  '(integer 0 #.sb!xc:array-dimension-limit))
 
 ;;;; conditions
 
@@ -38,6 +33,8 @@ one-past-the-end"
                                       (octets-encoding-error-position c)))
                      (octets-encoding-error-external-format c)))))
 
+(declaim (ftype (sfunction (t t t) (simple-array (unsigned-byte 8) 1))
+                encoding-error))
 (defun encoding-error (external-format string pos)
   (restart-case
       (error 'octets-encoding-error
@@ -123,18 +120,9 @@ one-past-the-end"
     (,definer aref (simple-array (unsigned-byte 8) (*)))
     (,definer sap-ref-8 system-area-pointer)))
 
-;;; FIXME: find out why the comment about SYMBOLICATE below is true
-;;; and fix it, or else replace with SYMBOLICATE.
-;;;
-;;; FIXME: this is cute, but is going to prevent greps for def.*<name>
-;;; from working for (defun ,(make-od-name ...) ...)
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defun make-od-name (sym1 sym2)
-    ;; "MAKE-NAME" is too generic, but this doesn't do quite what
-    ;; SYMBOLICATE does; MAKE-OD-NAME ("octets definition") it is
-    ;; then.
-    (intern (concatenate 'string (symbol-name sym1) "-" (symbol-name sym2))
-            (symbol-package sym1))))
+    (package-symbolicate (cl:symbol-package sym1) sym1 "-" sym2)))
 
 ;;;; to-octets conversions
 
@@ -280,7 +268,7 @@ one-past-the-end"
           do (let ((byte (funcall get-bytes string pos)))
                (typecase byte
                  ((unsigned-byte 8)
-                  (locally (declare (optimize (sb!c::insert-array-bounds-checks 0)))
+                  (locally (declare (optimize (sb-c::insert-array-bounds-checks 0)))
                     (setf (aref octets index) byte)))
                  ((simple-array (unsigned-byte 8) (*))
                   ;; KLUDGE: We ran into encoding errors.  Bail and do
@@ -367,14 +355,10 @@ one-past-the-end"
                                                     "nl_langinfo"
                                                     (function (c-string :external-format :latin-1)
                                                               int))
-                                                   sb!unix:codeset)
+                                                   sb-unix:codeset)
                                                   "LATIN-1")
                                               "KEYWORD")
-                             #!+win32 (sb!win32::ansi-codepage)))
-        (/show0 "cold-printing defaulted external-format:")
-        #!+sb-show
-        (cold-print external-format)
-        (/show0 "matching to known aliases")
+                             #!+win32 (sb-win32::ansi-codepage)))
         (let ((entry (get-external-format external-format)))
           (cond
             (entry
@@ -404,8 +388,28 @@ one-past-the-end"
                                    (default-external-format)
                                    external-format)))
 
+(declaim (ftype (sfunction ((vector (unsigned-byte 8)) &key (:external-format t)
+                                   (:start index)
+                                   (:end sequence-end))
+                           (or (simple-array character (*))
+                               (simple-array base-char (*))))
+                octets-to-string))
 (defun octets-to-string (vector &key (external-format :default) (start 0) end)
-  (declare (type (vector (unsigned-byte 8)) vector))
+  "Return a string obtained by decoding VECTOR according to EXTERNAL-FORMAT.
+
+If EXTERNAL-FORMAT is given, it must designate an external format.
+
+If given, START and END must be bounding index designators and
+designate a subsequence of VECTOR that should be decoded.
+
+If some of the octets of VECTOR (or the subsequence bounded by START
+and END) cannot be decoded by EXTERNAL-FORMAT an error of a subtype of
+SB-INT:CHARACTER-DECODING-ERROR is signaled.
+
+Note that for some values of EXTERNAL-FORMAT the length of the
+returned string may be different from the length of VECTOR (or the
+subsequence bounded by START and END)."
+  (declare (explicit-check start end :result))
   (with-array-data ((vector vector)
                     (start start)
                     (end end)
@@ -414,9 +418,32 @@ one-past-the-end"
     (let ((ef (maybe-defaulted-external-format external-format)))
       (funcall (ef-octets-to-string-fun ef) vector start end))))
 
+(declaim (ftype (sfunction (string &key (:external-format t)
+                                   (:start index)
+                                   (:end sequence-end)
+                                   (:null-terminate t))
+                           (simple-array (unsigned-byte 8) (*)))
+                string-to-octets))
 (defun string-to-octets (string &key (external-format :default)
                          (start 0) end null-terminate)
-  (declare (type string string))
+  "Return an octet vector that is STRING encoded according to EXTERNAL-FORMAT.
+
+If EXTERNAL-FORMAT is given, it must designate an external format.
+
+If given, START and END must be bounding index designators and
+designate a subsequence of STRING that should be encoded.
+
+If NULL-TERMINATE is true, the returned octet vector ends with an
+additional 0 element that does not correspond to any part of STRING.
+
+If some of the characters of STRING (or the subsequence bounded by
+START and END) cannot be encoded by EXTERNAL-FORMAT an error of a
+subtype of SB-INT:CHARACTER-ENCODING-ERROR is signaled.
+
+Note that for some values of EXTERNAL-FORMAT and NULL-TERMINATE the
+length of the returned vector may be different from the length of
+STRING (or the subsequence bounded by START and END)."
+  (declare (explicit-check start end :result))
   (with-array-data ((string string)
                     (start start)
                     (end end)
@@ -484,7 +511,7 @@ one-past-the-end"
              (replacement-handlerify entry replacement)
              entry))))))
 
-(defun !unintern-symbols ()
+(push
   `("SB-IMPL"
     char-class char-class2 char-class3
     ,@(let (macros)
@@ -497,4 +524,5 @@ one-past-the-end"
                          (eql (mismatch name "DEFINE-") 7)
                          (or (ends-with-p name "->STRING")
                              (ends-with-p name "->STRING*")))
-                (push s macros))))))))
+                (push s macros)))))))
+  *!removable-symbols*)

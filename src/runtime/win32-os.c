@@ -58,7 +58,7 @@
 
 #include "validate.h"
 #include "thread.h"
-#include "cpputil.h"
+#include "align.h"
 
 #ifndef LISP_FEATURE_SB_THREAD
 /* dummy definition to reduce ifdef clutter */
@@ -235,14 +235,6 @@ unsigned long block_deferrables_and_return_mask()
     return (unsigned long)sset;
 }
 
-#if defined(LISP_FEATURE_SB_THREAD)
-void apply_sigmask(unsigned long sigmask)
-{
-    sigset_t sset = (sigset_t)sigmask;
-    thread_sigmask(SIG_SETMASK, &sset, 0);
-}
-#endif
-
 /* The exception handling function looks like this: */
 EXCEPTION_DISPOSITION handle_exception(EXCEPTION_RECORD *,
                                        struct lisp_exception_frame *,
@@ -284,7 +276,7 @@ static void set_seh_frame(void *frame)
 
 void alloc_gc_page()
 {
-    AVER(VirtualAlloc(GC_SAFEPOINT_PAGE_ADDR, sizeof(lispobj),
+    AVER(VirtualAlloc(GC_SAFEPOINT_PAGE_ADDR, BACKEND_PAGE_BYTES,
                       MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE));
 }
 
@@ -312,14 +304,14 @@ void alloc_gc_page()
 void map_gc_page()
 {
     DWORD oldProt;
-    AVER(VirtualProtect((void*) GC_SAFEPOINT_PAGE_ADDR, sizeof(lispobj),
+    AVER(VirtualProtect((void*) GC_SAFEPOINT_PAGE_ADDR, BACKEND_PAGE_BYTES,
                         PAGE_READWRITE, &oldProt));
 }
 
 void unmap_gc_page()
 {
     DWORD oldProt;
-    AVER(VirtualProtect((void*) GC_SAFEPOINT_PAGE_ADDR, sizeof(lispobj),
+    AVER(VirtualProtect((void*) GC_SAFEPOINT_PAGE_ADDR, BACKEND_PAGE_BYTES,
                         PAGE_NOACCESS, &oldProt));
 }
 
@@ -661,7 +653,7 @@ void* os_dlsym_default(char* name)
    started before _any_ TLS slot is allocated by libraries, and
    some C compiler vendors rely on this fact. */
 
-void os_preinit()
+int os_preinit(char *argv[], char *envp[])
 {
 #ifdef LISP_FEATURE_X86
     DWORD slots[TLS_MINIMUM_AVAILABLE];
@@ -688,6 +680,7 @@ void os_preinit()
              "(last TlsAlloc() returned %u)",key);
     }
 #endif
+    return 0;
 }
 #endif  /* LISP_FEATURE_SB_THREAD */
 
@@ -841,20 +834,20 @@ os_validate(int movable, os_vm_address_t addr, os_vm_size_t len)
         return 0;
 
     if ((mem_info.State == MEM_RESERVE) && (mem_info.RegionSize >=len)) {
-      /* It would be correct to return here. However, support for Wine
-       * is beneficial, and Wine has a strange behavior in this
-       * department. It reports all memory below KERNEL32.DLL as
-       * reserved, but disallows MEM_COMMIT.
-       *
-       * Let's work around it: reserve the region we need for a second
-       * time. The second reservation is documented to fail on normal NT
-       * family, but it will succeed on Wine if this region is
-       * actually free.
-       */
-      VirtualAlloc(addr, len, MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-      /* If it is wine, the second call has succeded, and now the region
-       * is really reserved. */
-      return addr;
+        /* It would be correct to return here. However, support for Wine
+         * is beneficial, and Wine has a strange behavior in this
+         * department. It reports all memory below KERNEL32.DLL as
+         * reserved, but disallows MEM_COMMIT.
+         *
+         * Let's work around it: reserve the region we need for a second
+         * time. The second reservation is documented to fail on normal NT
+         * family, but it will succeed on Wine if this region is
+         * actually free.
+         */
+        VirtualAlloc(addr, len, MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        /* If it is wine, the second call has succeded, and now the region
+         * is really reserved. */
+        return addr;
     }
 
     if (mem_info.State == MEM_RESERVE) {
@@ -864,11 +857,12 @@ os_validate(int movable, os_vm_address_t addr, os_vm_size_t len)
          * provision for MEM_RESERVE in the following code, I suppose: */
     }
 
-    if (!AVERLAX(VirtualAlloc(addr, len, (mem_info.State == MEM_RESERVE)?
-                              MEM_COMMIT: MEM_RESERVE, PAGE_EXECUTE_READWRITE)))
-        return 0;
+    os_vm_address_t actual;
 
-    return addr;
+    if (!AVERLAX(actual = VirtualAlloc(addr, len, (mem_info.State == MEM_RESERVE)?
+                                       MEM_COMMIT: MEM_RESERVE, PAGE_EXECUTE_READWRITE)))
+        return 0;
+    return actual;
 }
 
 /*
@@ -1014,9 +1008,7 @@ static boolean is_some_thread_local_addr(os_vm_address_t addr);
 boolean
 gc_managed_addr_p(lispobj addr)
 {
-    if(in_range_p(addr, READ_ONLY_SPACE_START, READ_ONLY_SPACE_SIZE) ||
-       in_range_p(addr, STATIC_SPACE_START   , STATIC_SPACE_SIZE) ||
-       in_range_p(addr, DYNAMIC_SPACE_START  , dynamic_space_size) ||
+    if(gc_managed_heap_space_p(addr) ||
        is_some_thread_local_addr((os_vm_address_t)addr))
         return 1;
     return 0;
@@ -1206,7 +1198,7 @@ handle_access_violation(os_context_t *ctx,
 
     /* Safepoint pages */
 #ifdef LISP_FEATURE_SB_THREAD
-    if (fault_address == (void *) GC_SAFEPOINT_PAGE_ADDR) {
+    if (fault_address == (void *) GC_SAFEPOINT_TRAP_ADDR) {
         thread_in_lisp_raised(ctx);
         return 0;
     }
@@ -1232,6 +1224,13 @@ handle_access_violation(os_context_t *ctx,
                               MEM_COMMIT, PAGE_EXECUTE_READWRITE));
         }
         return 0;
+    } else {
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+        extern int immobile_space_handle_wp_violation(void*);
+        if (immobile_space_handle_wp_violation(fault_address)) {
+            return 0;
+        }
+#endif
     }
 
     if (fault_address == undefined_alien_address)
@@ -1856,9 +1855,7 @@ win32_maybe_interrupt_io(void* thread)
                 goto unlock;
             }
             if (ptr_CancelSynchronousIo) {
-                pthread_mutex_lock(&th->os_thread->fiber_lock);
-                done = !!ptr_CancelSynchronousIo(th->os_thread->fiber_group->handle);
-                pthread_mutex_unlock(&th->os_thread->fiber_lock);
+                done = !!ptr_CancelSynchronousIo(th->os_thread->handle);
             }
             done |= !!ptr_CancelIoEx(h,NULL);
         }
@@ -1914,6 +1911,7 @@ win32_unix_write(HANDLE handle, void * buf, int count)
     LARGE_INTEGER file_position;
     BOOL seekable;
     BOOL ok;
+    DWORD errorCode;
 
     if (console_handle_p(handle)) {
         return win32_write_console(handle,buf,count);
@@ -1934,19 +1932,20 @@ win32_unix_write(HANDLE handle, void * buf, int count)
 
     WITH_INTERRUPTIBLE_IO(handle) {
         ok = WriteFile(handle, buf, count, &written_bytes, &overlapped);
+        if (!ok)
+            errorCode = GetLastError();
     }
 
     if (ok) {
         goto done_something;
     } else {
-        DWORD errorCode = GetLastError();
         if (errorCode==ERROR_OPERATION_ABORTED) {
             GetOverlappedResult(handle,&overlapped,&written_bytes,FALSE);
             errno = EINTR;
             return -1;
         }
         if (errorCode!=ERROR_IO_PENDING) {
-            errno = EIO;
+            errno = errorCode;
             return -1;
         } else {
             if(WaitForMultipleObjects(2,self->private_events.events,
@@ -1957,10 +1956,10 @@ win32_unix_write(HANDLE handle, void * buf, int count)
                 waitInGOR = FALSE;
             }
             if (!GetOverlappedResult(handle,&overlapped,&written_bytes,waitInGOR)) {
-                if (GetLastError()==ERROR_OPERATION_ABORTED) {
+                if ((errorCode = GetLastError())==ERROR_OPERATION_ABORTED) {
                     errno = EINTR;
                 } else {
-                    errno = EIO;
+                    errno = errorCode;
                 }
                 return -1;
             } else {
@@ -2009,13 +2008,14 @@ win32_unix_read(HANDLE handle, void * buf, int count)
 
     WITH_INTERRUPTIBLE_IO(handle) {
         ok = ReadFile(handle,buf,count,&read_bytes, &overlapped);
+        if (!ok)
+            errorCode = GetLastError();
     }
 
     if (ok) {
         /* immediately */
         goto done_something;
     } else {
-        errorCode = GetLastError();
         if (errorCode == ERROR_HANDLE_EOF ||
             errorCode == ERROR_BROKEN_PIPE ||
             errorCode == ERROR_NETNAME_DELETED) {

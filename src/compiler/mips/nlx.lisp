@@ -1,4 +1,4 @@
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;; Make a TN for the argument count passing location for a
 ;;; non-local entry.
@@ -49,7 +49,15 @@
   (:generator 1
     (move res bsp-tn)))
 
+(define-vop (current-nsp)
+  (:results (res :scs (any-reg descriptor-reg)))
+  (:generator 1
+    (move res nsp-tn)))
 
+(define-vop (set-nsp)
+  (:args (nsp :scs (any-reg descriptor-reg)))
+  (:generator 1
+    (move nsp-tn nsp)))
 
 ;;;; Unwind block hackery:
 
@@ -100,15 +108,13 @@
     (move block result)))
 
 
-;;; Just set the current unwind-protect to TN's address.  This instantiates an
+;;; Just set the current unwind-protect to UWP.  This instantiates an
 ;;; unwind block as an unwind-protect.
 ;;;
 (define-vop (set-unwind-protect)
-  (:args (tn))
-  (:temporary (:scs (descriptor-reg)) new-uwp)
+  (:args (uwp :scs (any-reg)))
   (:generator 7
-    (inst addu new-uwp cfp-tn (* (tn-offset tn) n-word-bytes))
-    (store-symbol-value new-uwp *current-unwind-protect-block*)))
+    (store-symbol-value uwp *current-unwind-protect-block*)))
 
 
 (define-vop (unlink-catch-block)
@@ -175,7 +181,7 @@
 
                (emit-label defaulting-done)
 
-               (assemble (*elsewhere*)
+               (assemble (:elsewhere)
                  (dolist (def (defaults))
                    (emit-label (car def))
                    (let ((tn (cdr def)))

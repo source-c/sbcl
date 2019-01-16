@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; Move functions.
 (define-move-fun (load-fp-zero 1) (vop x y)
@@ -378,7 +378,7 @@
           (inst ldw offset nfp y)
           (inst ldw (+ offset n-word-bytes) nfp
                 (make-wired-tn (primitive-type-or-lose 'unsigned-byte-32)
-                               (sc-number-or-lose 'unsigned-reg)
+                               unsigned-reg-sc-number
                                (+ 1 (tn-offset y))))
           (inst stw old1 offset nfp)
           (inst stw old2 (+ offset n-word-bytes) nfp)))
@@ -388,7 +388,7 @@
         (inst ldw (- (* (1+ double-float-value-slot) n-word-bytes)
                      other-pointer-lowtag) x
                   (make-wired-tn (primitive-type-or-lose 'unsigned-byte-32)
-                                 (sc-number-or-lose 'unsigned-reg)
+                                 unsigned-reg-sc-number
                                  (+ 1 (tn-offset y))))))))
 (define-move-vop move-to-double-int-reg
   :move (double-reg descriptor-reg) (double-int-carg-reg))
@@ -555,7 +555,7 @@
   ;; FIXME-lav: let 'inst cmp' translate keywords into raw binary instead of giving it here
   (frob < #b01001 #b10101 </single-float </double-float)
   (frob > #b10001 #b01101 >/single-float >/double-float)
-  (frob = #b00101 #b11001 eql/single-float eql/double-float))
+  (frob = #b00101 #b11001 =/single-float =/double-float))
 
 
 ;;;; Conversion:
@@ -814,7 +814,7 @@
 
 ;;;; Float mode hackery:
 
-(sb!xc:deftype float-modes () '(unsigned-byte 32))
+(sb-xc:deftype float-modes () '(unsigned-byte 32))
 (defknown floating-point-modes () float-modes (flushable))
 (defknown ((setf floating-point-modes)) (float-modes)
             float-modes)

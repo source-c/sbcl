@@ -9,11 +9,12 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!IMPL")
+(in-package "SB-IMPL")
 
 (/show0 "compiler-deftype.lisp 14")
 
 (defun %compiler-deftype (name expander source-location &optional doc)
+  (declare (ignorable doc))
   (with-single-package-locked-error
       (:symbol name "defining ~A as a type specifier"))
   (ecase (info :type :kind name)
@@ -47,9 +48,10 @@
   (setf (info :type :expander name) expander)
   (when source-location
     (setf (info :type :source-location name) source-location))
+  #-sb-xc-host
   (when doc
-    (setf (fdocumentation name 'type) doc))
-  (sb!c::%note-type-defined name)
+    (setf (documentation name 'type) doc))
+  (sb-c::%note-type-defined name)
   name)
 
 (/show0 "compiler-deftype.lisp end of file")

@@ -9,14 +9,14 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; LIST and LIST*
 (define-vop (list-or-list*)
   (:args (things :more t))
-  (:temporary (:scs (descriptor-reg) :type list) ptr)
+  (:temporary (:scs (descriptor-reg)) ptr)
   (:temporary (:scs (descriptor-reg)) temp)
-  (:temporary (:scs (descriptor-reg) :type list :to (:result 0) :target result)
+  (:temporary (:scs (descriptor-reg) :to (:result 0) :target result)
               res)
   (:temporary (:scs (non-descriptor-reg)) alloc-temp)
   (:info num)
@@ -71,37 +71,6 @@
 
 
 ;;;; Special purpose inline allocators.
-
-(define-vop (allocate-code-object)
-  (:args (boxed-arg :scs (any-reg))
-         (unboxed-arg :scs (any-reg)))
-  (:results (result :scs (descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg)) ndescr)
-  (:temporary (:scs (any-reg) :from (:argument 0)) boxed)
-  (:temporary (:scs (non-descriptor-reg)) size)
-  (:temporary (:scs (non-descriptor-reg)) unboxed)
-  (:generator 100
-    (inst add boxed boxed-arg (fixnumize (1+ code-constants-offset)))
-    (inst and boxed (lognot lowtag-mask))
-    (inst srl unboxed unboxed-arg word-shift)
-    (inst add unboxed lowtag-mask)
-    (inst and unboxed (lognot lowtag-mask))
-    (pseudo-atomic ()
-      ;;
-      ;; This looks like another dreadful type pun. CSR - 2002-02-06
-      ;;
-      ;; Not any more, or not in that sense at least, because the
-      ;; "p/a bit is also the highest lowtag bit" assumption is now hidden
-      ;; in the allocation macro.  DFL - 2012-10-01
-      ;;
-      ;; Figure out how much space we really need and allocate it.
-      (inst add size boxed unboxed)
-      (allocation result size other-pointer-lowtag :temp-tn ndescr)
-      (inst sll ndescr boxed (- n-widetag-bits word-shift))
-      (inst or ndescr code-header-widetag)
-      (storew ndescr result 0 other-pointer-lowtag)
-      (storew unboxed-arg result code-code-size-slot other-pointer-lowtag)
-      (storew null-tn result code-debug-info-slot other-pointer-lowtag))))
 
 (define-vop (make-fdefn)
   (:args (name :scs (descriptor-reg) :to :eval))
@@ -185,8 +154,13 @@
   (:generator 6
     (inst add bytes extra (* (1+ words) n-word-bytes))
     (inst sll header bytes (- n-widetag-bits 2))
-    (inst add header header (+ (ash -2 n-widetag-bits) type))
-    (inst and bytes (lognot lowtag-mask))
+    ;; The specified EXTRA value is the exact value placed in the header
+    ;; as the word count when allocating code.
+    (cond ((= type code-header-widetag)
+           (inst add header header type))
+          (t
+           (inst add header header (+ (ash -2 n-widetag-bits) type))
+           (inst and bytes (lognot lowtag-mask))))
     (pseudo-atomic ()
       (allocation result bytes lowtag :temp-tn temp)
       (storew header result 0 lowtag))))

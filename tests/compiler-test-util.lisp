@@ -65,6 +65,9 @@
 (defun collect-consing-stats (thunk times)
   (declare (type function thunk))
   (declare (type fixnum times))
+  #+(and sb-thread gencgc)
+  (sb-vm::close-current-gc-region)
+  (setf sb-int:*n-bytes-freed-or-purified* 0)
   (let ((before (sb-ext:get-bytes-consed)))
     (dotimes (i times)
       (funcall thunk))
@@ -98,7 +101,8 @@
 (defmacro assert-consing (form &optional (times '+times+))
   `(check-consing t ',form (lambda () ,form) ,times))
 
-(defun file-compile (toplevel-forms &key load)
+(defun file-compile (toplevel-forms &key load
+                                         before-load)
   (let* ((lisp (merge-pathnames "file-compile-tmp.lisp"))
          (fasl (compile-file-pathname lisp))
          (error-stream (make-string-output-stream)))
@@ -113,6 +117,8 @@
                (let ((*error-output* error-stream))
                  (compile-file lisp :print nil :verbose nil))
              (when load
+               (when before-load
+                 (funcall before-load))
                (let ((*error-output* error-stream))
                  (load fasl :print nil :verbose nil)))
              (values warn fail error-stream)))

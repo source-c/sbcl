@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 (defun machine-type ()
   "Return a string describing the type of the local machine."
@@ -19,47 +19,35 @@
 
 ;;; This gets called by LOAD to resolve newly positioned objects
 ;;; with things (like code instructions) that have to refer to them.
-;;;
-;;; Add a fixup offset to the vector of fixup offsets for the given
-;;; code object.
-(defun fixup-code-object (code offset fixup kind &optional flavor)
+;;; Return T if and only if the fixup needs to be recorded in %CODE-FIXUPS
+(defun fixup-code-object (code offset fixup kind flavor)
   (declare (type index offset))
   (declare (ignore flavor))
-  (without-gcing
-   (when
-     (let* ((obj-start-addr (logandc2 (get-lisp-obj-address code) sb!vm:lowtag-mask))
-            (sap (code-instructions code))
-            (code-end-addr (+ (sap-int sap) (%code-code-size code))))
-        (ecase kind
-          (:absolute
-           ;; Word at sap + offset contains a value to be replaced by
-           ;; adding that value to fixup.
-           (setf (sap-ref-32 sap offset) (+ fixup (sap-ref-32 sap offset)))
-           ;; Record absolute fixups that point within the code object.
-           (< obj-start-addr (sap-ref-32 sap offset) code-end-addr))
-          (:relative
-           ;; Fixup is the actual address wanted.
-           ;; Replace word with value to add to that loc to get there.
-           (let* ((loc-sap (+ (sap-int sap) offset))
-                  ;; Use modular arithmetic so that if the offset
-                  ;; doesn't fit into signed-byte-32 it'll wrap around
-                  ;; when added to EIP
-                  (rel-val (ldb (byte 32 0)
-                                (- fixup loc-sap n-word-bytes))))
-             (declare (type (unsigned-byte 32) loc-sap rel-val))
-             (setf (sap-ref-32 sap offset) rel-val))
-           ;; Record relative fixups that point outside the code object.
-           (or (< fixup obj-start-addr) (> fixup code-end-addr)))))
-    ;; The preceding logic returns T if and only if the fixup
-    ;; should be preserved for re-fix-up when code is transported.
-    (setf (sb!vm::%code-fixups code)
-          (let ((fixups (sb!vm::%code-fixups code)))
-            (let* ((len (length (the (simple-array sb!vm:word 1) fixups)))
-                   (new (replace (make-array (1+ len) :element-type 'sb!vm:word)
-                                 fixups)))
-              (setf (aref new len) offset)
-              new)))))
-  nil)
+  (let* ((obj-start-addr (logandc2 (get-lisp-obj-address code) sb-vm:lowtag-mask))
+         (sap (code-instructions code))
+         (code-end-addr (+ (sap-int sap) (%code-code-size code))))
+    (ecase kind
+      (:absolute
+       ;; Word at sap + offset contains a value to be replaced by
+       ;; adding that value to fixup.
+       (setf (sap-ref-32 sap offset) (+ fixup (sap-ref-32 sap offset)))
+       ;; Record absolute fixups that point into CODE. An absolute fixup
+       ;; can't point to another dynamic-space object, but it could point
+       ;; to read-only or static space. Those don't need to be saved.
+       (< obj-start-addr (sap-ref-32 sap offset) code-end-addr))
+      (:relative
+       ;; Fixup is the actual address wanted.
+       ;; Replace word with value to add to that loc to get there.
+       (let* ((loc-sap (+ (sap-int sap) offset))
+              ;; Use modular arithmetic so that if the offset
+              ;; doesn't fit into signed-byte-32 it'll wrap around
+              ;; when added to EIP
+              (rel-val (ldb (byte 32 0) (- fixup loc-sap n-word-bytes))))
+         (declare (type (unsigned-byte 32) loc-sap rel-val))
+         (setf (sap-ref-32 sap offset) rel-val))
+       ;; Relative fixups point outside of this object. Keep them all.
+       (aver (or (< fixup obj-start-addr) (> fixup code-end-addr)))
+       t))))
 
 ;;;; low-level signal context access functions
 ;;;;
@@ -121,7 +109,7 @@
 
 #!+(or linux sunos)
 (define-alien-routine ("os_context_fp_control" context-floating-point-modes)
-    (sb!alien:unsigned 32)
+    (sb-alien:unsigned 32)
   (context (* os-context-t)))
 
 ;;;; INTERNAL-ERROR-ARGS
@@ -130,14 +118,10 @@
 ;;; arguments from the instruction stream.
 (defun internal-error-args (context)
   (declare (type (alien (* os-context-t)) context))
-  (/show0 "entering INTERNAL-ERROR-ARGS, CONTEXT=..")
-  (/hexstr context)
   (let* ((pc (context-pc context))
-         (error-number (sap-ref-8 pc 1)))
+         (trap-number (sap-ref-8 pc 0)))
     (declare (type system-area-pointer pc))
-    (/show0 "got PC")
-    (values error-number
-            (sb!kernel::decode-internal-error-args (sap+ pc 2) error-number))))
+    (sb-kernel::decode-internal-error-args (sap+ pc 1) trap-number)))
 
 ;;; This is used in error.lisp to insure that floating-point exceptions
 ;;; are properly trapped. The compiler translates this to a VOP.
@@ -162,9 +146,6 @@
 (defvar *fp-constant-l2e*)
 (defvar *fp-constant-lg2*)
 (defvar *fp-constant-ln2*)
-
-;;; the current alien stack pointer; saved/restored for non-local exits
-(defvar *alien-stack-pointer*)
 
 ;;; Support for the MT19937 random number generator. The update
 ;;; function is implemented as an assembly routine. This definition is

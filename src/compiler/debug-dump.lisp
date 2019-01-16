@@ -10,7 +10,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 (deftype byte-buffer () '(vector (unsigned-byte 8)))
 (defvar *byte-buffer*)
@@ -57,6 +57,27 @@
           (nconc (ir2-block-locations (vop-block vop))
                  (list location)))
     location))
+
+(defun note-this-location (vop kind)
+  "NOTE-THIS-LOCATION VOP Kind
+  Note that the current code location is an interesting (to the debugger)
+  location of the specified Kind. VOP is the VOP responsible for this code.
+  This VOP must specify some non-null :SAVE-P value (perhaps :COMPUTE-ONLY) so
+  that the live set is computed."
+  (let ((lab (gen-label)))
+    (emit-label lab)
+    (note-debug-location vop lab kind *location-context*)))
+
+(defun note-next-instruction (vop kind)
+  "NOTE-NEXT-INSTRUCTION VOP Kind
+   Similar to NOTE-THIS-LOCATION, except the use the location of the next
+   instruction for the code location, wherever the scheduler decided to put
+   it."
+  (let ((loc (note-debug-location vop nil kind)))
+    (emit-postit (lambda (segment posn)
+                   (setf (location-info-label loc)
+                         (- posn (segment-header-skew segment))))))
+  (values))
 
 #!-sb-fluid (declaim (inline ir2-block-physenv))
 (defun ir2-block-physenv (2block)
@@ -123,7 +144,7 @@
      (let ((offset (- (label-position (restart-location-label x))
                       location))
            (tn (restart-location-tn x))
-           (registers-size #.(integer-length (sb-size (sb-or-lose 'sb!vm::registers)))))
+           (registers-size #.(integer-length (sb-size (sb-or-lose 'sb-vm::registers)))))
        (if tn
            (the fixnum (logior (ash offset registers-size)
                                (tn-offset tn)))
@@ -133,10 +154,9 @@
 
 (defun decode-restart-location (x)
   (declare (fixnum x))
-  (let ((registers-size #.(integer-length (sb-size (sb-or-lose 'sb!vm::registers)))))
-    (values (make-sc-offset
-             (sc-number-or-lose 'sb!vm::descriptor-reg)
-             (ldb (byte registers-size 0) x))
+  (let ((registers-size #.(integer-length (sb-size (sb-or-lose 'sb-vm::registers)))))
+    (values (make-sc+offset sb-vm:descriptor-reg-sc-number
+                            (ldb (byte registers-size 0) x))
             (ash x (- registers-size)))))
 
 ;;; Dump a compiled debug-location into *BYTE-BUFFER* that describes
@@ -268,20 +288,24 @@
 (defun debug-source-for-info (info &key function)
   (declare (type source-info info))
   (let ((file-info (get-toplevelish-file-info info)))
-    (make-debug-source
+    (multiple-value-call
+        (if function #'sb-c::make-core-debug-source #'make-debug-source)
      :compiled (source-info-start-time info)
-
      :namestring (or *source-namestring*
                      (make-file-info-namestring
-                      (if (pathnamep (file-info-name file-info))
-                          (file-info-name file-info))
+                      (let ((pathname
+                             (case *name-context-file-path-selector*
+                               (pathname (file-info-untruename file-info))
+                               (truename (file-info-name file-info)))))
+                        (if (pathnamep pathname) pathname))
                       file-info))
      :created (file-info-write-date file-info)
-     :form (when function
-             (let ((direct-file-info (source-info-file-info info)))
-               (when (eq :lisp (file-info-name direct-file-info))
-                 (elt (file-info-forms direct-file-info) 0))))
-     :function function)))
+     (if function
+         (values :form (let ((direct-file-info (source-info-file-info info)))
+                         (when (eq :lisp (file-info-name direct-file-info))
+                           (elt (file-info-forms direct-file-info) 0)))
+                 :function function)
+         (values)))))
 
 (defun smallest-element-type (integer negative)
   (let ((bits (max (+ (integer-length integer)
@@ -334,17 +358,18 @@
 
 (defun compact-vector (sequence)
   (cond ((and (= (length sequence) 1)
-              (not (vectorp (elt sequence 0))))
+              (not (typep (elt sequence 0) '(and vector
+                                             (not string)))))
          (elt sequence 0))
         (t
          (coerce-to-smallest-eltype sequence))))
 
 ;;;; variables
 
-;;; Return a SC-OFFSET describing TN's location.
-(defun tn-sc-offset (tn)
+;;; Return a SC+OFFSET describing TN's location.
+(defun tn-sc+offset (tn)
   (declare (type tn tn))
-  (make-sc-offset (sc-number (tn-sc tn))
+  (make-sc+offset (sc-number (tn-sc tn))
                   (tn-offset tn)))
 
 (defun lambda-ancestor-p (maybe-ancestor maybe-descendant)
@@ -366,11 +391,10 @@
 ;;; environment live and is an argument. If a :DEBUG-ENVIRONMENT TN,
 ;;; then we also exclude set variables, since the variable is not
 ;;; guaranteed to be live everywhere in that case.
-(defun dump-1-var (fun var tn minimal buffer &optional same-name-p)
+(defun dump-1-var (fun var tn minimal buffer &optional name same-name-p)
   (declare (type lambda-var var) (type (or tn null) tn)
            (type clambda fun))
-  (let* ((name (leaf-debug-name var))
-         (save-tn (and tn (tn-save-tn tn)))
+  (let* ((save-tn (and tn (tn-save-tn tn)))
          (kind (and tn (tn-kind tn)))
          (flags 0)
          (info (lambda-var-arg-info var))
@@ -409,15 +433,15 @@
     #!+64-bit ; FIXME: fails if SB-VM:N-FIXNUM-TAG-BITS is 3
               ; which early-vm.lisp claims to work
     (cond (indirect
-           (setf (ldb (byte 27 8) flags) (tn-sc-offset tn))
+           (setf (ldb (byte 27 8) flags) (tn-sc+offset tn))
            (when save-tn
-             (setf (ldb (byte 27 35) flags) (tn-sc-offset save-tn))))
+             (setf (ldb (byte 27 35) flags) (tn-sc+offset save-tn))))
           (t
            (if (and tn (tn-offset tn))
-               (setf (ldb (byte 27 8) flags) (tn-sc-offset tn))
+               (setf (ldb (byte 27 8) flags) (tn-sc+offset tn))
                (aver minimal))
            (when save-tn
-             (setf (ldb (byte 27 35) flags) (tn-sc-offset save-tn)))))
+             (setf (ldb (byte 27 35) flags) (tn-sc+offset save-tn)))))
     (vector-push-extend flags buffer)
     (unless (or minimal
                 same-name-p
@@ -428,7 +452,7 @@
       ;; and PARSE-COMPILED-DEBUG-VARS can create the interned symbol.
       ;; This reduces core size by omitting zillions of symbols whose names
       ;; are spelled the same.
-      (vector-push-extend (if (symbol-package name) name (string name)) buffer))
+      (vector-push-extend (if (cl:symbol-package name) name (string name)) buffer))
 
     (cond (indirect
            ;; Indirect variables live in the parent frame, and are
@@ -436,19 +460,31 @@
            ;; The first one/two sc-offsets are for the frame pointer,
            ;; the third is for the stack offset.
            #!-64-bit
-           (vector-push-extend (tn-sc-offset tn) buffer)
+           (vector-push-extend (tn-sc+offset tn) buffer)
            #!-64-bit
            (when save-tn
-             (vector-push-extend (tn-sc-offset save-tn) buffer))
-           (vector-push-extend (tn-sc-offset (leaf-info var)) buffer))
+             (vector-push-extend (tn-sc+offset save-tn) buffer))
+           (vector-push-extend (tn-sc+offset (leaf-info var)) buffer))
           #!-64-bit
           (t
            (if (and tn (tn-offset tn))
-               (vector-push-extend (tn-sc-offset tn) buffer)
+               (vector-push-extend (tn-sc+offset tn) buffer)
                (aver minimal))
            (when save-tn
-             (vector-push-extend (tn-sc-offset save-tn) buffer)))))
+             (vector-push-extend (tn-sc+offset save-tn) buffer)))))
   (values))
+
+(defun leaf-principal-name (leaf)
+  ;; If all the references are from the same substituted variable
+  ;; use its name.
+  ;; Helps with &key processing variables.
+  (let ((refs (leaf-refs leaf)))
+    (loop for ref in refs
+          for name = (ref-%source-name ref)
+          for first-name = name then first-name
+          unless (eq name first-name)
+          return (leaf-debug-name leaf)
+          finally (return name))))
 
 ;;; Return a vector suitable for use as the DEBUG-FUN-VARS
 ;;; of FUN. LEVEL is the current DEBUG-INFO quality. VAR-LOCS is a
@@ -459,10 +495,10 @@
   (declare (type clambda fun) (type hash-table var-locs))
   (collect ((vars))
     (labels ((frob-leaf (leaf tn gensym-p)
-               (let ((name (leaf-debug-name leaf)))
+               (let ((name (leaf-principal-name leaf)))
                  (when (and name (leaf-refs leaf) (tn-offset tn)
-                            (or gensym-p (symbol-package name)))
-                   (vars (cons leaf tn)))))
+                            (or gensym-p (cl:symbol-package name)))
+                   (vars (list* name leaf tn)))))
              (frob-lambda (x gensym-p)
                (dolist (leaf (lambda-vars x))
                  (frob-leaf leaf (leaf-info leaf) gensym-p))))
@@ -478,21 +514,21 @@
 
     (let ((sorted (sort (vars) #'string<
                         :key (lambda (x)
-                               (symbol-name (leaf-debug-name (car x))))))
+                               (symbol-name (car x)))))
           (prev-name nil)
           (i 0)
           (buffer (make-array 0 :fill-pointer 0 :adjustable t))
           ;; XEPs don't have any useful variables
           (minimal (eq (functional-kind fun) :external)))
       (declare (type index i))
-      (dolist (x sorted)
-        (let* ((var (car x))
-               (name (leaf-debug-name var)))
-          (dump-1-var fun var (cdr x) minimal buffer
-                      (and prev-name (eq prev-name name)))
-          (setf prev-name name)
-          (setf (gethash var var-locs) i)
-          (incf i)))
+      (loop for (name var . tn) in sorted
+            do
+            (dump-1-var fun var tn minimal buffer
+                        name
+                        (and prev-name (eq prev-name name)))
+            (setf prev-name name)
+            (setf (gethash var var-locs) i)
+            (incf i))
       (compact-vector buffer))))
 
 ;;; Return a vector suitable for use as the DEBUG-FUN-VARS of
@@ -570,7 +606,7 @@
 ;;; (Must be known values return...)
 (defun compute-debug-returns (fun)
   (coerce-to-smallest-eltype
-   (mapcar #'tn-sc-offset
+   (mapcar #'tn-sc+offset
            (return-info-locations (tail-set-info (lambda-tail-set fun))))))
 
 ;;;; debug functions
@@ -587,7 +623,7 @@
          (name (if (consp name)
                    (case (car name)
                      ((xep tl-xep)
-                      (assert (eq kind :external))
+                      (aver (eq kind :external))
                       (second name))
                      (&optional-processor
                       (setf kind :optional)
@@ -601,18 +637,24 @@
     (funcall (compiled-debug-fun-ctor kind)
              :name name
              #!-fp-and-pc-standard-save :return-pc
-             #!-fp-and-pc-standard-save (tn-sc-offset (ir2-physenv-return-pc 2env))
+             #!-fp-and-pc-standard-save (tn-sc+offset (ir2-physenv-return-pc 2env))
+             #!-fp-and-pc-standard-save :return-pc-pass
+             #!-fp-and-pc-standard-save (tn-sc+offset (ir2-physenv-return-pc-pass 2env))
              #!-fp-and-pc-standard-save :old-fp
-             #!-fp-and-pc-standard-save (tn-sc-offset (ir2-physenv-old-fp 2env))
+             #!-fp-and-pc-standard-save (tn-sc+offset (ir2-physenv-old-fp 2env))
              :encoded-locs
              (cdf-encode-locs
               (label-position (ir2-physenv-environment-start 2env))
               (label-position (ir2-physenv-elsewhere-start 2env))
               (when (ir2-physenv-closure-save-tn 2env)
-                (tn-sc-offset (ir2-physenv-closure-save-tn 2env)))
+                (tn-sc+offset (ir2-physenv-closure-save-tn 2env)))
               #!+unwind-to-frame-and-call-vop
               (when (ir2-physenv-bsp-save-tn 2env)
-                (tn-sc-offset (ir2-physenv-bsp-save-tn 2env)))))))
+                (tn-sc+offset (ir2-physenv-bsp-save-tn 2env)))
+              #!-fp-and-pc-standard-save
+              (label-position (ir2-physenv-lra-saved-pc 2env))
+              #!-fp-and-pc-standard-save
+              (label-position (ir2-physenv-cfp-saved-pc 2env))))))
 
 ;;; Return a complete C-D-F structure for FUN. This involves
 ;;; determining the DEBUG-INFO level and filling in optional slots as
@@ -704,17 +746,17 @@
        ;; so if there's only one function, pick that as the component name.
        ;; Otherwise preserve whatever crummy name was already assigned.
        :name (let* ((2comp (component-info component))
-                    (entries (sb!c::ir2-component-entries 2comp)))
+                    (entries (sb-c::ir2-component-entries 2comp)))
                (or (and (not (cdr entries))
-                        (sb!c::entry-info-name (car entries)))
+                        (sb-c::entry-info-name (car entries)))
                    (component-name component)))
        :fun-map fun-map
-       :tlf-number component-tlf-num
-       :char-offset
-       (and component-tlf-num
-            (aref (file-info-positions
-                   (source-info-file-info *source-info*))
-                  component-tlf-num))
+       :tlf-num+offset (pack-tlf-num+offset
+                        component-tlf-num
+                        (and component-tlf-num
+                             (aref (file-info-positions
+                                    (source-info-file-info *source-info*))
+                                   component-tlf-num)))
        :contexts (compact-vector *contexts*)))))
 
 ;;; Write BITS out to BYTE-BUFFER in backend byte order. The length of

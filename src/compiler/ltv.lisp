@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 (defknown %load-time-value (t) t (flushable movable))
 
@@ -25,7 +25,7 @@
             ;; Another similar case - this allows the printer to work
             ;; immediately in cold-init. (See SETUP-PRINTER-STATE.)
             ((cons (eql function)
-                   (cons (satisfies sb!int:legal-fun-name-p) null))
+                   (cons (satisfies legal-fun-name-p) null))
              'function)
             ;; Case(s) that should only happen in the cross-compiler.
             #+sb-xc-host
@@ -38,9 +38,9 @@
             #+sb-xc-host
             ((cons (eql find-classoid-cell) (cons (cons (eql quote))))
              (aver (eq (getf (cddr form) :create) t))
-             'sb!kernel::classoid-cell))
+             'sb-kernel::classoid-cell))
           (fopcompile form nil t)
-          (values (sb!fasl::dump-pop *compile-object*) (specifier-type it)))
+          (values (sb-fasl::dump-pop *compile-object*) (specifier-type it)))
          (t
           (let ((lambda (compile-load-time-stuff form t)))
             (values (fasl-dump-load-time-value-lambda lambda *compile-object*
@@ -115,7 +115,7 @@ guaranteed to never be modified, so it can be put in read-only storage."
                            (error (condition)
                              (compiler-error "(during EVAL of LOAD-TIME-VALUE)~%~A"
                                              condition)))))
-                  (if (eq sb!ext:*evaluator-mode* :compile)
+                  (if (eq sb-ext:*evaluator-mode* :compile)
                       ;; This call to EVAL actually means compile+eval.
                       (eval-it 'eval form)
                       (eval-it 'funcall (compile nil `(lambda () ,form)))))))

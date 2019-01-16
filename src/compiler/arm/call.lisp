@@ -9,10 +9,10 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
-(defconstant arg-count-sc (make-sc-offset immediate-arg-scn nargs-offset))
-(defconstant closure-sc (make-sc-offset descriptor-reg-sc-number lexenv-offset))
+(defconstant arg-count-sc (make-sc+offset immediate-arg-scn nargs-offset))
+(defconstant closure-sc (make-sc+offset descriptor-reg-sc-number lexenv-offset))
 
 ;;; Always wire the return PC location to the stack in its standard
 ;;; location.
@@ -22,7 +22,7 @@
                  lra-save-offset))
 
 (defconstant return-pc-passing-offset
-  (make-sc-offset control-stack-sc-number lra-save-offset))
+  (make-sc+offset control-stack-sc-number lra-save-offset))
 
 ;;; This is similar to MAKE-RETURN-PC-PASSING-LOCATION, but makes a
 ;;; location to pass OLD-FP in.
@@ -31,13 +31,12 @@
 ;;; because we want to be able to assume it's always there. Besides,
 ;;; the ARM doesn't have enough registers to really make it profitable
 ;;; to pass it in a register.
-(defun make-old-fp-passing-location (standard)
-  (declare (ignore standard))
+(defun make-old-fp-passing-location ()
   (make-wired-tn *fixnum-primitive-type* control-stack-sc-number
                  ocfp-save-offset))
 
 (defconstant old-fp-passing-offset
-  (make-sc-offset control-stack-sc-number ocfp-save-offset))
+  (make-sc+offset control-stack-sc-number ocfp-save-offset))
 
 ;;; Make the TNs used to hold OLD-FP and RETURN-PC within the current
 ;;; function. We treat these specially so that the debugger can find
@@ -124,8 +123,7 @@
     (emit-label start-lab)
     ;; Allocate function header.
     (inst simple-fun-header-word)
-    (dotimes (i (1- simple-fun-code-offset))
-      (inst word 0))
+    (inst .skip (* (1- simple-fun-code-offset) n-word-bytes))
     (inst compute-code code-tn lip start-lab temp)))
 
 (define-vop (xep-setup-sp)
@@ -213,7 +211,7 @@
                                 :unknown-return))
     (inst compute-code code-tn lip lra-label temp)
     ;; Pick off the single-value case first.
-    (sb!assem:without-scheduling ()
+    (sb-assem:without-scheduling ()
 
       ;; Default register values for single-value return case.
       ;; The callee returns with condition bits CLEAR in the
@@ -451,7 +449,18 @@
 ;;; More args are stored consecutively on the stack, starting
 ;;; immediately at the context pointer.  The context pointer is not
 ;;; typed, so the lowtag is 0.
-(define-full-reffer more-arg * 0 0 (descriptor-reg any-reg) * %more-arg)
+(define-vop (more-arg)
+  (:translate %more-arg)
+  (:policy :fast-safe)
+  (:args (context :scs (descriptor-reg))
+         (index :scs (any-reg)))
+  (:arg-types * tagged-num)
+  (:temporary (:scs (any-reg)) temp)
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:result-types *)
+  (:generator 5
+    (inst add temp context index)
+    (loadw value temp)))
 
 ;;; Turn more arg (context, count) into a list.
 (define-vop (listify-rest-args)
@@ -524,7 +533,7 @@
 ;;; below the current stack top.
 (define-vop (more-arg-context)
   (:policy :fast-safe)
-  (:translate sb!c::%more-arg-context)
+  (:translate sb-c::%more-arg-context)
   (:args (supplied :scs (any-reg)))
   (:arg-types tagged-num (:constant fixnum))
   (:info fixed)
@@ -882,7 +891,7 @@
                                                     ,(incf index)))
                                            *register-arg-names*))
                                (storew cfp-tn new-fp ocfp-save-offset))
-                             '((inst mov nargs-pass (fixnumize nargs)))))
+                             '((load-immediate-word nargs-pass (fixnumize nargs)))))
                       ,@(if (eq return :tail)
                             '((:load-return-pc
                                (error "RETURN-PC not in its passing location"))
@@ -902,11 +911,11 @@
                   ;; Conditionally insert a conditional trap:
                   (when step-instrumenting
                     (assemble ()
-                      ;; Get the symbol-value of SB!IMPL::*STEPPING*
+                      ;; Get the symbol-value of SB-IMPL::*STEPPING*
                       ;; KLUDGE: ... into LIP.  Either it's zero or it
                       ;; isn't, and even taking a stray interrupt and
                       ;; GC can't screw that up.
-                      (load-symbol-value lip sb!impl::*stepping*)
+                      (load-symbol-value lip sb-impl::*stepping*)
                       (inst cmp lip 0)
                       ;; If it's not 0, trap.
                       (inst b :eq step-done-label)
@@ -1014,7 +1023,7 @@
         (inst add cur-nfp cur-nfp (bytes-needed-for-non-descriptor-stack-frame))
         (move nsp-tn cur-nfp)))
     (let ((fixup-lab (gen-label)))
-      (assemble (*elsewhere*)
+      (assemble (:elsewhere)
         (emit-label fixup-lab)
         (inst word (make-fixup 'tail-call-variable :assembly-routine)))
       (inst load-from-label pc-tn lip fixup-lab))))
@@ -1152,7 +1161,7 @@
   (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
-    (load-symbol-value stepping sb!impl::*stepping*)
+    (load-symbol-value stepping sb-impl::*stepping*)
     ;; If it's not zero, trap.
     (inst cmp stepping 0)
     (inst b :eq DONE)

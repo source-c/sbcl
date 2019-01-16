@@ -11,7 +11,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!C")
+(in-package "SB-C")
 
 ;;;; internal predicates
 
@@ -50,7 +50,7 @@
 
 (define-type-predicate simple-array-unsigned-fixnum-p
     (simple-array
-     (unsigned-byte #.sb!vm:n-positive-fixnum-bits) (*)))
+     (unsigned-byte #.sb-vm:n-positive-fixnum-bits) (*)))
 
 (define-type-predicate simple-array-unsigned-byte-31-p
     (simple-array (unsigned-byte 31) (*)))
@@ -69,7 +69,7 @@
                        (simple-array (signed-byte 16) (*)))
 
 (define-type-predicate simple-array-fixnum-p
-    (simple-array (signed-byte #.sb!vm:n-fixnum-bits)
+    (simple-array (signed-byte #.sb-vm:n-fixnum-bits)
                   (*)))
 
 (define-type-predicate simple-array-signed-byte-32-p
@@ -106,6 +106,8 @@
 (define-type-predicate signed-byte-64-p (signed-byte 64))
 #!+sb-simd-pack
 (define-type-predicate simd-pack-p simd-pack)
+#!+sb-simd-pack-256
+(define-type-predicate simd-pack-256-p simd-pack-256)
 (define-type-predicate vector-nil-p (vector nil))
 (define-type-predicate weak-pointer-p weak-pointer)
 (define-type-predicate code-component-p code-component)
@@ -119,3 +121,45 @@
 ;;; Unlike the un-%'ed versions, these are true type predicates,
 ;;; accepting any type object.
 (define-type-predicate %standard-char-p standard-char)
+(define-type-predicate non-null-symbol-p (and symbol (not null)))
+
+(defglobal *backend-type-predicates-grouped*
+    (let (plist)
+      (loop for (type . pred) in *backend-type-predicates*
+            for class = (#-sb-xc-host %instance-layout
+                         #+sb-xc-host type-of
+                         type)
+            do (push type (getf plist class))
+               (push pred (getf plist class)))
+      (map 'vector (lambda (x)
+                     (if (listp x)
+                         (concatenate 'vector
+                                      (list
+                                       (every (lambda (x)
+                                                (or (symbolp x)
+                                                    (and (sb-kernel::ctype-eq-comparable x)
+                                                         (sb-kernel::ctype-interned-p x))))
+                                              x))
+                                      (nreverse x))
+                         x))
+           plist)))
+(declaim (simple-vector *backend-type-predicates-grouped*))
+
+(defun backend-type-predicate (type)
+  #-sb-xc-host
+  (declare (optimize (insert-array-bounds-checks 0)))
+  (flet ((vector-getf (vector key test &optional (start 0))
+           (loop for i from start below (length vector) by 2
+                 when (funcall test (svref vector i) key)
+                 return (svref vector (1+ i)))))
+    (declare (inline vector-getf))
+    (let ((group (truly-the (or simple-vector null)
+                            (vector-getf *backend-type-predicates-grouped*
+                                         (#-sb-xc-host %instance-layout
+                                          #+sb-xc-host type-of type)
+                                         #'eq))))
+      (when group
+        (if (and (svref group 0)
+                 (sb-kernel::ctype-eq-comparable type))
+            (vector-getf (truly-the simple-vector group) type #'eq 1)
+            (vector-getf (truly-the simple-vector group) type #'type= 1))))))

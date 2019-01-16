@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 ;;;; Allocator for the array header.
 (define-vop (make-array-header)
@@ -70,7 +70,7 @@
   (:generator 5
     (let ((error (generate-error-code vop 'invalid-array-index-error
                                       array bound index)))
-      (%test-fixnum index error t)
+      (%test-fixnum index nil error t)
       (inst bc :>>= nil index bound error))))
 
 

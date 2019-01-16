@@ -12,7 +12,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!WIN32")
+(in-package "SB-WIN32")
 
 ;;; Alien definitions for commonly used Win32 types.  Woe unto whoever
 ;;; tries to untangle this someday for 64-bit Windows.
@@ -174,15 +174,15 @@
   (milliseconds dword))
 
 #!+sb-thread
-(defun sb!unix:nanosleep (sec nsec)
+(defun sb-unix:nanosleep (sec nsec)
   (let ((*allow-with-interrupts* *interrupts-enabled*))
     (without-interrupts
-      (let ((timer (sb!impl::os-create-wtimer)))
-        (sb!impl::os-set-wtimer timer sec nsec)
+      (let ((timer (sb-impl::os-create-wtimer)))
+        (sb-impl::os-set-wtimer timer sec nsec)
         (unwind-protect
              (do () ((with-local-interrupts
-                       (zerop (sb!impl::os-wait-for-wtimer timer)))))
-          (sb!impl::os-close-wtimer timer))))))
+                       (zerop (sb-impl::os-wait-for-wtimer timer)))))
+          (sb-impl::os-close-wtimer timer))))))
 
 (define-alien-routine ("win32_wait_object_or_signal" wait-object-or-signal)
     dword
@@ -429,12 +429,12 @@
 
 ;;; FIXME: The various FOO-SYSCALL-BAR macros, and perhaps some other
 ;;; macros in this file, are only used in this file, and could be
-;;; implemented using SB!XC:DEFMACRO wrapped in EVAL-WHEN.
+;;; implemented using SB-XC:DEFMACRO wrapped in EVAL-WHEN.
 
 (defmacro syscall ((name ret-type &rest arg-types) success-form &rest args)
   (with-funcname (sname name)
     `(locally
-       (declare (optimize (sb!c::float-accuracy 0)))
+       (declare (optimize (sb-c::float-accuracy 0)))
        (let ((result (alien-funcall
                        (extern-alien ,sname
                                      (function ,ret-type ,@arg-types))
@@ -448,7 +448,7 @@
 (defmacro syscall* ((name &rest arg-types) success-form &rest args)
   (with-funcname (sname name)
     `(locally
-       (declare (optimize (sb!c::float-accuracy 0)))
+       (declare (optimize (sb-c::float-accuracy 0)))
        (let ((result (alien-funcall
                        (extern-alien ,sname (function bool ,@arg-types))
                        ,@args)))
@@ -497,7 +497,7 @@
 (defun get-folder-pathname (csidl)
   (parse-native-namestring (get-folder-namestring csidl)))
 
-(defun sb!unix:posix-getcwd ()
+(defun sb-unix:posix-getcwd ()
   (with-alien ((apath pathname-buffer))
     (with-sysfun (afunc ("GetCurrentDirectory" t) dword dword (* char))
       (let ((ret (alien-funcall afunc (1+ max_path) (cast apath (* char)))))
@@ -509,21 +509,21 @@
               (cast-and-free apath))
             (decode-system-string apath))))))
 
-(defun sb!unix:unix-mkdir (name mode)
-  (declare (type sb!unix:unix-pathname name)
-           (type sb!unix:unix-file-mode mode)
+(defun sb-unix:unix-mkdir (name mode)
+  (declare (type sb-unix:unix-pathname name)
+           (type sb-unix:unix-file-mode mode)
            (ignore mode))
   (syscall (("CreateDirectory" t) lispbool system-string (* t))
            (values result (if result 0 (get-last-error)))
            name nil))
 
-(defun sb!unix:unix-rename (name1 name2)
-  (declare (type sb!unix:unix-pathname name1 name2))
+(defun sb-unix:unix-rename (name1 name2)
+  (declare (type sb-unix:unix-pathname name1 name2))
   (syscall (("MoveFile" t) lispbool system-string system-string)
            (values result (if result 0 (get-last-error)))
            name1 name2))
 
-(defun sb!unix::posix-getenv (name)
+(defun sb-unix::posix-getenv (name)
   (declare (type simple-string name))
   (with-alien ((aenv (* char) (make-system-buffer default-environment-length)))
     (with-sysfun (afunc ("GetEnvironmentVariable" t)
@@ -548,7 +548,7 @@
 ;;;; Process time information
 
 (defconstant 100ns-per-internal-time-unit
-  (/ 10000000 sb!xc:internal-time-units-per-second))
+  (/ 10000000 sb-xc:internal-time-units-per-second))
 
 ;; FILETIME
 ;; The FILETIME structure is a 64-bit value representing the number of
@@ -772,7 +772,7 @@ absense."
 ;;
 ;; DFL: Merged this function because it seems useful to me.  But
 ;; shouldn't we then define it on actual POSIX, too?
-(defun (setf sb!unix::posix-getenv) (new-value name)
+(defun (setf sb-unix::posix-getenv) (new-value name)
   (if (setenv name new-value)
       new-value
       (posix-getenv name)))
@@ -835,11 +835,15 @@ absense."
   (whence dword))
 
 (defun lseeki64 (handle offset whence)
-  (multiple-value-bind (moved to-place)
-      (set-file-pointer-ex handle offset whence)
-    (if moved
-        (values to-place 0)
-        (values -1 (get-last-error)))))
+  (let ((type (get-file-type handle)))
+    (if (or (= type file-type-char)
+            (= type file-type-disk))
+        (multiple-value-bind (moved to-place)
+            (set-file-pointer-ex handle offset whence)
+          (if moved
+              (values to-place 0)
+              (values -1 (get-last-error))))
+        (values -1 0))))
 
 ;; File mapping support routines
 (define-alien-routine (#!+sb-unicode "CreateFileMappingW"
@@ -922,19 +926,19 @@ absense."
   (handle handle)
   (flags int))
 
-;; Intended to be an imitation of sb!unix:unix-open based on
+;; Intended to be an imitation of sb-unix:unix-open based on
 ;; CreateFile, as complete as possibly.
 ;; FILE_FLAG_OVERLAPPED is a must for decent I/O.
 
 (defun unixlike-open (path flags &key revertable
                                       overlapped)
-  (declare (type sb!unix:unix-pathname path)
+  (declare (type sb-unix:unix-pathname path)
            (type fixnum flags))
   (let* ((disposition-flags
            (logior
-            (if (logtest sb!unix:o_creat flags) #b100 0)
-            (if (logtest sb!unix:o_excl flags) #b010 0)
-            (if (logtest sb!unix:o_trunc flags) #b001 0)))
+            (if (logtest sb-unix:o_creat flags) #b100 0)
+            (if (logtest sb-unix:o_excl flags) #b010 0)
+            (if (logtest sb-unix:o_trunc flags) #b001 0)))
          (create-disposition
            ;; there are 8 combinations of creat|excl|trunc, some of
            ;; them are equivalent. Case stmt below maps them to 5
@@ -949,7 +953,7 @@ absense."
             (create-file path
                          (logior
                           (if revertable #x10000 0)
-                          (if (logtest sb!unix:o_append flags)
+                          (if (logtest sb-unix:o_append flags)
                               access-file-append-data
                               0)
                           (ecase (logand 3 flags)
@@ -991,7 +995,7 @@ absense."
              ;; our desire to do so to the runtime?
              ;;   -- DFL
              ;;
-             (set-file-pointer-ex handle 0 (if (logtest sb!unix::o_append flags) 2 0))
+             (set-file-pointer-ex handle 0 (if (logtest sb-unix::o_append flags) 2 0))
              (values handle 0))))))
 
 (define-alien-routine ("closesocket" close-socket) int (handle handle))
@@ -1114,7 +1118,7 @@ absense."
       allow
       (win32-error '(setf inheritable-handle-p))))
 
-(defun sb!unix:unix-dup (fd)
+(defun sb-unix:unix-dup (fd)
   (let ((me (get-current-process)))
     (multiple-value-bind (duplicated handle)
         (duplicate-handle me fd me 0 t +duplicate-same-access+)
@@ -1124,7 +1128,7 @@ absense."
 
 (defun call-with-crt-fd (thunk handle &optional (flags 0))
   (multiple-value-bind (duplicate errno)
-      (sb!unix:unix-dup handle)
+      (sb-unix:unix-dup handle)
     (if duplicate
         (let ((fd (open-osfhandle duplicate flags)))
           (unwind-protect (funcall thunk fd)

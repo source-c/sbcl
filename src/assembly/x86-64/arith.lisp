@@ -9,32 +9,42 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
 #-sb-assembling ; avoid redefinition warning
 (progn
 (defun !both-fixnum-p (temp x y)
-  (inst mov (reg-in-size temp :dword)
-        (reg-in-size x :dword))
-  (inst or (reg-in-size temp :dword)
-        (reg-in-size y :dword))
-  (inst test (reg-in-size temp :byte)
-        fixnum-tag-mask))
+  (inst mov :dword temp x)
+  (inst or :dword temp y)
+  (inst test :byte temp fixnum-tag-mask))
 
 (defun !some-fixnum-p (temp x y)
-  (inst mov (reg-in-size temp :dword)
-        (reg-in-size x :dword))
-  (inst and (reg-in-size temp :dword)
-        (reg-in-size y :dword))
-  (inst test (reg-in-size temp :byte)
-        fixnum-tag-mask))
-)
+  (inst mov :dword temp x)
+  (inst and :dword temp y)
+  (inst test :byte temp fixnum-tag-mask))
 
-#+sb-xc-host
-(defmacro static-fun-addr (name)
-  #!+immobile-code `(make-fixup ,name :static-call)
-  #!-immobile-code
-  `(make-ea :qword :disp (+ nil-value (static-fun-offset ,name))))
+(defun !static-fun-addr (name)
+  #!+immobile-code (make-fixup name :static-call)
+  #!-immobile-code (ea (+ nil-value (static-fun-offset name))))
+
+(defun !call-static-fun (fun arg-count)
+  (inst push rbp-tn)
+  (inst mov rbp-tn rsp-tn)
+  (inst sub rsp-tn (* n-word-bytes 2))
+  (inst mov (ea rsp-tn) rbp-tn)
+  (inst mov rbp-tn rsp-tn)
+  (inst mov rcx-tn (fixnumize arg-count))
+  (inst call (!static-fun-addr fun))
+  (inst pop rbp-tn))
+
+(defun !tail-call-static-fun (fun arg-count)
+  (inst push rbp-tn)
+  (inst mov rbp-tn rsp-tn)
+  (inst sub rsp-tn n-word-bytes)
+  (inst push (ea (frame-byte-offset return-pc-save-offset) rbp-tn))
+  (inst mov rcx-tn (fixnumize arg-count))
+  (inst jmp (!static-fun-addr fun))))
+
 
 ;;;; addition, subtraction, and multiplication
 
@@ -60,14 +70,7 @@
                 (inst ret)
 
                 DO-STATIC-FUN
-                ;; Same as: (inst enter (* n-word-bytes 1))
-                (inst push rbp-tn)
-                (inst mov rbp-tn rsp-tn)
-                (inst sub rsp-tn (* n-word-bytes 1))
-                (inst push (make-ea :qword :base rbp-tn
-                            :disp (frame-byte-offset return-pc-save-offset)))
-                (inst mov rcx (fixnumize 2)) ; arg count
-                (inst jmp (static-fun-addr ',(symbolicate "TWO-ARG-" fun))))))
+                (!tail-call-static-fun ',(symbolicate "TWO-ARG-" fun) 2))))
 
   #.`
   (define-generic-arith-routine (+ 10)
@@ -82,8 +85,8 @@
 
     (move rcx res)
 
-    (with-fixed-allocation (res bignum-widetag (1+ bignum-digits-offset))
-      (storew rcx res bignum-digits-offset other-pointer-lowtag))
+    (fixed-alloc res bignum-widetag (1+ bignum-digits-offset) nil)
+    (storew rcx res bignum-digits-offset other-pointer-lowtag)
 
     OKAY)
 
@@ -101,8 +104,8 @@
 
     (move rcx res)
 
-    (with-fixed-allocation (res bignum-widetag (1+ bignum-digits-offset))
-      (storew rcx res bignum-digits-offset other-pointer-lowtag))
+    (fixed-alloc res bignum-widetag (1+ bignum-digits-offset) nil)
+    (storew rcx res bignum-digits-offset other-pointer-lowtag)
     OKAY)
 
   (define-generic-arith-routine (* 30)
@@ -119,15 +122,15 @@
     (inst cmp x rcx)
     (inst jmp :e SINGLE-WORD-BIGNUM)
 
-    (with-fixed-allocation (res bignum-widetag (+ bignum-digits-offset 2))
-      (storew rax res bignum-digits-offset other-pointer-lowtag)
-      (storew rcx res (1+ bignum-digits-offset) other-pointer-lowtag))
+    (fixed-alloc res bignum-widetag (+ bignum-digits-offset 2) nil)
+    (storew rax res bignum-digits-offset other-pointer-lowtag)
+    (storew rcx res (1+ bignum-digits-offset) other-pointer-lowtag)
     (inst jmp DONE)
 
     SINGLE-WORD-BIGNUM
 
-    (with-fixed-allocation (res bignum-widetag (1+ bignum-digits-offset))
-      (storew rax res bignum-digits-offset other-pointer-lowtag))
+    (fixed-alloc res bignum-widetag (1+ bignum-digits-offset) nil)
+    (storew rax res bignum-digits-offset other-pointer-lowtag)
     (inst jmp DONE)
 
     OKAY
@@ -145,16 +148,10 @@
                          ((:arg x (descriptor-reg any-reg) rdx-offset)
                           (:res res (descriptor-reg any-reg) rdx-offset)
                           (:temp rcx unsigned-reg rcx-offset))
-  (inst test (reg-in-size x :byte) fixnum-tag-mask)
+  (inst test :byte x fixnum-tag-mask)
   (inst jmp :z FIXNUM)
 
-  (inst push rbp-tn)
-  (inst mov rbp-tn rsp-tn)
-  (inst sub rsp-tn n-word-bytes)
-  (inst push (make-ea :qword :base rbp-tn
-                      :disp (frame-byte-offset return-pc-save-offset)))
-  (inst mov rcx (fixnumize 1))    ; arg count
-  (inst jmp (static-fun-addr '%negate))
+  (!tail-call-static-fun '%negate 1)
 
   FIXNUM
   (move res x)
@@ -163,8 +160,8 @@
   (inst shr res n-fixnum-tag-bits)      ; sign bit is data - remove type bits
   (move rcx res)
 
-  (with-fixed-allocation (res bignum-widetag (1+ bignum-digits-offset))
-    (storew rcx res bignum-digits-offset other-pointer-lowtag))
+  (fixed-alloc res bignum-widetag (1+ bignum-digits-offset) nil)
+  (storew rcx res bignum-digits-offset other-pointer-lowtag)
 
   OKAY)
 
@@ -176,8 +173,7 @@
                                         (:policy :safe)
                                         (:save-p t)
                                         (:conditional ,test)
-                                        (:cost 10)
-                                        (:call-temps rcx))
+                                        (:cost 10))
                   ((:arg x (descriptor-reg any-reg) rdx-offset)
                    (:arg y (descriptor-reg any-reg) rdi-offset)
 
@@ -190,29 +186,13 @@
                 (inst ret)
 
                 DO-STATIC-FUN
-                (inst push rbp-tn)
-                (inst mov rbp-tn rsp-tn)
-                (inst sub rsp-tn (* n-word-bytes 3))
-                (inst mov (make-ea :qword :base rsp-tn
-                                   :disp (frame-byte-offset
-                                          (+ sp->fp-offset
-                                             -3
-                                             ocfp-save-offset)))
-                      rbp-tn)
-                (inst lea rbp-tn (make-ea :qword :base rsp-tn
-                                          :disp (frame-byte-offset
-                                          (+ sp->fp-offset
-                                             -3
-                                             ocfp-save-offset))))
-                (inst mov rcx (fixnumize 2))
-                (inst call (static-fun-addr ',static-fn))
+                (!call-static-fun ',static-fn 2)
                 ;; HACK: We depend on NIL having the lowest address of all
                 ;; static symbols (including T)
                 ,@(ecase test
                     (:l `((inst mov y (1+ nil-value))
                           (inst cmp y x)))
-                    (:g `((inst cmp x (1+ nil-value)))))
-                (inst pop rbp-tn))))
+                    (:g `((inst cmp x (1+ nil-value))))))))
   (define-cond-assem-rtn generic-< < two-arg-< :l)
   (define-cond-assem-rtn generic-> > two-arg-> :g))
 
@@ -221,8 +201,7 @@
                           (:policy :safe)
                           (:save-p t)
                           (:conditional :e)
-                          (:cost 10)
-                          (:call-temps rcx))
+                          (:cost 10))
                          ((:arg x (descriptor-reg any-reg) rdx-offset)
                           (:arg y (descriptor-reg any-reg) rdi-offset)
 
@@ -236,32 +215,15 @@
   (inst ret)
 
   DO-STATIC-FUN
-  (inst push rbp-tn)
-  (inst mov rbp-tn rsp-tn)
-  (inst sub rsp-tn (* n-word-bytes 3))
-  (inst mov (make-ea :qword :base rsp-tn
-                     :disp (frame-byte-offset
-                            (+ sp->fp-offset
-                               -3
-                               ocfp-save-offset)))
-        rbp-tn)
-  (inst lea rbp-tn (make-ea :qword :base rsp-tn
-                            :disp (frame-byte-offset
-                                   (+ sp->fp-offset
-                                      -3
-                                      ocfp-save-offset))))
-  (inst mov rcx (fixnumize 2))
-  (inst call (static-fun-addr 'eql))
-  (inst cmp x (+ nil-value (static-symbol-offset t)))
-  (inst pop rbp-tn))
+  (!call-static-fun 'eql 2)
+  (inst cmp x (+ nil-value (static-symbol-offset t))))
 
 (define-assembly-routine (generic-=
                           (:translate =)
                           (:policy :safe)
                           (:save-p t)
                           (:conditional :e)
-                          (:cost 10)
-                          (:call-temps rcx))
+                          (:cost 10))
                          ((:arg x (descriptor-reg any-reg) rdx-offset)
                           (:arg y (descriptor-reg any-reg) rdi-offset)
 
@@ -274,32 +236,17 @@
   (inst ret)
 
   DO-STATIC-FUN
-  (inst push rbp-tn)
-  (inst mov rbp-tn rsp-tn)
-  (inst sub rsp-tn (* n-word-bytes 3))
-  (inst mov (make-ea :qword :base rsp-tn
-                     :disp (frame-byte-offset
-                            (+ sp->fp-offset
-                               -3
-                               ocfp-save-offset)))
-        rbp-tn)
-  (inst lea rbp-tn (make-ea :qword :base rsp-tn
-                            :disp (frame-byte-offset
-                                   (+ sp->fp-offset
-                                      -3
-                                      ocfp-save-offset))))
-
-  (inst mov rcx (fixnumize 2))
-  (inst call (static-fun-addr 'two-arg-=))
-  (inst cmp x (+ nil-value (static-symbol-offset t)))
-  (inst pop rbp-tn))
+  (!call-static-fun 'two-arg-= 2)
+  (inst cmp x (+ nil-value (static-symbol-offset t))))
 
 #+sb-assembling
 (define-assembly-routine (logcount)
                          ((:arg arg (descriptor-reg any-reg) rdx-offset)
                           (:temp mask unsigned-reg rcx-offset)
                           (:temp temp unsigned-reg rax-offset))
-  (inst push temp) ; save RAX
+  (inst push temp)
+  (inst push mask)
+
   (let ((result arg))
     ;; See the comments below for how the algorithm works. The tricks
     ;; used can be found for example in AMD's software optimization
@@ -343,21 +290,8 @@
     (inst mov mask #x0101010101010101)
     (inst imul result mask)
     (inst shr result 56))
-  (inst pop temp)) ; restore RAX
-
-#-sb-assembling ; avoid redefinition warning
-(defun emit-foreign-logbitp (index foreign-symbol temp-reg) ; result in Z flag
-  (declare (ignorable temp-reg))
-  (multiple-value-bind (byte bit) (floor index 8)
-    #!-sb-dynamic-core
-    (inst test
-          (make-ea :byte :disp (make-fixup foreign-symbol :foreign byte))
-          (ash 1 bit))
-    #!+sb-dynamic-core
-    (progn
-      (inst mov temp-reg
-            (make-ea :qword :disp (make-fixup foreign-symbol :foreign-dataref)))
-      (inst test (make-ea :byte :base temp-reg :disp byte) (ash 1 bit)))))
+  (inst pop mask)
+  (inst pop temp))
 
 ;; To perform logcount on small integers, we test whether to use the
 ;; builtin opcode, or an assembly routine. I benchmarked this against
@@ -378,25 +312,33 @@
          ;; input/output of assembly routine
          (:temporary (:sc unsigned-reg :offset rdx-offset
                           :from (:argument 0) :to (:result 0)) rdx)
-         ;; Assembly routine clobbers RAX and RCX but only needs to save RAX,
-         ;; as this vop clobbers RCX in the call. If changed to "CALL [ADDR]"
-         ;; be sure to update the subroutine to push and pop RCX.
-         (:temporary (:sc unsigned-reg :offset rcx-offset) rcx)
          (:vop-var vop)
          (:generator ,cost
            ,@(when signed
                `((move rdx arg)
                  (setf arg rdx)
-                 (inst test rdx rdx)
+                 ,(if (eq arg-type 'fixnum)
+                      `(inst sar rdx n-fixnum-tag-bits)
+                      `(inst test rdx rdx))
                  (inst jmp :ge POSITIVE)
                  (inst not rdx)
                  POSITIVE))
-           ;; POPCNT = ECX bit 23 = bit 7 of byte index 2
-           ;; this use of 'rcx' is as the temporary register for performing
-           ;; a reference to foreign data with dynamic core. It has to be
-           ;; a register that conflicts with 'arg' lest we clobber it.
-           (emit-foreign-logbitp 23 "cpuid_fn1_ecx" rcx)
-           (inst jmp :z slow)
+           (unless (memq :popcnt *backend-subfeatures*)
+             ;; POPCNT = ECX bit 23
+             (multiple-value-bind (bytes bits) (floor (+ 23 n-fixnum-tag-bits)
+                                                      n-byte-bits)
+               ;; FIXME: should be
+               ;;    (INST TEST :BYTE (STATIC-SYMBOL-VALUE-EA '*BLAH*) CONST)
+               ;; but can't do that until sizes are removed from EAs
+               ;; because STATIC-SYMBOL-VALUE-EA returns a :QWORD ea for now.
+               (inst test :byte
+                     (ea (+ nil-value
+                            (static-symbol-offset '*cpuid-fn1-ecx*)
+                            (ash symbol-value-slot word-shift)
+                            (- other-pointer-lowtag)
+                            bytes))
+                     (ash 1 bits)))
+             (inst jmp :z slow))
            ;; Intel's implementation of POPCNT on some models treats it as
            ;; a 2-operand ALU op in the manner of ADD,SUB,etc which means that
            ;; it falsely appears to need data from the destination register.
@@ -409,13 +351,15 @@
            (inst popcnt result arg)
            (inst jmp done)
          slow
-           (move rdx arg)
-           (invoke-asm-routine 'call 'logcount vop rcx)
-           (move result rdx)
+           (unless (memq :popcnt *backend-subfeatures*)
+             (move rdx arg)
+             (invoke-asm-routine 'call 'logcount vop)
+             (move result rdx))
          done))))
   (def-it unsigned-byte-64-count 14 unsigned-reg unsigned-num)
   (def-it signed-byte-64-count 15 signed-reg signed-num :signed t)
-  (def-it positive-fixnum-count 13 any-reg positive-fixnum))
+  (def-it positive-fixnum-count 12 any-reg positive-fixnum)
+  (def-it positive-fixnum-count 13 any-reg fixnum :signed t))
 
 ;;; EQL for integers that are either fixnum or bignum
 
@@ -437,8 +381,7 @@
                           ;; if the args are not integer, which this doesn't.
                           (:policy :fast-safe)
                           (:conditional :e)
-                          (:cost 10)
-                          (:call-temps rcx))
+                          (:cost 10))
                          ((:arg x (descriptor-reg any-reg) rdx-offset)
                           (:arg y (descriptor-reg any-reg) rdi-offset)
                           (:temp rcx unsigned-reg rcx-offset)
@@ -446,26 +389,22 @@
   (inst cmp x y)
   (inst jmp :e done) ; Z condition flag contains the answer
   ;; check that both have other-pointer-lowtag
-  (inst lea (reg-in-size rax :dword)
-        (make-ea :dword :base x :disp (- other-pointer-lowtag)))
-  (inst lea (reg-in-size rcx :dword)
-        (make-ea :dword :base y :disp (- other-pointer-lowtag)))
-  (inst or (reg-in-size rax :dword) (reg-in-size rcx :dword))
-  (inst test (reg-in-size rax :byte) lowtag-mask)
+  (inst lea :dword rax (ea (- other-pointer-lowtag) x))
+  (inst lea :dword rcx (ea (- other-pointer-lowtag) y))
+  (inst or :dword rax rcx)
+  (inst test :byte rax lowtag-mask)
   (inst jmp :ne done)
   ;; Compare the entire header word, ensuring that if at least one
   ;; argument is a bignum, then both are.
-  (inst mov rcx (make-ea :qword :base x :disp (- other-pointer-lowtag)))
-  (inst cmp rcx (make-ea :qword :base y :disp (- other-pointer-lowtag)))
+  (inst mov rcx (ea (- other-pointer-lowtag) x))
+  (inst cmp rcx (ea (- other-pointer-lowtag) y))
   (inst jmp :ne done)
   (inst shr rcx n-widetag-bits)
   ;; can you have 0 payload words? probably not, but let's be safe here.
   (inst jrcxz done)
   loop
-  (inst mov rax (make-ea :qword :base x :disp (- other-pointer-lowtag)
-                         :index rcx :scale 8))
-  (inst cmp rax (make-ea :qword :base y :disp (- other-pointer-lowtag)
-                         :index rcx :scale 8))
+  (inst mov rax (ea (- other-pointer-lowtag) x rcx 8))
+  (inst cmp rax (ea (- other-pointer-lowtag) y rcx 8))
   ;; These next 3 instructions are the equivalent of "LOOPNZ LOOP"
   ;; but had significantly better performance for me, consistent with claims
   ;; of most optimization guides saying that LOOP was deliberately pessimized

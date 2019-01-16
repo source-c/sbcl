@@ -9,11 +9,18 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB!VM")
+(in-package "SB-VM")
 
+#-c-headers-only
 (macrolet ((frob ()
              `(progn ,@*!late-primitive-object-forms*)))
-  (frob))
+  (frob)
+  (defknown symbol-extra (t) t (flushable))
+  (def-reffer 'symbol-extra symbol-size other-pointer-lowtag)
+  (defknown (setf symbol-extra) (t t) t ())
+  (def-setter '(setf symbol-extra) symbol-size other-pointer-lowtag))
+
+(defconstant extended-symbol-size (1+ symbol-size))
 
 #!+sb-thread
 (dolist (slot (primitive-object-slots
@@ -35,7 +42,7 @@
   (lambda (entry)
     (cons (symbol-value (symbolicate (car entry) "-WIDETAG"))
           (cdr entry)))
-  `((bignum "unboxed" "unboxed" "bignum")
+  `((bignum "unboxed" "bignum" "bignum")
     (ratio "boxed" "ratio_or_complex" "boxed")
     (single-float ,(or #!+64-bit "immediate" "unboxed"))
     (double-float "unboxed")
@@ -44,27 +51,39 @@
     (complex-double-float "unboxed")
 
     (code-header "code_header")
+    ;; For all 3 function subtypes, the transporter is "lose"
+    ;; because functions are not OTHER pointer objects.
     ;; The scavenge function for fun-header is basically "lose",
     ;; but it's only defined on non-x86 platforms for some reason.
-    (simple-fun ,(or #!+(or x86 x86-64) "lose" "fun_header") "fun_header" "lose")
-    (closure ,(or #!+(or x86 x86-64) "closure" "short_boxed") "short_boxed")
+    ;; The sizer is "lose" because it's an error if a function is encountered
+    ;; in a heap scan.
+    (simple-fun ,(or #!+(or x86 x86-64) "lose" "fun_header") "lose" "lose")
+    ;; The closure scavenge function needs to know if the "self" slot
+    ;; has pointer nature though it be fixnum tagged, as on x86.
+    ;; The sizer is short_boxed.
+    (closure ,(or #!+(or x86 x86-64) "closure" "short_boxed") "lose" "short_boxed")
+    ;; Like closure, but these can also have a layout pointer in the high header bytes.
     (funcallable-instance ,(or #!+compact-instance-header "funinstance" "short_boxed")
-                                 "short_boxed")
+                          "lose" "short_boxed")
     ;; These have a scav and trans function, but no size function.
     #!-(or x86 x86-64) (return-pc "return_pc_header" "return_pc_header" "lose")
 
     (value-cell "boxed")
     (symbol "tiny_boxed")
+    ;; Can't transport characters as "other" pointer objects.
+    ;; It should be a cons cell half which would go through trans_list()
     (character "immediate")
     (sap "unboxed")
     (unbound-marker "immediate")
     (weak-pointer "lose" "weak_pointer" "boxed")
-    (instance "instance" "instance" "short_boxed")
+    (instance "instance" "lose" "short_boxed")
     (fdefn ,(or #!+(or sparc arm) "boxed" "fdefn") "tiny_boxed")
 
     (no-tls-value-marker "immediate")
 
     #!+sb-simd-pack (simd-pack "unboxed")
+    #!+sb-simd-pack-256 (simd-pack-256 "unboxed")
+    (filler "unboxed")
 
     (simple-array "boxed")
     (simple-array-unsigned-byte-2 "vector_unsigned_byte_2")
@@ -135,18 +154,18 @@ static inline lispobj compute_lispobj(lispobj* base_addr) {
   lispobj header = *base_addr;
   return make_lispobj(base_addr,
                       is_cons_half(header) ? LIST_POINTER_LOWTAG :
-                        lowtag_for_widetag[widetag_of(header)>>2]);~%}~%")
+                        lowtag_for_widetag[header_widetag(header)>>2]);~%}~%")
 
   (format stream "~%#ifdef WANT_SCAV_TRANS_SIZE_TABLES~%")
   (let ((a (make-array 64 :initial-element 0)))
     (dolist (entry *scav/trans/size*)
       (destructuring-bind (widetag scav &rest ignore) entry
         (declare (ignore ignore))
-        (unless (eq scav "immediate")
+        (unless (string= scav "immediate")
           (setf (aref a (ash widetag -2))
                 (case widetag
                   (#.instance-widetag instance-pointer-lowtag)
-                  (#.+fun-header-widetags+ fun-pointer-lowtag)
+                  (#.+function-widetags+ fun-pointer-lowtag)
                   (t other-pointer-lowtag))))))
     (let ((contents (format nil "~{0x~x,~} " (coerce a 'list))))
       (format stream
@@ -169,12 +188,17 @@ static inline lispobj compute_lispobj(lispobj* base_addr) {
                                    (#.fun-pointer-lowtag      "fun")
                                    (#.other-pointer-lowtag    "other"))))
                (when pointer-kind
-                 (setf (svref ptrtab (ldb (byte 2 (- sb!vm:n-lowtag-bits 2)) i))
+                 (setf (svref ptrtab (ldb (byte 2 (- sb-vm:n-lowtag-bits 2)) i))
                        pointer-kind)
                  (setf (svref scavtab i) (format nil "~A_pointer" pointer-kind)
                        (svref sizetab i) "pointer"))))))
     (dolist (entry *scav/trans/size*)
       (destructuring-bind (widetag scav &optional (trans scav) (size trans)) entry
+        ;; immediates use trans_lose which is what trans_immediate did anyway.
+        ;; Substitution here makes the *scav/trans/size* table definition
+        ;; more clear, because single-float is either immediate or unboxed,
+        ;; and it's not nice to repeat the reader conditional expressing that.
+        (when (string= trans "immediate") (setq trans "lose"))
         (setf (svref scavtab widetag) scav
               (svref transtab (ash widetag -2)) trans
               (svref sizetab widetag) size)))
